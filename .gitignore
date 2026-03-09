@@ -1,0 +1,16 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+amazon_ecom/amazon-purchases.csv
+amazon_ecom/survey.csv
+.DS_Store
+dist/
+build/
+*.egg-info/
+**.sh
