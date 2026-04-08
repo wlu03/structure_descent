@@ -15,3 +15,5 @@ build/
 *.egg-info/
 **.sh
 **.pdf
+**/colab_runner.ipynb
+**/NEXT_STEPS.md
