@@ -5,6 +5,7 @@ Builds ordered purchase sequences and choice sets per customer.
 Each purchase event (s_t, a*) becomes a training instance for the conditional logit.
 """
 
+import re
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -20,12 +21,18 @@ def load_data(
     purchases_path = purchases_path or DATA_DIR / "amazon-purchases.csv"
     survey_path = survey_path or DATA_DIR / "survey.csv"
 
+    print(f"[load_data] Loading purchases from {purchases_path} ...")
     purchases = pd.read_csv(purchases_path, parse_dates=["Order Date"])
+    print(f"[load_data] Loaded {len(purchases):,} rows, {purchases.shape[1]} columns")
+
+    print(f"[load_data] Loading survey from {survey_path} ...")
     survey = pd.read_csv(survey_path)
+    print(f"[load_data] Loaded {len(survey):,} survey respondents")
     return purchases, survey
 
 
 def clean_purchases(df: pd.DataFrame) -> pd.DataFrame:
+    print(f"[clean] Starting with {len(df):,} rows ...")
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
@@ -43,11 +50,16 @@ def clean_purchases(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=col_map)
     df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
     df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0.0)
+    n_before = len(df)
     df = df.dropna(subset=["customer_id", "order_date", "asin"])
+    n_dropped = n_before - len(df)
+    if n_dropped > 0:
+        print(f"[clean] Dropped {n_dropped:,} rows with missing customer_id/order_date/asin")
     df["category"] = df["category"].fillna("Unknown").astype(str)
     df["customer_id"] = df["customer_id"].astype(str)
     df["asin"] = df["asin"].astype(str)
     df = df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
+    print(f"[clean] Done: {len(df):,} rows, {df['customer_id'].nunique():,} customers, {df['asin'].nunique():,} ASINs, {df['category'].nunique():,} categories")
     return df
 
 
@@ -152,6 +164,7 @@ def temporal_split(df: pd.DataFrame, val_frac: float = 0.1, test_frac: float = 0
     Per-customer temporal split: train on earliest, val + test on most recent.
     Adds a 'split' column: 'train' | 'val' | 'test'.
     """
+    print(f"[split] Temporal split: val={val_frac:.0%}, test={test_frac:.0%} per customer ...")
     df = df.sort_values(["customer_id", "order_date"]).copy().reset_index(drop=True)
 
     def assign_splits(grp_indices):
@@ -168,4 +181,6 @@ def temporal_split(df: pd.DataFrame, val_frac: float = 0.1, test_frac: float = 0
         split_labels.extend(assign_splits(grp.index))
 
     df["split"] = split_labels
+    counts = df["split"].value_counts()
+    print(f"[split] Done: train={counts.get('train',0):,}, val={counts.get('val',0):,}, test={counts.get('test',0):,}")
     return df
