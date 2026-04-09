@@ -63,6 +63,82 @@ def clean_purchases(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def join_survey(df: pd.DataFrame, survey: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge survey columns onto events by customer_id == Survey ResponseID.
+    Light cleaning: drop all-null columns, snake_case column names. No encoding.
+    """
+    print(f"[survey] Joining survey onto {len(df):,} events ...")
+    survey = survey.copy()
+    id_col = None
+    for c in survey.columns:
+        if c.strip() == "Survey ResponseID":
+            id_col = c
+            break
+    if id_col is None:
+        raise KeyError("join_survey: no 'Survey ResponseID' column found in survey DataFrame")
+    survey = survey.rename(columns={id_col: "customer_id"})
+    survey["customer_id"] = survey["customer_id"].astype(str)
+
+    all_null = [c for c in survey.columns if survey[c].isna().all()]
+    if all_null:
+        survey = survey.drop(columns=all_null)
+
+    def _snake(name: str) -> str:
+        s = name.strip().lower()
+        s = re.sub(r"[^0-9a-z]+", "_", s)
+        return s.strip("_")
+
+    survey.columns = [c if c == "customer_id" else _snake(c) for c in survey.columns]
+    survey = survey.drop_duplicates(subset=["customer_id"], keep="first")
+
+    before_cols = set(df.columns)
+    merged = df.merge(survey, on="customer_id", how="left")
+    new_cols = [c for c in merged.columns if c not in before_cols]
+    print(f"[survey] Done: added {len(new_cols)} survey columns ({len(all_null)} all-null dropped)")
+    return merged
+
+
+_BRAND_STOPWORDS = {
+    "premium", "new", "upgraded", "upgrade", "original", "genuine", "authentic",
+    "professional", "pro", "deluxe", "luxury", "ultra", "super", "best",
+    "the", "a", "an", "for", "with", "by", "of",
+    "2-pack", "3-pack", "4-pack", "6-pack", "10-pack", "pack",
+    "set", "kit", "bundle", "case", "box",
+}
+
+
+def _first_brand_token(title: str) -> str:
+    if not isinstance(title, str) or not title:
+        return ""
+    for tok in title.split():
+        t = tok.lower().strip(",.:;!?()[]{}\"'")
+        if not t:
+            continue
+        if t in _BRAND_STOPWORDS:
+            continue
+        if re.fullmatch(r"[\d\.\-x/]+", t):
+            continue
+        if re.fullmatch(r"\d+[a-z]{1,3}", t):
+            continue
+        return t
+    return ""
+
+
+def _build_asin_brand_map(df: pd.DataFrame) -> Dict[str, str]:
+    tokens = df["title"].fillna("").map(_first_brand_token)
+    tmp = pd.DataFrame({"asin": df["asin"].to_numpy(), "tok": tokens.to_numpy()})
+    tmp = tmp[tmp["tok"] != ""]
+    if len(tmp) == 0:
+        return {}
+    mode = (
+        tmp.groupby("asin")["tok"]
+        .agg(lambda s: s.value_counts().idxmax())
+        .to_dict()
+    )
+    return mode
+
+
 def compute_state_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     For each purchase, compute history-derived state features:
@@ -99,7 +175,12 @@ def compute_state_features(df: pd.DataFrame) -> pd.DataFrame:
     popularity = df.groupby("asin")["customer_id"].count().rename("popularity")
     df = df.join(popularity, on="asin")
 
-    df["brand"] = df["title"].fillna("").str.split().str[0].str.lower()
+    print("[features]   brand (mode first-token per ASIN) ...")
+    brand_map = _build_asin_brand_map(df)
+    brand_counts = pd.Series(list(brand_map.values())).value_counts()
+    ambiguous = set(brand_counts[brand_counts < 2].index) if len(brand_counts) else set()
+    df["brand"] = df["asin"].map(brand_map).fillna("")
+    df.loc[df["brand"].isin(ambiguous) | (df["brand"] == ""), "brand"] = "unknown_brand"
 
     return df
 
