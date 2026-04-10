@@ -9,7 +9,8 @@ Layer 2 — Amazon-Specific Feature Functions:
   price_rank, delivery_speed, co_purchase
 
 Layer 3 — Combinators (domain-agnostic):
-  interaction, split_by, threshold, log_transform, decay
+  interaction, split_by, threshold, log_transform, decay,
+  ratio, power, difference
 
 A DSLStructure is a list of active term names. The inner loop reads the
 feature function specified by S and fits weights θ to each active term.
@@ -114,15 +115,36 @@ def decay(term: np.ndarray, time_delta: np.ndarray, halflife: float = 30.0) -> n
     return np.asarray(term, dtype=float) * np.exp(-np.log(2) * np.asarray(time_delta, dtype=float) / halflife)
 
 
+def ratio(term_a: np.ndarray, term_b: np.ndarray) -> np.ndarray:
+    """Ratio of two terms: a / (b + epsilon) for numerical stability."""
+    return np.asarray(term_a, dtype=float) / (np.asarray(term_b, dtype=float) + 1e-8)
+
+
+def power(term: np.ndarray, exponent: float = 2.0) -> np.ndarray:
+    """Power transform: |x|^n * sign(x) for signed scaling."""
+    t = np.asarray(term, dtype=float)
+    return np.abs(t) ** exponent * np.sign(t)
+
+
+def difference(term_a: np.ndarray, term_b: np.ndarray) -> np.ndarray:
+    """Explicit difference: a - b, fitted with a single weight."""
+    return np.asarray(term_a, dtype=float) - np.asarray(term_b, dtype=float)
+
+
 LAYER1_PRIMITIVES = ["routine", "recency", "novelty", "popularity", "affinity", "time_match"]
 LAYER2_AMAZON = [
     "price_sensitivity", "rating_signal", "brand_affinity",
     "price_rank", "delivery_speed", "co_purchase",
 ]
-LAYER3_COMBINATORS = ["interaction", "split_by", "threshold", "log_transform", "decay"]
+LAYER3_COMBINATORS = ["interaction", "split_by", "threshold", "log_transform", "decay", "ratio", "power", "difference"]
 
 ALL_TERMS = LAYER1_PRIMITIVES + LAYER2_AMAZON
 ALL_DSL = ALL_TERMS + LAYER3_COMBINATORS
+
+# Combinators that take 2 base terms as arguments
+BINARY_COMBINATORS = {"interaction", "split_by", "ratio", "difference"}
+# Combinators that take 1 base term
+UNARY_COMBINATORS = {"log_transform", "threshold", "decay", "power"}
 
 
 @dataclass
