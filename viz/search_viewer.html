@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Structure Descent</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+    background: #fff; color: #1a1a1a;
+    overflow-x: hidden; height: 100vh;
+    display: flex; flex-direction: column;
+}
+
+#header {
+    padding: 28px 32px 0; display: flex; gap: 24px;
+    align-items: baseline; flex-shrink: 0;
+}
+#header h1 { font-size: 16px; font-weight: 600; color: #111; }
+.metric-cards { display: flex; gap: 20px; }
+.metric-card { font-size: 12px; color: #999; }
+.metric-card .value { font-size: 13px; font-weight: 600; color: #444; }
+
+#main { display: flex; padding: 20px 32px 0; gap: 0; flex: 1; min-height: 0; }
+
+#canvas-wrap { flex: 1; position: relative; min-height: 440px; }
+canvas { display: block; width: 100%; height: 100%; }
+
+/* ── Sidebar ── */
+#sidebar { width: 340px; display: flex; flex-direction: column; border-left: 1px solid #f0f0f0; min-height: 0; }
+#sidebar-header {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; color: #bbb;
+    padding: 0 4px 10px 20px; border-bottom: 1px solid #f0f0f0;
+    display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
+}
+#toggle-rejected {
+    font-size: 10px; color: #aaa; cursor: pointer; user-select: none;
+    padding: 2px 6px; border-radius: 3px; border: 1px solid #e8e8e8;
+}
+#toggle-rejected:hover { background: #f7f7f7; }
+#toggle-rejected.active { background: #f0f7f4; color: #5DCAA5; border-color: #c8e6d8; }
+#node-list { overflow-y: auto; flex: 1; padding: 4px 0 12px 0; }
+
+/* ── Sidebar rows ── */
+.node-row {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 7px 6px 7px 20px; border-radius: 6px;
+    cursor: pointer; transition: background 0.12s;
+}
+.node-row:hover { background: #f9f9f9; }
+.node-row.selected { background: #f3faf6; }
+.node-row.pulse { animation: pulse-bg 0.6s ease; }
+@keyframes pulse-bg { 0%{background:#e0f5ec} 100%{background:transparent} }
+
+.node-row.rejected-row { padding-left: 34px; opacity: 0.7; }
+.node-row.rejected-row .node-label { font-style: italic; }
+.rejected-rows { display: none; }
+.rejected-rows.visible { display: block; }
+
+/* Step groups */
+.step-group { margin-bottom: 2px; }
+.step-group:last-child { margin-bottom: 0; }
+.step-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 20px 2px; margin-top: 4px;
+}
+.step-header:first-child { margin-top: 0; }
+.step-number {
+    font-size: 9px; font-weight: 700; color: #bbb;
+    background: #f4f4f2; border-radius: 3px;
+    padding: 1px 5px; letter-spacing: 0.3px;
+    flex-shrink: 0;
+}
+.step-line { flex: 1; height: 1px; background: #f0efeb; }
+.step-score-summary {
+    font-size: 9px; color: #ccc; flex-shrink: 0;
+}
+.step-score-summary .delta { font-weight: 600; }
+.step-score-summary .delta.pos { color: #5DCAA5; }
+.step-score-summary .delta.neg { color: #D9806C; }
+
+.node-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; margin-top: 4px; }
+.node-dot.accepted { background: #5DCAA5; }
+.node-dot.rejected { background: none; border: 1.5px solid #C4C1B8; }
+
+.node-info { flex: 1; min-width: 0; }
+.node-label { font-size: 12px; color: #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.node-sub { font-size: 10px; color: #bbb; }
+.node-score-wrap { flex-shrink: 0; text-align: right; }
+.node-score { font-size: 12px; font-weight: 600; color: #444; }
+.node-delta { font-size: 10px; font-weight: 600; }
+.node-delta.pos { color: #5DCAA5; }
+.node-delta.neg { color: #D9806C; }
+
+/* ── Expanded detail card ── */
+.node-detail { display: none; padding: 8px 8px 14px 20px; font-size: 11px; line-height: 1.5; }
+.node-detail.visible { display: block; }
+
+/* Equation block */
+.eq-block {
+    background: #f8f8f6; border-radius: 6px; padding: 10px 12px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 11.5px; line-height: 1.7; margin: 6px 0;
+    border: 1px solid #eeede8;
+}
+.eq-line { white-space: pre; }
+.eq-header { color: #999; font-size: 10px; margin-bottom: 2px; }
+.eq-weight { color: #888; }
+.eq-op { color: #ccc; }
+.eq-param { color: #a0a0a0; }
+/* Term name colors — inline in the equation */
+.eq-behavioral { color: #0C447C; }
+.eq-discovery  { color: #27500A; }
+.eq-temporal   { color: #633806; }
+.eq-market     { color: #72243E; }
+.eq-social     { color: #3C3489; }
+.eq-structural { color: #444441; }
+
+/* Diff line */
+.eq-diff {
+    margin-top: 4px; padding: 4px 8px; border-radius: 4px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 11px;
+}
+.eq-diff.add { background: #f0faf4; color: #2d8a5e; border-left: 3px solid #5DCAA5; }
+.eq-diff.remove { background: #fdf4f2; color: #b85040; border-left: 3px solid #D9806C; }
+
+/* Chips (secondary, below equation) */
+.terms { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.term-chip { padding: 2px 7px; border-radius: 8px; font-size: 9px; font-weight: 500; }
+.chip-behavioral { background: #B5D4F4; color: #0C447C; }
+.chip-discovery  { background: #C0DD97; color: #27500A; }
+.chip-temporal   { background: #FAC775; color: #633806; }
+.chip-market     { background: #F4C0D1; color: #72243E; }
+.chip-social     { background: #CECBF6; color: #3C3489; }
+.chip-structural { background: #D3D1C7; color: #444441; }
+
+/* Reasoning */
+.reasoning-quote {
+    color: #888; font-size: 11px; line-height: 1.5;
+    padding: 6px 8px; margin-top: 8px;
+    background: #fafafa; border-left: 2.5px solid #e0e0e0;
+    border-radius: 0 4px 4px 0;
+}
+
+/* Verdict bar */
+.verdict-bar {
+    margin-top: 8px; padding: 6px 8px; border-radius: 4px;
+    font-size: 11px; font-weight: 600;
+    display: flex; justify-content: space-between; align-items: center;
+}
+.verdict-bar.accepted { background: #f0f9f4; color: #3a9e7a; border: 1px solid #d4ede4; }
+.verdict-bar.rejected { background: #fdf5f3; color: #C06050; border: 1px solid #f0dcd8; }
+.verdict-bar .verdict-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+.verdict-bar .verdict-delta { font-size: 14px; font-weight: 700; }
+
+/* ── Tooltip ── */
+#tooltip {
+    position: absolute; background: #fff; border: 1px solid #eaeaea; border-radius: 8px;
+    padding: 10px 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.06);
+    pointer-events: none; opacity: 0; transition: opacity 0.1s; max-width: 280px; z-index: 10;
+}
+#tooltip.visible { opacity: 1; }
+#tooltip .t-score { font-size: 22px; font-weight: 700; color: #111; line-height: 1.1; }
+#tooltip .t-struct { font-size: 11px; color: #777; margin-top: 2px; line-height: 1.3; }
+#tooltip .t-meta { font-size: 10px; color: #bbb; margin-top: 4px; display: flex; align-items: center; gap: 4px; }
+#tooltip .t-dot { width: 5px; height: 5px; border-radius: 50%; display: inline-block; }
+
+/* ── Legend ── */
+#legend { padding: 6px 32px 16px; font-size: 10px; color: #ccc; display: flex; gap: 14px; flex-shrink: 0; }
+#legend .item { display: flex; align-items: center; gap: 4px; }
+#legend .ldot { width: 6px; height: 6px; border-radius: 50%; }
+
+/* ── Load prompt ── */
+#load-prompt { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); text-align: center; color: #aaa; font-size: 14px; }
+#load-prompt button { margin-top: 12px; padding: 8px 20px; background: #5DCAA5; color: #fff; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; }
+#load-prompt button:hover { background: #4bb893; }
+</style>
+</head>
+<body>
+
+<div id="header">
+    <h1>Structure Descent</h1>
+    <div class="metric-cards" id="metrics"></div>
+</div>
+<div id="main">
+    <div id="canvas-wrap">
+        <canvas id="graph"></canvas>
+        <div id="tooltip"></div>
+        <div id="load-prompt">
+            <p>Load <code>search_history.json</code></p>
+            <button onclick="loadFile()">Choose File</button>
+            <input type="file" id="file-input" accept=".json" style="display:none">
+        </div>
+    </div>
+    <div id="sidebar">
+        <div id="sidebar-header">
+            <span>Search History</span>
+            <span id="toggle-rejected" onclick="toggleRejected()">Show rejected</span>
+        </div>
+        <div id="node-list"></div>
+    </div>
+</div>
+<div id="legend">
+    <div class="item"><div class="ldot" style="background:#5DCAA5"></div> Accepted</div>
+    <div class="item"><div class="ldot" style="background:none;border:1.5px solid #C4C1B8"></div> Rejected</div>
+</div>
+
+<script>
+const canvas = document.getElementById('graph');
+const ctx = canvas.getContext('2d');
+let W, H, data = null, nodes = [], edges = [], hoveredNode = null, selectedNode = null, showRejectedFlag = false;
+
+const TEAL = '#5DCAA5', WARM_GRAY = '#C4C1B8', RED_SOFT = '#D9806C';
+
+const catMap = {
+    routine:'behavioral', affinity:'behavioral',
+    novelty:'discovery', diversity:'discovery',
+    recency:'temporal', time_match:'temporal', decay:'temporal',
+    popularity:'market', price_sensitivity:'market', price_rank:'market', rating_signal:'market',
+    brand_affinity:'social', co_purchase:'social', delivery_speed:'social',
+    threshold:'structural', split_by:'structural', interaction:'structural',
+    log_transform:'structural', power:'structural', ratio:'structural', difference:'structural',
+};
+
+function termCat(t) { return catMap[t.split('(')[0].trim()] || 'structural'; }
+function chipCls(t) { return 'chip-' + termCat(t); }
+function eqCls(t) { return 'eq-' + termCat(t); }
+
+// ── Equation rendering ──
+function renderEquation(terms, weights) {
+    if (!terms || !terms.length) return '';
+    let lines = [];
+    for (let i = 0; i < terms.length; i++) {
+        const t = terms[i];
+        const w = weights && weights[t] !== undefined ? weights[t] : null;
+        const op = i === 0 ? '<span class="eq-op">S = </span>' : '<span class="eq-op">  + </span>';
+        const wStr = w !== null ? `<span class="eq-weight">${w.toFixed(2)}</span><span class="eq-op">·</span>` : '';
+        const tStr = renderTermName(t);
+        lines.push(`<div class="eq-line">${op}${wStr}${tStr}</div>`);
+    }
+    return `<div class="eq-block">${lines.join('')}</div>`;
+}
+
+function renderTermName(t) {
+    const m = t.match(/^(\w+)\((.+)\)$/);
+    if (m) {
+        const base = m[1], args = m[2];
+        const cls = eqCls(base);
+        // Color args individually
+        const coloredArgs = args.split(',').map(a => {
+            a = a.trim();
+            if (a.includes('=')) {
+                const [k,v] = a.split('=');
+                return `<span class="eq-param">${k.trim()}=${v.trim()}</span>`;
+            }
+            return `<span class="${eqCls(a)}">${a}</span>`;
+        }).join('<span class="eq-op">, </span>');
+        return `<span class="${cls}">${base}</span><span class="eq-op">(</span>${coloredArgs}<span class="eq-op">)</span>`;
+    }
+    return `<span class="${eqCls(t)}">${t}</span>`;
+}
+
+function renderDiff(changes, weights) {
+    if (!changes || !changes.length) return '';
+    return changes.map(c => {
+        const cls = c.op === 'ADD' ? 'add' : 'remove';
+        const sign = c.op === 'ADD' ? '+' : '-';
+        const w = weights && weights[c.term] !== undefined ? weights[c.term] : null;
+        const wStr = w !== null ? `${w.toFixed(2)}·` : '';
+        const tStr = renderTermName(c.term);
+        return `<div class="eq-diff ${cls}">${sign} ${wStr}${tStr}</div>`;
+    }).join('');
+}
+
+function renderChips(terms) {
+    if (!terms || !terms.length) return '';
+    return '<div class="terms">' + terms.map(t => `<span class="term-chip ${chipCls(t)}">${t}</span>`).join('') + '</div>';
+}
+
+// ── Canvas ──
+function resize() {
+    const wrap = document.getElementById('canvas-wrap');
+    W = wrap.clientWidth; H = wrap.clientHeight;
+    canvas.width = W * devicePixelRatio; canvas.height = H * devicePixelRatio;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    if (data) { layoutNodes(); draw(); }
+}
+
+function loadFile() { document.getElementById('file-input').click(); }
+document.getElementById('file-input').addEventListener('change', e => {
+    const f = e.target.files[0]; if (!f) return;
+    const r = new FileReader();
+    r.onload = ev => { try { data = JSON.parse(ev.target.result); initGraph(); } catch(e) { alert('Invalid JSON'); } };
+    r.readAsText(f);
+});
+fetch('../data/search_history.json').then(r=>r.ok?r.json():Promise.reject()).then(d=>{data=d;initGraph();}).catch(()=>{});
+
+function getUniqueAccepted() {
+    const path = data.nodes.filter(n=>n.type==='accepted').sort((a,b)=>a.iteration-b.iteration);
+    const u = []; let last = '';
+    for (const n of path) { if (n.structure !== last) { u.push(n); last = n.structure; } }
+    return u;
+}
+
+function initGraph() {
+    document.getElementById('load-prompt').style.display = 'none';
+    const best = data.nodes.reduce((a,b)=>a.score>b.score?a:b);
+    const ua = getUniqueAccepted();
+    const rej = data.nodes.filter(n=>n.type==='rejected').length;
+    document.getElementById('metrics').innerHTML = `
+        <div class="metric-card">Best <span class="value">${best.score.toFixed(1)}</span></div>
+        <div class="metric-card">Steps <span class="value">${ua.length}</span></div>
+        <div class="metric-card">Rejected <span class="value">${rej}</span></div>
+        <div class="metric-card">Final <span class="value">${best.n_terms} terms</span></div>`;
+    edges = data.edges;
+    layoutNodes(); buildSidebar(); draw();
+}
+
+function layoutNodes() {
+    const pad = {left:60, right:30, top:32, bottom:42};
+    const ua = getUniqueAccepted();
+    const nS = ua.length;
+    const sX = {}; ua.forEach((n,i) => { sX[n.id] = pad.left + (i/Math.max(nS-1,1))*(W-pad.left-pad.right); });
+
+    const allAcc = data.nodes.filter(n=>n.type==='accepted').sort((a,b)=>a.iteration-b.iteration);
+    const i2x = {};
+    for (const n of allAcc) { const m = ua.findLast(u=>u.iteration<=n.iteration); if(m) i2x[n.iteration] = sX[m.id]; }
+
+    const scores = data.nodes.map(n=>n.score).filter(s=>s!==0);
+    const mn = Math.min(...scores), mx = Math.max(...scores), rng = mx-mn||1, sp = rng*0.12;
+    const sY = s => H-pad.bottom-((s-mn+sp)/(rng+2*sp))*(H-pad.top-pad.bottom);
+
+    nodes = data.nodes.map(n => {
+        let x;
+        if (n.type==='accepted') { x = i2x[n.iteration]||pad.left; }
+        else { const px = i2x[n.iteration-1]||i2x[n.iteration]||pad.left; x = px+(Math.random()-0.5)*24; }
+        return {...n, x, y:sY(n.score), _isU: n.type==='accepted'&&sX[n.id]!==undefined, _pad:pad, _mn:mn, _mx:mx, _rng:rng, _sp:sp};
+    });
+    nodes._sY=sY; nodes._pad=pad; nodes._ua=ua;
+}
+
+function draw() {
+    ctx.clearRect(0,0,W,H); if(!nodes.length) return;
+    const pad=nodes._pad, n0=nodes[0], mn=n0._mn, rng=n0._rng, sp=n0._sp;
+
+    // Grid
+    for(let i=0;i<=5;i++){
+        const f=i/5, y=H-pad.bottom-f*(H-pad.top-pad.bottom), v=mn-sp+f*(rng+2*sp);
+        ctx.beginPath();ctx.moveTo(pad.left-4,y);ctx.lineTo(W-pad.right,y);
+        ctx.strokeStyle='rgba(0,0,0,0.04)';ctx.lineWidth=0.5;ctx.stroke();
+        ctx.fillStyle='#d5d5d5';ctx.font='9px -apple-system,sans-serif';
+        ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(v.toFixed(0),pad.left-8,y);
+    }
+
+    const em={}; nodes.forEach(n=>em[n.id]=n);
+
+    // Rejected edges
+    ctx.setLineDash([2,3]);
+    for(const e of edges){if(e.type!=='rejected')continue;const s=em[e.source],t=em[e.target];if(!s||!t)continue;
+        ctx.beginPath();ctx.moveTo(s.x,s.y);ctx.lineTo(t.x,t.y);ctx.strokeStyle='rgba(196,193,184,0.3)';ctx.lineWidth=0.5;ctx.stroke();}
+    ctx.setLineDash([]);
+
+    // Accepted path
+    const uq=nodes.filter(n=>n._isU).sort((a,b)=>a.iteration-b.iteration);
+    if(uq.length>1){ctx.beginPath();ctx.moveTo(uq[0].x,uq[0].y);
+        for(let i=1;i<uq.length;i++){const p=uq[i-1],c=uq[i];ctx.quadraticCurveTo((p.x+c.x)/2,p.y,c.x,c.y);}
+        ctx.strokeStyle=TEAL;ctx.lineWidth=1.5;ctx.stroke();}
+
+    // Nodes
+    for(const n of nodes){
+        if(n.type==='accepted'&&!n._isU)continue;
+        const isH=hoveredNode===n,isS=selectedNode===n, r=isS?6.5:isH?5.5:n._isU?4.5:3.5;
+        if(n.type==='rejected'){ctx.beginPath();ctx.arc(n.x,n.y,r,0,Math.PI*2);ctx.fillStyle='#fff';ctx.fill();ctx.strokeStyle=isH||isS?'#999':WARM_GRAY;ctx.lineWidth=isS?1.8:1.2;ctx.stroke();}
+        else{ctx.beginPath();ctx.arc(n.x,n.y,r,0,Math.PI*2);ctx.fillStyle=isS?'#4bb893':TEAL;ctx.fill();}
+        if(isS){ctx.beginPath();ctx.arc(n.x,n.y,r+3,0,Math.PI*2);ctx.strokeStyle=n.type==='rejected'?'rgba(217,128,108,0.3)':'rgba(93,202,165,0.3)';ctx.lineWidth=2;ctx.stroke();}
+    }
+
+    // Labels
+    ctx.textAlign='center';ctx.textBaseline='top';ctx.font='9px -apple-system,sans-serif';ctx.fillStyle='#d5d5d5';
+    for(let i=0;i<uq.length;i++){if(uq.length<=10||i===0||i===uq.length-1||i%2===0)ctx.fillText(`${uq[i].iteration}`,uq[i].x,H-pad.bottom+8);}
+}
+
+function getNodeAt(mx,my){for(let i=nodes.length-1;i>=0;i--){const n=nodes[i];if(n.type==='accepted'&&!n._isU)continue;const dx=mx-n.x,dy=my-n.y;if(dx*dx+dy*dy<100)return n;}return null;}
+
+// Tooltip
+canvas.addEventListener('mousemove',e=>{const rect=canvas.getBoundingClientRect();const mx=e.clientX-rect.left,my=e.clientY-rect.top;const node=getNodeAt(mx,my);if(node!==hoveredNode){hoveredNode=node;canvas.style.cursor=node?'pointer':'default';draw();}showTooltip(node,e.clientX,e.clientY);});
+canvas.addEventListener('mouseleave',()=>{hoveredNode=null;draw();document.getElementById('tooltip').classList.remove('visible');});
+
+function showTooltip(node,cx,cy){const tip=document.getElementById('tooltip');if(!node){tip.classList.remove('visible');return;}
+    tip.innerHTML=`<div class="t-score">${node.score.toFixed(1)}</div><div class="t-struct">${node.structure.replace('S = ','')}</div><div class="t-meta"><span class="t-dot" style="background:${node.accepted?TEAL:WARM_GRAY}"></span>${node.accepted?'Accepted':'Rejected'} · Iter ${node.iteration} · ${node.n_terms} terms</div>`;
+    const wrap=document.getElementById('canvas-wrap').getBoundingClientRect();let l=cx-wrap.left+14,t=cy-wrap.top-36;if(l+260>wrap.width)l=cx-wrap.left-280;if(t<0)t=cy-wrap.top+16;
+    tip.style.left=l+'px';tip.style.top=t+'px';tip.classList.add('visible');}
+
+// Click
+canvas.addEventListener('click',e=>{
+    const rect=canvas.getBoundingClientRect();
+    const node=getNodeAt(e.clientX-rect.left,e.clientY-rect.top);
+    if (!node) return;
+    // Toggle: clicking the same node again deselects
+    if (selectedNode && selectedNode.id === node.id) {
+        selectedNode = null; draw();
+        document.querySelectorAll('.node-row').forEach(r => r.classList.remove('selected'));
+        document.querySelectorAll('.node-detail').forEach(d => { d.classList.remove('visible'); d.innerHTML = ''; });
+        return;
+    }
+    selectNode(node,'graph');
+});
+
+function selectNode(node,src){
+    selectedNode=node;draw();
+    if(node.type==='rejected'&&!showRejectedFlag)toggleRejected();
+    highlightSidebarRow(node.id);expandDetail(node.id);
+    if(src==='graph'){const row=document.querySelector(`.node-row[data-id="${node.id}"]`);if(row){row.classList.remove('pulse');void row.offsetWidth;row.classList.add('pulse');}}
+}
+
+// ── Sidebar ──
+function toggleRejected(){showRejectedFlag=!showRejectedFlag;const b=document.getElementById('toggle-rejected');b.classList.toggle('active',showRejectedFlag);b.textContent=showRejectedFlag?'Hide rejected':'Show rejected';document.querySelectorAll('.rejected-rows').forEach(el=>el.classList.toggle('visible',showRejectedFlag));}
+
+function buildSidebar(){
+    const list=document.getElementById('node-list');
+    // Group: each unique accepted step is a group, with its rejected branches
+    const ua = nodes.filter(n=>n._isU).sort((a,b)=>a.iteration-b.iteration);
+    const rejNodes = nodes.filter(n=>n.type==='rejected');
+
+    // Map each rejected node to its parent accepted step
+    const rejByParent = {};
+    for (const r of rejNodes) {
+        // Parent is the accepted step at or before this iteration
+        const parent = ua.findLast(u => u.iteration < r.iteration) || ua.findLast(u => u.iteration <= r.iteration);
+        const key = parent ? parent.id : 'orphan';
+        if (!rejByParent[key]) rejByParent[key] = [];
+        rejByParent[key].push(r);
+    }
+
+    let html = '';
+    for (let si = 0; si < ua.length; si++) {
+        const n = ua[si];
+        const stepNum = si;
+        const rej = rejByParent[n.id] || [];
+
+        // Step header
+        let headerRight = '';
+        if (n.score_delta && n.score_delta > 0) {
+            headerRight = `<span class="delta pos">+${n.score_delta.toFixed(0)}</span>`;
+        } else if (si === 0) {
+            headerRight = 'initial';
+        }
+        const rejCount = rej.length;
+        const rejLabel = rejCount > 0 ? `${rejCount} rejected` : '';
+
+        html += `<div class="step-group">`;
+        html += `<div class="step-header">`;
+        html += `<span class="step-number">STEP ${stepNum}</span>`;
+        html += `<span class="step-line"></span>`;
+        html += `<span class="step-score-summary">${rejLabel}${rejLabel && headerRight ? ' · ' : ''}${headerRight}</span>`;
+        html += `</div>`;
+
+        // Accepted row
+        html += renderRow(n, false);
+        html += `<div id="detail-${n.id}" class="node-detail"></div>`;
+
+        // Rejected rows for this step
+        if (rej.length) {
+            html += `<div class="rejected-rows">`;
+            for (const r of rej.sort((a,b)=>a.iteration-b.iteration)) {
+                html += renderRow(r, true);
+                html += `<div id="detail-${r.id}" class="node-detail"></div>`;
+            }
+            html += `</div>`;
+        }
+
+        html += `</div>`;
+    }
+    list.innerHTML = html;
+}
+
+function renderRow(n,rej){
+    const cls=rej?'rejected-row':'';const dot=rej?'rejected':'accepted';
+    const label=rej?(n.changes||[]).map(c=>`${c.op} ${c.term}`).join(', ')||n.structure.replace('S = ','').slice(0,28)+'…':(()=>{const s=n.structure.replace('S = ','');return s.length>30?s.slice(0,30)+'…':s;})();
+    const sub=`Iter ${n.iteration}`+(rej?'':`· ${n.n_terms} terms`);
+    const d=n.score_delta;let dH='';if(d!==undefined&&d!==null&&d!==0){dH=`<div class="node-delta ${d>0?'pos':'neg'}">${d>0?'+':''}${d.toFixed(0)}</div>`;}
+    return `<div class="node-row ${cls}" data-id="${n.id}" onclick="selectFromSidebar('${n.id}')"><div class="node-dot ${dot}"></div><div class="node-info"><div class="node-label">${label}</div><div class="node-sub">${sub}</div></div><div class="node-score-wrap"><div class="node-score" style="${rej?'color:#bbb':''}">${n.score.toFixed(0)}</div>${dH}</div></div>`;
+}
+
+function selectFromSidebar(id){
+    // Toggle: clicking the same node again deselects and collapses
+    if (selectedNode && selectedNode.id === id) {
+        selectedNode = null; draw();
+        document.querySelectorAll('.node-row').forEach(r => r.classList.remove('selected'));
+        document.querySelectorAll('.node-detail').forEach(d => { d.classList.remove('visible'); d.innerHTML = ''; });
+        return;
+    }
+    const n=nodes.find(n=>n.id===id);if(n)selectNode(n,'sidebar');
+}
+function highlightSidebarRow(id){document.querySelectorAll('.node-row').forEach(r=>r.classList.remove('selected'));const row=document.querySelector(`.node-row[data-id="${id}"]`);if(row){row.classList.add('selected');row.scrollIntoView({block:'nearest',behavior:'smooth'});}}
+
+function expandDetail(id){
+    document.querySelectorAll('.node-detail').forEach(d=>{d.classList.remove('visible');d.innerHTML='';});
+    const node=nodes.find(n=>n.id===id); if(!node)return;
+    const el=document.getElementById('detail-'+id); if(!el)return;
+
+    // 1. Structure header + score
+    const scoreStr = `<div style="font-size:13px;font-weight:600;color:#333;margin-bottom:4px">${node.structure} <span style="color:#999;font-weight:400">· ${node.score.toFixed(1)}</span></div>`;
+
+    // 2. Equation block with weights
+    const eqHTML = renderEquation(node.terms, node.weights);
+
+    // 3. Diff lines (what changed)
+    const diffHTML = renderDiff(node.changes, node.weights);
+
+    // 4. Chips (secondary)
+    const chipsHTML = renderChips(node.terms);
+
+    // 5. Reasoning
+    const reasonHTML = node.reasoning ? `<div class="reasoning-quote">"${node.reasoning}"</div>` : '';
+
+    // 6. Verdict bar
+    let verdictHTML = '';
+    const d = node.score_delta;
+    if (node.type === 'rejected' && d != null) {
+        verdictHTML = `<div class="verdict-bar rejected"><span class="verdict-label">Rejected</span><span class="verdict-delta">Score Δ ${d>0?'+':''}${d.toFixed(1)}</span></div>`;
+    } else if (d != null && d > 0) {
+        verdictHTML = `<div class="verdict-bar accepted"><span class="verdict-label">Accepted</span><span class="verdict-delta">Score Δ +${d.toFixed(1)}</span></div>`;
+    }
+
+    el.innerHTML = scoreStr + eqHTML + diffHTML + chipsHTML + reasonHTML + verdictHTML;
+    el.classList.add('visible');
+}
+
+window.addEventListener('resize', resize);
+resize();
+</script>
+</body>
+</html>
