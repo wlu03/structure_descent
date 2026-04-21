@@ -1,216 +1,48 @@
-# Structure Descent
-### LLM-Guided Utility Model Search for Interpretable Discrete Choice
+# PO-LEU
 
-Replication of the Structure Descent framework on the Amazon e-commerce dataset. The framework discovers interpretable utility functions for predicting consumer purchase behavior by combining LLM-guided structural search with gradient-based weight fitting.
+Perceived-Outcome, LLM-generated, Embedding-based Utility.
+Specification: [`docs/redesign.md`](docs/redesign.md).
 
----
+## Status
 
-## How it works
+Implemented via a wave-based orchestration. See `NOTES.md` for the running
+build log, deviations from spec, and unresolved ambiguities.
 
-Structure Descent separates two optimization problems:
+## Wave plan
 
-| Problem | Space | Tool |
+| Wave | Scope | Modules |
 |---|---|---|
-| Which factors appear in the utility function? | Discrete, combinatorial | LLM-guided search |
-| How much should each factor weigh? | Continuous | L-BFGS gradient optimization |
+| Scaffold | tree, default config, conftest | `configs/default.yaml`, `tests/conftest.py` |
+| 1 | data prep + cache + prompts | `src/data/person_features.py`, `src/data/context_string.py`, `src/outcomes/prompts.py`, `src/outcomes/cache.py` |
+| 2 | LLM generation + diversity | `src/outcomes/generate.py`, `src/outcomes/diversity_filter.py` |
+| 3 | encoder | `src/outcomes/encode.py` |
+| 4 | model modules | `src/model/attribute_heads.py`, `src/model/weight_net.py`, `src/model/salience_net.py` |
+| 5 | assembly + ablations | `src/model/po_leu.py`, `src/model/ablations.py` |
+| 6 | training + eval | `src/train/regularizers.py`, `src/train/loop.py`, `src/eval/metrics.py`, `src/eval/strata.py` |
+| 7 | interpretability + ablation configs | `src/eval/interpret.py`, `configs/ablation_*.yaml` |
+| Final | smoke test | `scripts/smoke_end_to_end.py` |
 
-The **outer loop** prompts an LLM with a diagnostic report of the current model's failures and asks it to propose structural changes to the DSL. The **inner loop** fits hierarchical weights for any fixed structure. A proposal is accepted only if it improves the Bayesian posterior score — the LLM proposes, the math decides.
+## Data
 
----
+Source data lives in `amazon_ecom/` (Amazon purchase logs + survey).
+Upstream v2.0 pipeline stages (load/clean/survey-join/state-features/split)
+are referenced at their interfaces only — not reimplemented here.
+`src/train/subsample.py` is retained verbatim from v1 (Appendix C).
 
-## Project structure
+## Layout
 
-```
-structure_descent/
-├── amazon_ecom/                    # Raw data (not committed)
-│   ├── amazon-purchases.csv        # 1.85M purchase transactions
-│   ├── survey.csv                  # 5,027 respondent survey responses
-│   └── fields.csv                  # Survey field descriptions
-├── notebooks/
-│   ├── 00_data_exploration.ipynb   # EDA on both datasets
-│   ├── 01_data_preparation.ipynb   # Build choice sets, temporal split
-│   ├── 02_dsl_features.ipynb       # Extract feature matrices
-│   ├── 03_inner_loop.ipynb         # Fit hierarchical weights
-│   ├── 04_outer_loop_llm.ipynb     # Run Structure Descent
-│   └── 05_evaluation.ipynb         # Full evaluation + ablations
-├── src/
-│   ├── data_prep.py                # Data loading and preprocessing
-│   ├── dsl.py                      # DSL feature functions + DSLStructure
-│   ├── inner_loop.py               # Hierarchical weight fitting (L-BFGS)
-│   ├── outer_loop.py               # LLM proposal + accept/reject
-│   └── evaluation.py               # Metrics, baselines, ablations
-├── data/                           # Processed outputs (created by notebooks)
-├── .env                            # API keys and provider config (not committed)
-├── .env.example                    # Template for .env
-└── requirements.txt
-```
-
----
+See redesign.md §14.
 
 ## Setup
 
-### 1. Clone and enter the repo
-
 ```bash
-git clone https://github.com/wlu03/structure_descent
-cd structure_descent
+python -m venv venv && source venv/bin/activate
+pip install -e '.[dev]'
+pytest
 ```
 
-### 2. Create and activate the virtual environment
+## Deliverable
 
-```bash
-python3 -m venv venv
-source venv/bin/activate      # macOS / Linux
-# venv\Scripts\activate       # Windows
-```
-
-### 3. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Register the Jupyter kernel
-
-```bash
-python -m ipykernel install --user --name structure_descent --display-name "Structure Descent"
-```
-
-### 5. Configure your LLM provider
-
-Copy the example env file and fill in your settings:
-
-```bash
-cp .env.example .env
-```
-
-#### Option A — Anthropic Claude (default)
-
-```env
-LLM_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-opus-4-6
-```
-
-#### Option B — Ollama (local LLM)
-
-First install and start Ollama:
-
-```bash
-# Install from https://ollama.com  (or: brew install ollama)
-
-# Start the server
-ollama serve
-
-# Pull a model (in a separate terminal)
-ollama pull llama3        # 4.7 GB — recommended
-ollama pull mistral       # 4.1 GB — strong JSON output
-ollama pull qwen2.5:7b    # 4.4 GB — strong instruction following
-```
-
-Then set your `.env`:
-
-```env
-LLM_PROVIDER=ollama
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=llama3
-```
-
-Switching providers at any time only requires changing `LLM_PROVIDER` in `.env`. All other code is unchanged.
-
----
-
-## Running the notebooks
-
-Start Jupyter and select the **"Structure Descent"** kernel when prompted:
-
-```bash
-jupyter notebook
-```
-
-Run notebooks in order:
-
-| Notebook | What it does |
-|---|---|
-| `00_data_exploration.ipynb` | EDA — distributions, categories, purchase volume |
-| `01_data_preparation.ipynb` | Clean data, compute state features, build choice sets, temporal split → saves to `data/` |
-| `02_dsl_features.ipynb` | Extract `[n_alts × n_terms]` feature matrices from choice events → saves `train_features.pkl` |
-| `03_inner_loop.ipynb` | Fit hierarchical weights θ_g + θ_c + Δ_i for the initial structure → saves `current_state.pkl` |
-| `04_outer_loop_llm.ipynb` | Run Structure Descent (LLM proposals + accept/reject) → saves `final_structure.pkl` |
-| `05_evaluation.ipynb` | Full evaluation: metrics, breakdowns, posterior predictive checks, baselines, ablations |
-
-> **Tip:** `MAX_EVENTS = 10_000` in notebook 02 lets you run quickly on a subset. Set to `None` for the full 1.85M row dataset.
-
----
-
-## Evaluation
-
-The full evaluation in `05_evaluation.ipynb` covers every method from the paper:
-
-**Predictive metrics** — top-1, top-5, MRR, NLL broken down by:
-- Product category
-- Repeat vs. novel purchases
-- User activity level (low / medium / high)
-- Time of day
-
-**Posterior predictive checks** — simulate sequences from the fitted model and compare to real data:
-- Repeat purchase rate
-- Category switching matrix P(cat_{t+1} | cat_t)
-- Inter-purchase gap distribution
-- Price trajectory
-- Brand loyalty index (HHI)
-
-**Baselines:**
-- Frequency (always predict most-purchased item)
-- Markov chain (category transition probabilities)
-- Standard conditional logit (hand-specified features, no search)
-- Structure Descent (final discovered structure)
-
-**Ablations:**
-- Structure search without LLM (random DSL proposals)
-- No hierarchy (single global weights, no θ_c or Δ_i)
-- TextGrad without priors (unconstrained LLM, no grammar)
-
----
-
-## DSL reference
-
-The utility function is a weighted sum of DSL terms: `u(a | s_t) = Σ θ_k · f_k(a, s_t)`
-
-**Layer 1 — Universal behavioral primitives**
-
-| Term | Meaning |
-|---|---|
-| `routine` | How many times the customer previously bought this item |
-| `recency` | Inverse days since last purchase of this item |
-| `novelty` | 1 if item never purchased by this customer |
-| `popularity` | Log-scaled global purchase frequency |
-| `affinity` | Log-scaled prior purchases in this category |
-| `time_match` | Whether this category is typical at this time of day |
-
-**Layer 2 — Amazon-specific features**
-
-| Term | Meaning |
-|---|---|
-| `price_sensitivity` | Negative price ratio relative to category average |
-| `rating_signal` | Star rating × log(review count) |
-| `brand_affinity` | Log-scaled brand purchase history |
-| `price_rank` | Cheapness relative to other items in session |
-| `delivery_speed` | Prime / fast shipping indicator |
-| `co_purchase` | Log-scaled co-purchase frequency with recent items |
-
-**Layer 3 — Combinators**
-
-| Term | Meaning |
-|---|---|
-| `interaction(a, b)` | Joint effect of two terms |
-| `split_by(term, cond)` | Different weights under different conditions |
-| `threshold(term, c)` | Binary indicator when term exceeds cutoff |
-| `log_transform(term)` | Signed log scaling |
-| `decay(term, halflife)` | Exponential decay over time |
-
----
-
-## Paper
-
-> *Structure Descent, LLM-Guided Utility Model Search for Interpretable Discrete Choice*
+Codebase + passing unit tests + `scripts/smoke_end_to_end.py` that executes
+one forward + backward pass on synthetic data and emits an interpretability
+report. No end-to-end training.

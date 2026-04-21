@@ -17,3 +17,17 @@ build/
 **.pdf
 **/colab_runner.ipynb
 **/NEXT_STEPS.md
+paper/
+
+# PO-LEU artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+outcomes_cache/*.sqlite
+outcomes_cache/*.parquet
+embeddings_cache/*.sqlite
+embeddings_cache/*.parquet
+checkpoints/*
+!checkpoints/.gitkeep
+reports/*
+!reports/.gitkeep
