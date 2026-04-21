@@ -141,7 +141,56 @@ preserved.
 
 ## Wave 2 — LLM generation + diversity filter
 
-(pending)
+**`src/outcomes/diversity_filter.py`** (§3.5).
+- `HashEmbedder(dim=64, seed=0)` is the deterministic stub encoder: SHA-256
+  of character 3-grams (with `\x02`/`\x03` sentinel padding so ≤2-char inputs
+  still emit a gram) mods into `dim` buckets, a second seeded SHA-256 picks
+  signs in `{-1, +1}`, and rows are L2-normalized (all-zero fallback snaps to
+  a deterministic unit basis vector). Numpy + stdlib only; no
+  sentence-transformers, torch, or sklearn.
+- Threshold default is `0.9` (§3.5). `find_paraphrase_pair` scans the strict
+  upper triangle in row-major order and returns the first `(i, j)` with
+  `cos_sim > threshold`, or `None`.
+- `diversity_filter(outcomes)` returns `(outcomes, ok)` — identity-preserving,
+  `ok == (no paraphrase found)`. The module never regenerates; `generate.py`
+  owns the "at most 2 retries" loop from §3.5.
+- `EmbeddingFn` is a `typing.Protocol` (runtime-checkable). Wave 3 will ship a
+  real `all-mpnet-base-v2`-backed encoder that plugs into the same protocol,
+  at which point the `embed_fn=None` default can be swapped without touching
+  this module.
+- Tests: `tests/test_diversity_filter.py`, 16 cases, all green.
+
+**`src/outcomes/generate.py`** (§3.3, §3.4).
+- `StubLLMClient` determinism: the completion is a `"\n".join` of one phrasing
+  per attribute family (`financial`, `health`, `convenience`, `emotional`,
+  `social`, in that order). A SHA-256 over `repr(messages) || "\x00" || seed`
+  drives the selection — byte `i` of the digest, mod the family size, picks
+  phrasing `i`. Same `(messages, seed)` → same text; distinct seeds flip at
+  least one byte of the digest with overwhelming probability, so the
+  per-family selections diverge.
+- `max_retries` is threaded into the generate loop by calling
+  `client.generate(..., seed=seed + attempt_idx)` for `attempt_idx in
+  range(max_retries + 1)`. A fresh seed per attempt means the stub actually
+  produces different text on retry; the `seed` recorded in metadata is the
+  final bumped seed, while the cache is keyed on the caller's *base* `seed`
+  so a re-call with the same base seed still hits the cache (§3.4).
+- Anthropic client: imported lazily inside `__init__` (and again defensively
+  at the top of `generate`). `import src.outcomes.generate` therefore never
+  touches the `anthropic` package — `ImportError` surfaces only on
+  instantiation. API key resolution reads `ANTHROPIC_API_KEY` inside the
+  constructor when `api_key is None`, never at module load; system prompts
+  are split off and forwarded via the SDK's top-level `system=` kwarg (the
+  SDK does not accept `role="system"` in `messages`). `seed` is not
+  forwarded because the Anthropic API has no seed parameter today.
+- Sentinel padding: `parse_completion` splits on `"\n"`, strips, drops
+  empties, keeps the first `K`; shortfalls are padded with
+  `SENTINEL_OUTCOME = "no additional consequence."` (exact §3.3 wording).
+  Every pad emits a stdlib `logger.warning` that includes the
+  `(customer_id, asin)` context the caller threads through.
+- Metadata recorded per cache write: `temperature`, `top_p`, `max_tokens`,
+  `model_id`, `finish_reason`, `seed`, `prompt_version`, `timestamp`
+  (`time.time()`). Covers row 1 of Reproducibility Checklist §15.
+- Tests: `tests/test_generate.py`, 11 cases, all green.
 
 ---
 
