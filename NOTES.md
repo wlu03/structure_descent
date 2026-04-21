@@ -22,6 +22,33 @@ also a note to self about what the paper/codebase must disclose.
 
 ---
 
+### Orchestrator-level spec resolution: per-head / salience parameter-count reconciliation (raised in Wave 4)
+
+§5.1 claims per-head count `768·128 + 128 + 128·1 + 1 = 98,433`; the actual
+sum is **98,561** (the spec formula drops the `fc1` bias term). §7.1 has
+the same bug: `794·64 + 64 + 64·1 + 1 = 50,881` but the actual sum is
+**50,945**. §6.1's weight-net count (`1,029`) is arithmetically correct.
+§0 states "Xavier-uniform for weights, zero init for biases" (biases are
+present on every linear by convention), and the architecture tables list
+two-Linear MLPs. The architecture is authoritative; the spec constants
+are the outliers.
+
+**Decision.** Two-Linear-with-biases architecture stands. Corrected
+constants (used by unit tests and by the §13 AIC/BIC reporting):
+
+| Module                      | Spec count (wrong) | Corrected count |
+|-----------------------------|--------------------|-----------------|
+| Attribute head (per-head)   | 98,433             | **98,561**       |
+| Attribute stack (M=5)       | 492,165            | **492,805**      |
+| Weight net                  | 1,029              | 1,029 (unchanged) |
+| Salience net                | 50,881             | **50,945**       |
+| **Total k (§9.4 / §13)**    | 544,075            | **544,779**      |
+
+The updated `k = 544,779` must propagate into the Wave-6 AIC/BIC reporting.
+Audit trail preserved; `docs/redesign.md` is not edited.
+
+---
+
 ## Wave 1 — data prep + cache + prompts
 
 ### Orchestrator-level spec resolution: p = 26 reconciliation
@@ -229,7 +256,56 @@ preserved.
 
 ## Wave 4 — model modules
 
-(pending)
+**`src/model/weight_net.py`** (§6).
+- `WeightNet(p=26, M=5, hidden=32, normalization="softmax")`: Linear(p→32) →
+  ReLU → Linear(32→5) → normalization, matching §6.1 exactly.
+- `normalization` is a simple switch. `"softmax"` (default) uses
+  `nn.Softmax(dim=-1)`; `"softplus"` applies `softplus(raw) /
+  softplus(raw).sum(-1, keepdim=True)` — the A4 ablation (§6.2 / §11) without
+  a second module. Any other string raises `ValueError`.
+- Xavier-uniform linear weights, zero biases (§0 convention). Final-layer
+  bias is retained (spec is silent).
+- `EXPECTED_PARAM_COUNT_DEFAULT = 1_029` exposed as a module-level constant
+  and asserted in `test_param_count_default`: `26*32 + 32 + 32*5 + 5`.
+- Forward contract: `(B, 26) → (B, 5)`, rows sum to 1.0 (atol 1e-6) under
+  both normalization modes.
+- Tests: `tests/test_weight_net.py`, 12 cases, all green.
+
+**`src/model/salience_net.py`** (§7, with orchestrator override).
+- `SalienceNet(d_e=768, p=26, hidden=64)`: `Linear(794 → 64) → ReLU →
+  Linear(64 → 1)`, both Linears carry biases per §0's "zero init for
+  biases" convention. Xavier-uniform weights, zero biases.
+- `forward(E, z_d)`: broadcasts `z_d` to `(B, J, K, p)` via
+  `z_d[:, None, None, :].expand(...)`, concatenates with `E` to
+  `(B, J, K, 794)`, runs the MLP to `(B, J, K, 1)`, squeezes, then
+  softmaxes over `K` — softmax is applied AFTER the MLP scalar score,
+  not before, so rows sum to 1 along `K` within each `(b, j)`.
+- `EXPECTED_PARAM_COUNT_DEFAULT = 50_945` (corrected from the spec's
+  arithmetic-wrong 50_881, per the §7.1 reconciliation block above);
+  asserted in `test_param_count_default`.
+- `UniformSalience` ablation A6 (§7.3): same signature, returns `1/K`
+  per entry, zero trainable params.
+- Tests: `tests/test_salience_net.py`, 11 cases, all green.
+
+**`src/model/attribute_heads.py`** (§5, with orchestrator override).
+- Confirmed: both Linears carry biases (`nn.Linear` default) per §0
+  "Xavier-uniform for weights, zero init for biases" — applies to both
+  `fc1` (d_e → hidden) and `fc2` (hidden → 1). §5.1's headline count of
+  `98,433` drops the `fc1` bias term; the actual sum
+  `768·128 + 128 + 128·1 + 1 = 98,561` is authoritative per the
+  orchestrator resolution block above.
+- `AttributeHead`: Linear(768→128) → ReLU → Linear(128→1), Xavier-uniform
+  weights, zero biases, no dropout / layernorm / residuals.
+- `AttributeHeadStack(M=5)` holds M independent heads in `nn.ModuleList`
+  (per §5.1 "M independent small MLPs"; no fused linear). Person-
+  independent (§5.3): `forward(E)` takes only the embedding tensor;
+  passing `z_d` as an extra positional raises `TypeError`.
+- Shape contract: `(B, J, K, d_e) → (B, J, K, M)` via last-axis concat of
+  each head's `(..., 1)` output.
+- `EXPECTED_PARAM_COUNT_PER_HEAD = 98_561` and
+  `EXPECTED_PARAM_COUNT_STACK_M5 = 492_805` are asserted at the corrected
+  values in `test_single_head_param_count` / `test_stack_param_count_default`.
+- Tests: `tests/test_attribute_heads.py`, 9 cases, all green.
 
 ---
 
