@@ -358,7 +358,120 @@ preserved.
 
 ## Wave 6 — training + eval
 
-(pending)
+**`src/train/regularizers.py`** (§9.2).
+- Four pure, composable terms + `RegularizerConfig` + `combined_regularizer`.
+  `weight_net_l2` walks `named_modules()` and sums `nn.Linear.weight ** 2`
+  only — biases are explicitly excluded (the spec writes `||φ_w||_2^2` on
+  weight parameters; softmax / activation modules contribute nothing).
+- **Entropy-sign convention.** `salience_entropy(S)` returns the *positive*
+  Shannon entropy `H(S) ≥ 0`. `combined_regularizer` subtracts
+  `λ_H · H(S)` so the loss shrinks when entropy grows — this is the §9.2
+  "minimize negative entropy, i.e. encourage spread" prescription. The
+  sign is documented in the function docstring and asserted by
+  `test_combined_sign_on_entropy`.
+- **Price-monotonicity alt-level surrogate.** §9.2 wants
+  `∂_{p_j} u_fin(e_k)`, but `E` is a frozen-encoder output with no
+  gradient path back to the scalar price, so a direct finite-difference
+  perturbation in embedding space would not correspond to a price
+  perturbation. Implemented instead at the alternative level:
+  mean-pool `u_fin` over `K`, sort `J` alternatives by price within each
+  batch, and penalize `mean(ReLU(Δu_fin / Δp))^2` over consecutive pairs
+  with `Δp > 0`. Ties (`Δp == 0`) are masked out. Non-negative, matches
+  the squared-positive-part form of §9.2 row 3.
+- **RegularizerConfig defaults from Appendix B.** `weight_l2 = 1e-4`,
+  `salience_entropy = 1e-3`, `monotonicity = 1e-3` (default
+  `enabled=False`), `diversity = 1e-4`. `from_default()` re-reads
+  `configs/default.yaml` and `test_regularizer_config_from_default`
+  cross-checks YAML ↔ dataclass defaults ↔ module `DEFAULT_LAMBDA_*`
+  constants to catch drift in any direction.
+- Tests: `tests/test_regularizers.py`, 12 cases, all green.
+
+**`src/eval/metrics.py`** (§13).
+- Exposes pure functions `topk_accuracy`, `mrr`, `nll`, `aic`, `bic`, plus
+  `compute_all(...)` → `EvalMetrics` dataclass (top1, top5, mrr_val, nll_val,
+  aic_val, bic_val, n_params, n_train; `to_dict()` via `dataclasses.asdict`).
+- **Natural log everywhere.** NLL uses `F.log_softmax` (natural log); BIC
+  uses `math.log(n_train)` (natural log); AIC shares the same base.
+- **MRR convention = `1 / (rank + 1)`** with 0-indexed rank (top → rank 0 →
+  reciprocal 1.0). Ties are unbiased: `rank = (# strictly greater) + 0.5 ·
+  (# tied others)`, so a uniform-logit row contributes `2/(J+1)` instead
+  of collapsing to 1 or `1/J`.
+- **Top-k tie-break** defers to `torch.topk` default (lower index first).
+- **AIC/BIC** are pure formulae: `aic = 2k + 2 n_train · NLL`,
+  `bic = k · ln n_train + 2 n_train · NLL`. Caller decides which NLL to
+  pass (§13 uses test-NLL); `compute_all` plumbs `k = 544_779` through
+  when `POLEU.num_params()` is passed in.
+- Accepts `torch.Tensor` **or** `np.ndarray` (converted via
+  `torch.as_tensor`); all six functions return Python floats. Stratified
+  breakdowns live in sibling `src/eval/strata.py` (out of scope).
+- Tests: `tests/test_metrics.py`, 12 cases, all green.
+
+**`src/train/loop.py`** (§9.1, §9.3).
+- `TrainConfig.from_default()` reads `configs/default.yaml → train:` via
+  pyyaml; defaults match Appendix B (batch 128, lr 1e-3 → 1e-4, 30 epochs,
+  patience 5, grad-clip 1.0). Non-"adam" optimizer raises. `TrainState`
+  tracks `step`, `epoch`, `train_loss`, `val_nll`, `best_val_nll`,
+  `patience_counter`, `stopped_early`.
+- `make_optimizer_and_scheduler` builds `torch.optim.Adam((β1, β2),
+  lr=cfg.lr)` and `CosineAnnealingLR(T_max=total_steps,
+  eta_min=cfg.lr_min)`; scheduler is stepped **per batch** and
+  grad-clip runs **before** `optimizer.step` via
+  `torch.nn.utils.clip_grad_norm_(cfg.grad_clip)`.
+- `iter_batches` yields `{z_d, E, c_star, omega}` dicts (last partial
+  batch allowed); **`omega=None` falls back to `torch.ones(N)`** per the
+  §9.1 "subsampling off ⇒ ω_t = 1" rule. Shuffling uses an optional
+  `torch.Generator` for determinism.
+- `try_import_subsample_weights` does `from src.train.subsample import
+  subsample_customers, apply_subsample` inside a try/except; both
+  `ImportError` and any runtime failure (e.g., missing Appendix-C
+  columns) return `(None, None)`. `n_customers=None` short-circuits
+  without touching the module (Appendix C.6 contract).
+- Regularizer integration is duck-typed: a top-level try/except imports
+  `RegularizerConfig` + `combined_regularizer` from
+  `src.train.regularizers`; absence is handled by a zero-returning
+  sentinel so `loop.py` is importable in isolation. When `reg_cfg is
+  not None`, `train_one_epoch` calls `combined_regularizer(model,
+  intermediates, E, None, reg_cfg)` (4th arg is `prices`, passed
+  `None` — §9.2 monotonicity is optional and requires a domain prior
+  not available at the loop level) and adds the scalar to the data
+  loss.
+- `evaluate_nll` is the pure §9.1 data NLL: `@torch.no_grad`, no
+  regularizers, **no ω** — a flat per-event mean `(1/N) ∑ ℓ_t` computed
+  by summing per-event CE across batches and dividing by total events
+  (so heterogeneous batch sizes don't skew the mean).
+- `fit` seeds torch, iterates up to `cfg.max_epochs`, runs
+  `train_one_epoch` then `evaluate_nll` on val, and early-stops when
+  `patience_counter >= cfg.early_stopping_patience` (counter resets on
+  improvement; `TrainState.stopped_early=True` on exit). `total_steps`
+  is the caller's responsibility (typically
+  `max_epochs × batches_per_epoch`).
+- Tests: `tests/test_train_loop.py`, 16 cases, all green.
+
+**`src/eval/strata.py`** (§13 strata, §12.3 dominant attribute).
+- Stratifiers (`category_breakdown`, `repeat_novel_breakdown`,
+  `activity_tertile_breakdown`, `time_of_day_breakdown`,
+  `dominant_attribute_breakdown`) all funnel through
+  `stratify_by_key(logits, c_star, group_key, *, compute_metrics_fn)` so
+  callers consume any strata result uniformly. Missing groups (0 events)
+  are omitted from the output (not present with NaNs).
+- **§12.3 mean-over-K aggregation.** The spec writes
+  `m* = argmax_m w_m · |u_m(e_{c*})|` for a single embedding, but PO-LEU
+  carries K outcomes per alternative. `dominant_attribute` takes the
+  **mean-over-K of `|u_m(e_k^{(c*)})|`** for the chosen alternative —
+  keeps the "which attribute drives this alternative's score" reading
+  and avoids mixing in salience (a separate interpretability axis).
+- **Tertile split convention.** `np.quantile(activity, [1/3, 2/3])` with
+  `np.digitize(..., right=False)`; ties on a quantile boundary fall into
+  the lower bucket, so the split is deterministic under duplicates.
+- **Time-of-day bucket boundaries** (half-open on the right):
+  night 0-6, morning 6-12, afternoon 12-18, evening 18-24. Hours outside
+  `[0, 24)` raise `ValueError`.
+- Default per-group metrics (`_default_metrics`) delegate to sibling
+  `src.eval.metrics` (`topk_accuracy`, `mrr`, `nll`) so strata stay in
+  lockstep with §13 conventions. AIC/BIC are deliberately excluded —
+  those need `n_train` + `k` and belong to the full-report layer.
+  Callers can override the whole metric bundle via `compute_metrics_fn=`.
+- Tests: `tests/test_strata.py`, 15 cases, all green.
 
 ---
 
