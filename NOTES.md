@@ -196,7 +196,34 @@ preserved.
 
 ## Wave 3 — encoder
 
-(pending)
+**`src/outcomes/encode.py`** (§4).
+- `EncoderClient` is a `typing.Protocol` (runtime-checkable) exposing
+  `encoder_id`, `d_e`, and `encode(texts) -> (N, d_e) float32` with rows
+  L2-normalized. Two concrete clients satisfy it.
+- `StubEncoder` (default, hermetic): per-string seed via
+  `blake2b(encoder_id || "\x00" || text, digest_size=8)` big-endian
+  → fresh `np.random.default_rng(seed)` draws `d_e` Gaussian samples,
+  then L2-normalize. Numpy + stdlib only; same string → same vector;
+  distinct inputs diverge far below the 0.999 cosine bar because every
+  byte of the blake2b digest drives a different RNG state.
+- `SentenceTransformersEncoder` (real, optional): `sentence_transformers`
+  is imported **lazily** inside `__init__` so importing this module
+  never loads torch. `encoder_id` is `f"{model_id}|pooling={pooling}|
+  max_length={max_length}"` — changing any of the three invalidates
+  the §4.3 cache. `encode()` delegates to the model with
+  `normalize_embeddings=True` (§4.2 step 4) and 64-token truncation.
+- `encode_batch` layers the §4.3 `EmbeddingsCache` on top of any
+  client: cache-misses are encoded in **one** batch, results are
+  written back, and the full tensor is reassembled in original input
+  order. `cache=None` is a pure pass-through with no side effects;
+  otherwise a second call with the same texts issues zero new
+  encodings (verified by `test_encode_batch_cache_miss_then_hit`).
+- `encode_outcomes_tensor` flattens `[B][J][K]` → `B*J*K` strings,
+  reuses `encode_batch`, reshapes to `(B, J, K, d_e)`. Ragged inputs
+  on either the J or K axis raise `ValueError`.
+- Tests: `tests/test_encode.py`, 11 cases, all green. All tests use
+  `StubEncoder` — `SentenceTransformersEncoder` is never instantiated
+  in the suite.
 
 ---
 
