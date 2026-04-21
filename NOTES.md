@@ -638,3 +638,166 @@ seed state that held when the test was first authored, but was fragile
 under test-order RNG drift; the new form captures the "γ near 1 on
 average" intent that the FiLM offset is supposed to guarantee.
 
+---
+
+## Wave 8 — v1 copy-in with schema parameterization
+
+**`src/data/schema_map.py`** (design doc §2, §4).
+- `DatasetSchema` fields: `name`, `description`, events block
+  (`events_path`, `events_parse_dates`, `events_column_map`,
+  `events_dropna_subset`, `events_category_null_fill`, `events_dtype_coerce`),
+  persons block (`persons_path`, `persons_id_column`), ordered
+  `z_d_mapping: tuple[ZDFieldSpec, ...]`, training block
+  (`choice_set_size`, `n_resamples`, `val_frac`, `test_frac`,
+  `subsample_enabled`, `subsample_n_customers`, `subsample_seed`).
+- Nine kind handlers implemented: `categorical_map`,
+  `categorical_map_with_collapse`, `categorical_to_int`, `ordinal_map`
+  (alias of `categorical_to_int`), `constant`, `composite`,
+  `external_lookup`, `derived_from_events`, `passthrough`.
+- Composite parser: restricted `ast.parse(..., mode='eval')` walker;
+  whitelist = `BinOp{Add,Sub,Mult,Div,Pow}`, `UnaryOp{USub}`,
+  `Compare{Eq}`, `Constant{int,float,str,bool}`, `Name`, and `Call`
+  limited to `min`/`max`/`abs`. No `eval`/`exec`. Column existence is
+  checked at parse time. Backtick-quoted identifiers (`` `Q-personal-diabetes` ``)
+  are rewritten to safe aliases before `ast.parse` and resolved back at
+  per-row lookup. Division by zero → NaN; NaN → `fallback` if set; `clamp`
+  applied last.
+- `drop_on_unknown` semantics: the union of drop values across all z_d
+  specs is applied to `persons_raw` *before* any translator runs. Rows
+  matching any drop value are removed entirely from the output — no z_d
+  columns are emitted for them. Any remaining source value not in
+  `values` raises `UnknownCategoryError`.
+- `derived_from_events` timing constraint: `translate_persons` requires a
+  `training_events` DataFrame whenever any z_d field has
+  `kind=derived_from_events`; a `ValueError` is raised if it is `None`.
+  The `mean` aggregator over `aggregator_column` requires that column to
+  already exist on `training_events` — i.e. `compute_state_features` (the
+  sibling module that writes `novelty`) must run *before* `translate_persons`.
+- Tests: `tests/test_schema_map.py`, 20 cases, all green.
+
+
+## Wave 8 — v1 copy-in with schema parameterization
+
+**`src/data/invariants.py`** (design doc §3).
+Strict between-stage validators for load → clean → survey_join →
+state_features → split → popularity. Failures raise `InvariantError`
+(an `AssertionError` subclass) carrying structured context:
+`invariant_name`, `stage`, optional `column`, and a `head(5)` sample of
+offending rows as a pandas DataFrame (always included when a row-level
+check fires so pytest output is self-contained). Key policy decisions:
+the survey-join stage logs a WARNING at or below a **5%** orphan-row
+miss-rate (rows with all-null joined survey columns) and raises
+`InvariantError("no_orphan_customers")` above that threshold;
+`recency_days` accepts the v1 `999` sentinel (never-purchased-before)
+alongside real non-negative values via `assert_non_negative(...,
+allow_sentinel=999.0)`; `popularity == 0` is a WARNING only (unseen
+ASINs outside the train window are legal, just noteworthy). Schema is a
+forward-string type hint (`"DatasetSchema"`) so callers can duck-type a
+`SimpleNamespace(events_column_map=..., persons_id_column=...)` to
+avoid a circular import against `schema_map.py`. No `strict=False`
+escape hatch — every assertion is unconditional.
+
+
+## Wave 8 — v1 copy-in with schema parameterization
+
+**`src/data/load.py`** (ported from `old_pipeline/src/data_prep.py:17-31`).
+Pure path-driven loader. `load(schema, *, events_path=None,
+persons_path=None) -> (events_raw, persons_raw)` reads the two CSVs
+declared on the `DatasetSchema` — or the per-call overrides (used by
+tests against `tests/fixtures/amazon_{events,persons}_100.csv`) — and
+returns them untouched. No renames, dtype coercion, or dropna; those
+live in `clean.py`. Three policy shifts vs. v1: (1) the module-level
+`DATA_DIR = Path(__file__).parent.parent / "amazon_ecom"` side effect
+at `data_prep.py:14` is **gone**; paths come exclusively from the
+schema (+ overrides). (2) `print(...)` is replaced with
+`logging.getLogger(__name__)` — INFO on stage completion
+("loaded 30484 events, 100 persons"), DEBUG for shapes, WARNING when
+either DataFrame is empty. (3) `validate_loaded(events_raw,
+persons_raw, schema)` is called before return, so schema/CSV mismatch
+surfaces as a structured `InvariantError` rather than a downstream
+`KeyError`. One wrinkle: `pd.read_csv(parse_dates=...)` raises a bare
+`ValueError` on a missing parse-date column, which would short-circuit
+the structured invariant; `load` peeks the header first and prunes
+`parse_dates` to columns actually present so the `InvariantError` from
+`validate_loaded` fires instead. Tests: `tests/test_data_load.py`,
+5 cases, all green.
+
+**`src/data/clean.py`** (ported from `old_pipeline/src/data_prep.py:34-63`).
+Thin wrapper around `src.data.schema_map.translate_events` — renames,
+`dropna_subset`, dtype coercion, and `category_null_fill` are *not*
+re-implemented here; they already live in `translate_events`. The
+ordering is fixed: (1) `translate_events` (schema-driven clean), (2)
+deterministic `sort_values(["customer_id","order_date"], kind="mergesort")`
++ `reset_index(drop=True)`, (3) `invariants.validate_cleaned(cleaned,
+schema)` — sort *before* validate so the post-stage `RangeIndex` +
+non-decreasing-within-customer shape is what downstream stages see.
+Logging uses `logging.getLogger(__name__)`: INFO on completion
+("cleaned N events, M customers, K categories ..."); if
+`translate_events`'s dropna removed **> 5%** of rows the line is
+upgraded to WARNING (same threshold as the survey-join miss-rate in
+`invariants.py`). Pure, deterministic, no module-level side effects,
+no new deps. Tests: `tests/test_data_clean.py`, 7 cases, all green.
+
+**`src/data/survey_join.py`** (ported from `old_pipeline/src/data_prep.py:66-99`).
+Left-joins `persons_raw` onto cleaned `events_df` by `customer_id` after
+renaming `schema.persons_id_column` (e.g. `"Survey ResponseID"`) to the
+canonical name. Port scope is deliberately narrow — column-rename +
+all-null-column drop + `drop_duplicates(subset=["customer_id"], keep="first")`
++ snake_case every persons column except the join key. z_d translation is
+**not** applied here (that is `schema_map.translate_persons`, fed the
+raw persons frame at a different stage). Q4 policy locked in NOTES:
+events whose `customer_id` is absent from persons **stay** in the joined
+frame (they contribute to popularity / state features and are dropped
+later at the z_d-build step when their survey columns are null); a
+WARNING fires with `n_events_orphan` and the miss-rate percent so the
+exclusion is visible. The v1 `_snake` helper is ported verbatim as
+`_snake_case`. `validate_joined` runs before return, so orphan-rate
+> 5% → `InvariantError`, orphan-rate in (0, 5%] → WARNING only. Tests:
+`tests/test_data_survey_join.py`, 11 cases, all green.
+
+**`src/data/state_features.py`** (ported from `old_pipeline/src/data_prep.py:102-225`).
+Logic-preserving port of `compute_state_features` (per-event history:
+`routine`, `novelty`, `recency_days`, `cat_affinity`, `cat_count_7d`,
+`cat_count_30d`, `brand`) + `attach_train_popularity` (train-only ASIN
+counts broadcast to every row). The `_BRAND_STOPWORDS` set, `_first_brand_token`,
+and `_build_asin_brand_map` helpers are copied verbatim — the stopword
+list is **Amazon-flavored** (pack/set/kit marketing terms, generic
+adjective buzzwords), and generalizing it is deferred to whichever
+future wave needs title-based brand inference for a second dataset.
+Three behavioral preserves: (1) first-time `(customer_id, asin)` pairs
+receive `recency_days = 999` (the sentinel `validate_state_features`
+whitelists via `allow_sentinel=999.0`); (2) input row count is preserved
+and the frame is re-sorted by `(customer_id, order_date)` on exit;
+(3) ASINs whose mode first-token appears only once across the catalog
+collapse to `"unknown_brand"`. Two policy shifts vs. v1: (a) all `print`
+calls replaced with `logging.getLogger(__name__)` (INFO per stage
+boundary, DEBUG for numeric diagnostics); (b) `attach_train_popularity`'s
+v1 `KeyError` on missing `split` is upgraded to a structured
+`InvariantError(invariant_name="split_required_for_popularity",
+stage="state_features")` via `assert_columns_present`, pointing the
+caller at the upstream `temporal_split` stage. Both public entry points
+call their matching validator (`validate_state_features` /
+`validate_popularity`) before returning. Tests:
+`tests/test_data_state_features.py`, 16 cases, all green.
+
+
+## Wave 8 — v1 copy-in with schema parameterization
+
+**`src/data/split.py`** (ported from `old_pipeline/src/data_prep.py:496-520`).
+Per-customer temporal split that appends a `split` column with values in
+`{"train", "val", "test"}`. **schema-or-kwargs contract**: callers pass
+either a `DatasetSchema` (whose `val_frac`/`test_frac` are used) or
+explicit `val_frac`/`test_frac` kwargs; when both are supplied the
+kwargs win, and a missing-both (or only-one-kwarg-with-no-schema)
+invocation raises `ValueError`. **v1 edge-case logic preserved
+verbatim**: `n_test = max(1, int(n * test_frac))`, `n_val = max(1,
+int(n * val_frac))`, and the `n_test + n_val >= n` collapse to
+`(n_test, n_val) = (1, 0)` for small customers; labels are assigned
+earliest -> latest as `n_train` trains then `n_val` vals then `n_test`
+tests. Deterministic `sort_values(["customer_id", "order_date"],
+kind="mergesort") + reset_index(drop=True)` runs before label
+assignment. **validate_split hook**: the post-stage invariant
+(`split ⊂ {train,val,test}`, every customer has >= 1 train row) runs
+before return, so a standalone 1-event customer raises `InvariantError`
+because v1's collapse labels that single row `"test"`. Tests:
+`tests/test_data_split.py`, 12 cases, all green.

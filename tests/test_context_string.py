@@ -21,7 +21,7 @@ def _base_row(**overrides):
     """A legal synthetic row covering every raw column c_d consumes."""
     row = {
         "age_bucket": "35-44",
-        "income_bucket": "50-75k",
+        "income_bucket": "50-100k",
         "household_size": 4,
         "has_kids": True,
         "city_size": "large",
@@ -80,8 +80,8 @@ def test_line_count_with_recent_and_time():
         "novelty_rate",
         "<25k",
         "25-50k",
-        "50-75k",
-        "75-150k",
+        "50-100k",
+        "100-150k",
         "150k+",
         "18-24",
         "25-34",

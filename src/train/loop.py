@@ -26,6 +26,7 @@ scope for this module — see the orchestrator plan).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -36,6 +37,8 @@ from torch import nn
 from torch.nn.utils import clip_grad_norm_
 
 from src.model.po_leu import cross_entropy_loss
+
+logger = logging.getLogger(__name__)
 
 
 # --- Optional regularizer import --------------------------------------------
@@ -221,6 +224,7 @@ def iter_batches(
     batch_size: int,
     shuffle: bool,
     generator: torch.Generator | None = None,
+    prices: torch.Tensor | None = None,
 ) -> Iterator[dict[str, torch.Tensor]]:
     """Yield mini-batches of a full-in-memory dataset.
 
@@ -230,9 +234,14 @@ def iter_batches(
     ``E``: ``(N, J, K, d_e)``
     ``c_star``: ``(N,)`` int64
     ``omega``: ``(N,)`` float, or ``None`` → treated as ones (§9.1 fallback)
+    ``prices``: optional ``(N, J)`` float tensor of per-alternative prices;
+        when supplied, each yielded batch includes a ``"prices"`` key used
+        by the §9.2 monotonicity regularizer. When ``None``, no ``"prices"``
+        key is emitted and the monotonicity term is inert.
 
-    Each yielded dict has keys ``"z_d", "E", "c_star", "omega"`` with the
-    first-axis reduced to ``batch_size`` (last batch may be shorter).
+    Each yielded dict has keys ``"z_d", "E", "c_star", "omega"`` and,
+    when ``prices`` is provided, ``"prices"``. First-axis is reduced to
+    ``batch_size`` (last batch may be shorter).
 
     When ``shuffle=True`` a permutation is drawn with the provided
     ``generator`` (or the default generator if ``None``); when ``False``
@@ -256,6 +265,16 @@ def iter_batches(
             )
         omega_t = omega
 
+    if prices is not None:
+        if prices.shape[0] != N:
+            raise ValueError(
+                f"prices first dim must equal N={N}; got {prices.shape=}."
+            )
+        if prices.dim() != 2:
+            raise ValueError(
+                f"prices must be 2-D (N, J); got {prices.shape=}."
+            )
+
     if shuffle:
         perm = torch.randperm(N, generator=generator)
     else:
@@ -263,12 +282,15 @@ def iter_batches(
 
     for start in range(0, N, batch_size):
         idx = perm[start : start + batch_size]
-        yield {
+        batch = {
             "z_d": z_d.index_select(0, idx),
             "E": E.index_select(0, idx),
             "c_star": c_star.index_select(0, idx),
             "omega": omega_t.index_select(0, idx),
         }
+        if prices is not None:
+            batch["prices"] = prices.index_select(0, idx)
+        yield batch
 
 
 # --- Optional subsampling integration ---------------------------------------
@@ -316,6 +338,11 @@ def try_import_subsample_weights(
             subsample_customers,
         )
     except ImportError:
+        logger.warning(
+            "src.train.subsample not importable — falling back to ω_t=1. "
+            "This is expected if subsampling is disabled; if you enabled "
+            "subsample.enabled=true in the config, this is a real bug."
+        )
         return (None, None)
 
     try:
@@ -325,9 +352,16 @@ def try_import_subsample_weights(
         _filtered, event_weights = apply_subsample(
             train_df, selected_ids, customer_weights
         )
-    except Exception:
+    except Exception as exc:
         # Any runtime failure (e.g., missing columns, degenerate SVD,
         # KMeans warning elevated to error) falls back to ω=1 per §9.1.
+        logger.warning(
+            "src.train.subsample.subsample_customers raised %r — "
+            "falling back to ω_t=1. Most likely cause: state_features "
+            "did not produce the required columns (routine, recency_days, "
+            "novelty) on this DataFrame. Run compute_state_features first.",
+            exc,
+        )
         return (None, None)
 
     return (selected_ids, event_weights)
@@ -346,21 +380,24 @@ def _compute_batch_loss(
     Returns the scalar total loss with autograd graph attached.
 
     The ``reg_cfg`` path delegates to ``combined_regularizer(model,
-    intermediates, E, None, reg_cfg)`` per §9.2 — the fourth positional
-    argument is ``prices`` in the sibling module's signature; we pass
-    ``None`` because prices are not available at this level (§9.2
-    monotonicity is described as optional and requires a domain prior).
+    intermediates, E, prices, reg_cfg)`` per §9.2. ``prices`` is read from
+    the batch dict when present (populated by :func:`iter_batches` when
+    the caller supplied a ``prices`` tensor) and is ``None`` otherwise.
+    When ``prices is None`` the §9.2 monotonicity term is inert regardless
+    of ``cfg.monotonicity_enabled`` — the caller must thread real prices
+    to enable it.
     """
     z_d = batch["z_d"]
     E = batch["E"]
     c_star = batch["c_star"]
     omega = batch["omega"]
+    prices = batch.get("prices")  # optional; None disables monotonicity term
 
     logits, intermediates = model(z_d, E)
     loss = cross_entropy_loss(logits, c_star, omega)
 
     if reg_cfg is not None:
-        reg_term = combined_regularizer(model, intermediates, E, None, reg_cfg)
+        reg_term = combined_regularizer(model, intermediates, E, prices, reg_cfg)
         loss = loss + reg_term
 
     return loss

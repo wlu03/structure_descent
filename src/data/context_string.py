@@ -46,12 +46,19 @@ DEFAULT_PHRASINGS: dict[str, dict[Any, str]] = {
         "55-64": "mid-50s",
         "65+": "mid-60s or older",
     },
+    # Option-B income collapse (NOTES.md Wave 8, Artifact-3 decision):
+    # Distribution-weighted midpoints from 5,027 Amazon survey respondents.
+    # Only the `50-100k` bucket has a non-trivial weighted midpoint
+    # ($72.9k, vs. naive $75k) because it merges two raw sub-buckets.
+    # Open-ended endpoints use US Census ACS 2022 PUMS anchors
+    # (<$25k mean ≈ $14.2k → $15k; ≥$150k mean ≈ $221k → rounded
+    # conservatively to $200k).
     "income_bucket": {
         "<25k": "about $15k/year",
-        "25-50k": "about $35k/year",
-        "50-75k": "about $60k/year",
-        "75-150k": "about $110k/year",
-        "150k+": "above $150k/year",
+        "25-50k": "about $38k/year",
+        "50-100k": "about $73k/year",
+        "100-150k": "about $125k/year",
+        "150k+": "around $200k/year",
     },
     "city_size": {
         "rural": "rural area",
@@ -131,8 +138,8 @@ _RAW_BUCKET_CODES: tuple[str, ...] = (
     "65+",
     "<25k",
     "25-50k",
-    "50-75k",
-    "75-150k",
+    "50-100k",
+    "100-150k",
     "150k+",
 )
 

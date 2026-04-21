@@ -1,0 +1,182 @@
+# Amazon-purchases + Prolific survey (Harvard Dataverse, 2018-2023).
+# Covers 5,027 survey respondents and ~1.48M purchase events.
+#
+# Refusals on Q-demos-income ("Prefer not to say", 76 respondents, 1.5%)
+# are dropped at the translate step per Artifact-3 decision; all other
+# missing z_d fields use kind: constant sentinels.
+#
+# See NOTES.md "Wave 8 — v1 copy-in with schema parameterization" for the
+# full decision log, especially Option-B income collapse and the
+# distribution-weighted midpoint calculations for `context_string`.
+
+dataset:
+  name: amazon
+  description: >
+    Amazon-purchases-2018-2023 + Prolific survey. Events in
+    amazon-purchases.csv; persons in survey.csv. Purchase-event shape:
+    (customer, date, asin, price, category, title). Canonical schema
+    matches redesign.md §2.1 (with Option-B income collapse + Amazon
+    sentinels for has_kids, health_rating, risk_tolerance).
+
+  events:
+    path: amazon_ecom/amazon-purchases.csv
+    parse_dates:
+      - "Order Date"
+    column_map:
+      "Order Date":                     order_date
+      "Purchase Price Per Unit":        price
+      "Quantity":                       quantity
+      "Shipping Address State":         state
+      "Title":                          title
+      "ASIN/ISBN (Product Code)":       asin
+      "ASIN/ISBN":                      asin
+      "Category":                       category
+      "Survey ResponseID":              customer_id
+    dropna_subset:
+      - customer_id
+      - order_date
+      - asin
+    category_null_fill: "Unknown"
+    dtype_coerce:
+      price: float
+      customer_id: str
+      asin: str
+
+  persons:
+    path: amazon_ecom/survey.csv
+    id_column: "Survey ResponseID"
+
+    z_d_mapping:
+
+      age_bucket:
+        source: "Q-demos-age"
+        kind: categorical_map
+        values:
+          "18 - 24 years":      "18-24"
+          "25 - 34 years":      "25-34"
+          "35 - 44 years":      "35-44"
+          "45 - 54 years":      "45-54"
+          "55 - 64 years":      "55-64"
+          "65 and older":       "65+"
+
+      income_bucket:
+        source: "Q-demos-income"
+        kind: categorical_map_with_collapse
+        # Option-B collapse (NOTES.md Artifact-3). Preserves both tails at
+        # raw resolution; merges $50-74k + $75-99k → "50-100k".
+        values:
+          "Less than $25,000":          "<25k"
+          "$25,000 - $49,999":          "25-50k"
+          "$50,000 - $74,999":          "50-100k"
+          "$75,000 - $99,999":          "50-100k"
+          "$100,000 - $149,999":        "100-150k"
+          "$150,000 or more":           "150k+"
+        drop_on_unknown:
+          - "Prefer not to say"
+        note: >
+          Distribution-weighted midpoint for the merged "50-100k" bucket is
+          ~$72.9k (1063 respondents at $62.5k + 761 at $87.5k out of 1824),
+          vs. naive $75k. The context_string.py phrasing "about $73k/year"
+          reflects the weighted value.
+
+      household_size:
+        source: "Q-amazon-use-hh-size"
+        kind: categorical_to_int
+        values:
+          "1 (just me!)":   1
+          "2":              2
+          "3":              3
+          "4+":             4
+        note: >
+          Survey max is "4+"; the person_features 5-bin scheme {1,2,3,4,5+}
+          therefore has an empty 5th slot for Amazon. Not a bug; the fit
+          learns the vocabulary from the DataFrame at runtime.
+
+      has_kids:
+        source: null
+        kind: constant
+        value: 0
+        note: >
+          Survey has no direct has_kids question. Proxies considered:
+          Q-life-changes == "Had a child" (biased toward RECENT parents);
+          household_size >= 3 (weak). Using constant 0 for Amazon v1.
+          Standardization in person_features.py collapses a constant
+          column to exactly zero (std policy at line 328), so this
+          produces a literal-zero z_d slot that absorbs cleanly in every
+          architecture except FiLM's multiplicative pathway (where the
+          absorption is still complete for c=0 — see Artifact-2).
+
+      city_size:
+        source: "Q-demos-state"
+        kind: external_lookup
+        lookup_path: configs/datasets/amazon/state_to_citysize.csv
+        fallback: "medium"
+        note: >
+          US Census ACS urban-percentage by state, bucketed to
+          {rural, small, medium, large}. The lookup CSV ships empty for
+          Amazon v1; every row falls through to fallback="medium", which
+          means one z_d one-hot slot is always 1 for every customer.
+          This creates the only nonzero-constant case in the FiLM
+          ablation (A8) — inconsequential for Wave 11/12 which run the
+          default PO-LEU.
+
+      education:
+        source: "Q-demos-education"
+        kind: ordinal_map
+        values:
+          "Some high school":                                                       1
+          "High school diploma or GED":                                             2
+          "Some college":                                                           3
+          "Bachelor's degree":                                                      4
+          "Graduate or professional degree (MA, MS, MBA, PhD, JD, MD, DDS, etc)":   5
+
+      health_rating:
+        source: null
+        kind: composite
+        formula: "5 - (`Q-personal-diabetes` == 'Yes') - (`Q-personal-wheelchair` == 'Yes')"
+        clamp: [1, 5]
+        fallback: 3
+        note: >
+          Only two health-adjacent binary columns in the survey. The
+          composite is lossy; the clamped output is in {3, 4, 5}.
+          Standardization then makes the constant-by-row portion zero
+          (the "always-5-minus-zero-minus-zero" baseline) and the
+          reaching-3 portion a small negative deviation for the 7% of
+          respondents who report diabetes or wheelchair use.
+
+      risk_tolerance:
+        source: null
+        kind: composite
+        formula: "(`Q-substance-use-cigarettes` == 'Yes') + (`Q-substance-use-marijuana` == 'Yes') + (`Q-substance-use-alcohol` == 'Yes')"
+        fallback: 0
+        note: >
+          Substance-use count (range 0-3). Standardized on the train split
+          per person_features.py. Loosely tracks risk-tolerating lifestyle;
+          the paper should frame this as a proxy, not a direct measure.
+
+      purchase_frequency:
+        source: derived_from_events
+        aggregator: count
+        group_by: customer_id
+        note: >
+          Count of events per customer in the train window. log1p applied
+          downstream by transform_person_features.
+
+      novelty_rate:
+        source: derived_from_events
+        aggregator: mean
+        aggregator_column: novelty
+        group_by: customer_id
+        note: >
+          Mean of the per-event novelty flag. Requires compute_state_features
+          to have run so the novelty column exists on the train DataFrame.
+
+  training:
+    choice_set_size: 10
+    n_resamples: 1
+    val_frac: 0.1
+    test_frac: 0.1
+    subsample:
+      enabled: false   # toggled true by scripts/run_dataset.py via --n-customers
+      n_customers: 500
+      seed: 42
