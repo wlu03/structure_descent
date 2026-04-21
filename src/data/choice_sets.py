@@ -60,6 +60,7 @@ def build_choice_sets(
     n_resamples: int = 1,
     popularity_col: str = "popularity",
     split_column: str = "split",
+    customer_to_extras: dict | None = None,
 ) -> list[dict]:
     """Return per-event choice-set records with ``z_d`` and ``c_d`` attached.
 
@@ -166,12 +167,19 @@ def build_choice_sets(
     }
 
     # c_d: render once per customer via build_context_string with the
-    # adapter-declared suppress_fields.
+    # adapter-declared suppress_fields. When the caller supplies
+    # ``customer_to_extras`` (Wave-11 enrichment), pass that customer's
+    # extras through as the ``extra_fields`` kwarg — keys
+    # ``{gender, life_event, amazon_frequency}`` ride alongside c_d but
+    # never touch z_d.
+    extras_by_cid = customer_to_extras or {}
     customer_to_cd: dict[object, str] = {}
     for _, row in persons_canonical.iterrows():
         cid = row["customer_id"]
         customer_to_cd[cid] = build_context_string(
-            row.to_dict(), suppress_fields=suppress
+            row.to_dict(),
+            suppress_fields=suppress,
+            extra_fields=extras_by_cid.get(cid),
         )
 
     # --------------------------------------------------------------- #

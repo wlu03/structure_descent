@@ -512,8 +512,38 @@ def main(args: argparse.Namespace) -> int:
     # Deferred to Wave 11/12: a fit-on-train, transform-on-all pattern that
     # supports val/test customers not present in train.
     from src.data.choice_sets import build_choice_sets
+    from src.data.context_string import extract_extra_fields_from_row
 
-    logger.info("stage: build_choice_sets (train+val rows together)")
+    # Wave-11 c_d enrichment: build a {customer_id -> extras} map from the
+    # dataset YAML's optional ``persons.c_d_extra_fields`` block and the
+    # RAW (pre-translate) persons rows. Unknown / NaN values are dropped
+    # inside the helper, so customers who refused gender / have no
+    # recent life-change / etc. simply get those clauses omitted.
+    dataset_yaml_dict = _load_yaml(dataset_yaml)
+    extras_block = (
+        dataset_yaml_dict.get("dataset", {})
+        .get("persons", {})
+        .get("c_d_extra_fields", {})
+    ) or {}
+    customer_to_extras: dict[str, dict] = {}
+    if extras_block:
+        survivors = set(persons_canonical["customer_id"].astype(str))
+        for _, raw_row in persons_raw.iterrows():
+            cid = str(raw_row.get(persons_id_col, ""))
+            if cid not in survivors:
+                continue
+            customer_to_extras[cid] = extract_extra_fields_from_row(
+                raw_row.to_dict(), extras_block
+            )
+        logger.info(
+            "c_d enrichment: extras_block loaded (%d fields); populated "
+            "extras for %d of %d survivors.",
+            len(extras_block),
+            sum(1 for v in customer_to_extras.values() if v),
+            len(survivors),
+        )
+
+    logger.info("stage: build_choice_sets (train+val+test rows together)")
     records_all = build_choice_sets(
         events_subset,
         persons_canonical,
@@ -521,6 +551,7 @@ def main(args: argparse.Namespace) -> int:
         seed=int(args.seed),
         n_resamples=int(adapter.schema.n_resamples),
         n_negatives=int(adapter.schema.choice_set_size) - 1,
+        customer_to_extras=customer_to_extras or None,
     )
 
     # Split records by the attached event's split (via per-record index).
