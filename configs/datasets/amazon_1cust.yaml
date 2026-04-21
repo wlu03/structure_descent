@@ -1,0 +1,167 @@
+dataset:
+  description: "Amazon-purchases-2018-2023 + Prolific survey. Events in amazon-purchases.csv;\
+    \ persons in survey.csv. Purchase-event shape: (customer, date, asin, price, category,\
+    \ title). Canonical schema matches redesign.md \xA72.1 (with Option-B income collapse\
+    \ + Amazon sentinels for has_kids, health_rating, risk_tolerance).\n"
+  events:
+    category_null_fill: Unknown
+    column_map:
+      ASIN/ISBN: asin
+      ASIN/ISBN (Product Code): asin
+      Category: category
+      Order Date: order_date
+      Purchase Price Per Unit: price
+      Quantity: quantity
+      Shipping Address State: state
+      Survey ResponseID: customer_id
+      Title: title
+    dropna_subset:
+    - customer_id
+    - order_date
+    - asin
+    dtype_coerce:
+      asin: str
+      customer_id: str
+      price: float
+    parse_dates:
+    - Order Date
+    path: tests/fixtures/amazon_events_1.csv
+  name: amazon
+  persons:
+    id_column: Survey ResponseID
+    path: tests/fixtures/amazon_persons_1.csv
+    z_d_mapping:
+      age_bucket:
+        kind: categorical_map
+        source: Q-demos-age
+        values:
+          18 - 24 years: 18-24
+          25 - 34 years: 25-34
+          35 - 44 years: 35-44
+          45 - 54 years: 45-54
+          55 - 64 years: 55-64
+          65 and older: 65+
+      city_size:
+        fallback: medium
+        kind: external_lookup
+        lookup_path: configs/datasets/amazon/state_to_citysize.csv
+        note: "US Census ACS urban-percentage by state, bucketed to {rural, small,\
+          \ medium, large}. The lookup CSV ships empty for Amazon v1; every row falls\
+          \ through to fallback=\"medium\", which means one z_d one-hot slot is always\
+          \ 1 for every customer. This creates the only nonzero-constant case in the\
+          \ FiLM ablation (A8) \u2014 inconsequential for Wave 11/12 which run the\
+          \ default PO-LEU.\n"
+        source: Q-demos-state
+      education:
+        drop_on_unknown:
+        - Prefer not to say
+        kind: ordinal_map
+        note: 'Amazon survey has 4 education levels (verified against the real CSV):
+          "Some high school or less" (n=46), "High school diploma or GED" (1860),
+          "Bachelor''s degree" (2219), "Graduate or professional degree" (870). Mapping
+          leaves an intentional gap at ordinal 3 ("Some college") because the survey
+          does not capture that level. 32 respondents refuse ("Prefer not to say");
+          dropped at translate time. Post-standardization the gap is absorbed (education
+          is a standardized scalar in z_d).
+
+          '
+        source: Q-demos-education
+        values:
+          Bachelor's degree: 4
+          Graduate or professional degree (MA, MS, MBA, PhD, JD, MD, DDS, etc): 5
+          High school diploma or GED: 2
+          Some high school or less: 1
+      has_kids:
+        kind: constant
+        note: "Survey has no direct has_kids question. Proxies considered: Q-life-changes\
+          \ == \"Had a child\" (biased toward RECENT parents); household_size >= 3\
+          \ (weak). Using constant 0 for Amazon v1. Standardization in person_features.py\
+          \ collapses a constant column to exactly zero (std policy at line 328),\
+          \ so this produces a literal-zero z_d slot that absorbs cleanly in every\
+          \ architecture except FiLM's multiplicative pathway (where the absorption\
+          \ is still complete for c=0 \u2014 see Artifact-2).\n"
+        source: null
+        value: 0
+      health_rating:
+        clamp:
+        - 1
+        - 5
+        fallback: 3
+        formula: 5 - (`Q-personal-diabetes` == 'Yes') - (`Q-personal-wheelchair` ==
+          'Yes')
+        kind: composite
+        note: 'Only two health-adjacent binary columns in the survey. The composite
+          is lossy; the clamped output is in {3, 4, 5}. Standardization then makes
+          the constant-by-row portion zero (the "always-5-minus-zero-minus-zero" baseline)
+          and the reaching-3 portion a small negative deviation for the 7% of respondents
+          who report diabetes or wheelchair use.
+
+          '
+        source: null
+      household_size:
+        kind: categorical_to_int
+        note: 'Survey max is "4+"; the person_features 5-bin scheme {1,2,3,4,5+} therefore
+          has an empty 5th slot for Amazon. Not a bug; the fit learns the vocabulary
+          from the DataFrame at runtime.
+
+          '
+        source: Q-amazon-use-hh-size
+        values:
+          1 (just me!): 1
+          '2': 2
+          '3': 3
+          4+: 4
+      income_bucket:
+        drop_on_unknown:
+        - Prefer not to say
+        kind: categorical_map_with_collapse
+        note: 'Distribution-weighted midpoint for the merged "50-100k" bucket is ~$72.9k
+          (1063 respondents at $62.5k + 761 at $87.5k out of 1824), vs. naive $75k.
+          The context_string.py phrasing "about $73k/year" reflects the weighted value.
+
+          '
+        source: Q-demos-income
+        values:
+          $100,000 - $149,999: 100-150k
+          $150,000 or more: 150k+
+          $25,000 - $49,999: 25-50k
+          $50,000 - $74,999: 50-100k
+          $75,000 - $99,999: 50-100k
+          Less than $25,000: <25k
+      novelty_rate:
+        aggregator: mean
+        aggregator_column: novelty
+        group_by: customer_id
+        note: 'Mean of the per-event novelty flag. Requires compute_state_features
+          to have run so the novelty column exists on the train DataFrame.
+
+          '
+        source: derived_from_events
+      purchase_frequency:
+        aggregator: count
+        group_by: customer_id
+        note: 'Count of events per customer in the train window. log1p applied downstream
+          by transform_person_features.
+
+          '
+        source: derived_from_events
+      risk_tolerance:
+        fallback: 0
+        formula: (`Q-substance-use-cigarettes` == 'Yes') + (`Q-substance-use-marijuana`
+          == 'Yes') + (`Q-substance-use-alcohol` == 'Yes')
+        kind: composite
+        note: 'Substance-use count (range 0-3). Standardized on the train split per
+          person_features.py. Loosely tracks risk-tolerating lifestyle; the paper
+          should frame this as a proxy, not a direct measure.
+
+          '
+        source: null
+  training:
+    choice_set_size: 10
+    n_resamples: 1
+    subsample:
+      enabled: false
+      n_customers: 500
+      seed: 42
+    test_frac: 0.1
+    val_frac: 0.1

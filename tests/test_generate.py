@@ -209,7 +209,10 @@ def test_cache_value_shape(tmp_cache_dir: Path) -> None:
             K=3, seed=1, prompt_version=PROMPT_VERSION,
             client=client, cache=cache,
         )
-        raw = cache.get_outcomes("cust-A", "B-A", 1, PROMPT_VERSION)
+        # generate_outcomes folds K into the cache-key's prompt_version
+        # field ("v1-K3"); the raw key-level read-back must use that
+        # composite value to find the entry.
+        raw = cache.get_outcomes("cust-A", "B-A", 1, f"{PROMPT_VERSION}-K3")
     finally:
         cache.close()
 

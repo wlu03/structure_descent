@@ -331,10 +331,14 @@ class AnthropicLLMClient:
             else:
                 user_messages.append({"role": msg["role"], "content": msg["content"]})
 
+        # Anthropic's newer models reject simultaneously-specified
+        # ``temperature`` and ``top_p``; we forward only ``temperature``
+        # (§3.3 sets both but the API now disallows the combo). The
+        # ``top_p`` value is silently dropped for Anthropic calls;
+        # stub / other clients still receive both parameters.
         create_kwargs: dict[str, Any] = {
             "model": self.model_id,
             "temperature": temperature,
-            "top_p": top_p,
             "max_tokens": max_tokens,
             "messages": user_messages,
         }
@@ -511,14 +515,26 @@ def generate_outcomes(
         ``outcomes`` is exactly ``K`` strings; ``metadata`` carries the
         fields listed in the module docstring.
     """
+    # Cache-key ``prompt_version`` includes K so different K values (e.g.
+    # K=1 validation vs K=3 ablation) never collide in the §3.4 cache.
+    # §3.4 lists four key fields — we fold K into ``prompt_version``
+    # rather than adding a fifth field, keeping the cache layer spec-
+    # compliant. Documented in NOTES.md Wave 11 dry-run.
+    cache_prompt_version = f"{prompt_version}-K{int(K)}"
+
     # ---- 1. cache lookup ------------------------------------------------
     if cache is not None:
-        cached = cache.get_outcomes(customer_id, asin, seed, prompt_version)
+        cached = cache.get_outcomes(customer_id, asin, seed, cache_prompt_version)
         if cached is not None:
-            return OutcomesPayload(
-                outcomes=list(cached.get("outcomes", [])),
-                metadata=dict(cached.get("metadata", {})),
-            )
+            cached_outcomes = list(cached.get("outcomes", []))
+            # Defensive: if a legacy (pre-K-fold) entry somehow survived,
+            # its length may not match K. Bail on the cache hit and
+            # regenerate rather than tripping the batching invariant.
+            if len(cached_outcomes) == int(K):
+                return OutcomesPayload(
+                    outcomes=cached_outcomes,
+                    metadata=dict(cached.get("metadata", {})),
+                )
 
     # ---- 2. build messages ---------------------------------------------
     messages = build_messages(c_d=c_d, alt=alt, K=K)
@@ -584,7 +600,7 @@ def generate_outcomes(
             customer_id,
             asin,
             seed,
-            prompt_version,
+            cache_prompt_version,
             final_outcomes,
             metadata,
         )
