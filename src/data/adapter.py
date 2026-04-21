@@ -109,6 +109,14 @@ class DatasetAdapter(Protocol):
         """Canonical z_d column names that should be skipped in ``c_d``."""
         ...
 
+    def categorical_vocabularies(self) -> "CategoricalVocabularies":
+        """Closed-set vocabularies for the one-hot z_d columns.
+
+        Used to pin z_d output width independent of the training-slice
+        composition. See ``src.data.person_features.CategoricalVocabularies``.
+        """
+        ...
+
 
 # --------------------------------------------------------------------------- #
 # Default YAML-backed implementation
@@ -298,6 +306,70 @@ class YamlAdapter:
         so adapter-suppress drift cannot break the renderer.
         """
         return self._suppress_fields_cache
+
+    # ------------------------------------------------------------------ #
+    # categorical_vocabularies (Wave 10)
+    # ------------------------------------------------------------------ #
+
+    def categorical_vocabularies(self) -> "CategoricalVocabularies":
+        """Build closed-set vocabularies for the one-hot z_d columns.
+
+        Rules per canonical column:
+
+        * ``kind == "categorical_map"`` / ``"categorical_map_with_collapse"``:
+          vocabulary = sorted unique range of ``values:`` dict.
+        * ``kind == "constant"``: vocabulary = ``(str(spec.value),)``.
+        * ``kind == "external_lookup"``: read the lookup CSV's ``value``
+          column; if empty or missing, fall back to ``(str(spec.fallback),)``.
+        * ``household_size`` is not schema-declared; always uses the
+          orchestrator-fixed ``("1", "2", "3", "4", "5+")``.
+
+        Cached — computed once on first call.
+        """
+        from src.data.person_features import CategoricalVocabularies
+
+        if getattr(self, "_vocab_cache", None) is None:
+            age = self._vocab_for("age_bucket")
+            income = self._vocab_for("income_bucket")
+            city = self._vocab_for("city_size")
+            self._vocab_cache = CategoricalVocabularies(
+                age_bucket=tuple(age),
+                income_bucket=tuple(income),
+                city_size=tuple(city),
+            )
+        return self._vocab_cache
+
+    def _vocab_for(self, canonical_column: str) -> list[str]:
+        """Extract the declared vocabulary for one canonical one-hot column."""
+        spec = next(
+            (s for s in self.schema.z_d_mapping
+             if s.canonical_column == canonical_column),
+            None,
+        )
+        if spec is None:
+            raise ValueError(
+                f"Schema has no z_d entry for canonical column "
+                f"{canonical_column!r}."
+            )
+        if spec.kind in ("categorical_map", "categorical_map_with_collapse"):
+            return sorted({str(v) for v in (spec.values or {}).values()})
+        if spec.kind == "constant":
+            return [str(spec.value)]
+        if spec.kind == "external_lookup":
+            if spec.lookup_path is None or self._external_lookup_is_empty(
+                spec.lookup_path
+            ):
+                return [str(spec.fallback)]
+            try:
+                tbl = pd.read_csv(spec.lookup_path)
+                return sorted({str(v) for v in tbl["value"].dropna().unique()})
+            except Exception:
+                return [str(spec.fallback)]
+        raise ValueError(
+            f"Cannot derive vocabulary for {canonical_column!r} "
+            f"from kind={spec.kind!r}; only categorical_map*, constant, "
+            f"and external_lookup are supported for one-hot z_d fields."
+        )
 
     # ------------------------------------------------------------------ #
     # Internals

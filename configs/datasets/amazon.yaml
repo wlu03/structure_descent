@@ -124,11 +124,21 @@ dataset:
         source: "Q-demos-education"
         kind: ordinal_map
         values:
-          "Some high school":                                                       1
+          "Some high school or less":                                               1
           "High school diploma or GED":                                             2
-          "Some college":                                                           3
           "Bachelor's degree":                                                      4
           "Graduate or professional degree (MA, MS, MBA, PhD, JD, MD, DDS, etc)":   5
+        drop_on_unknown:
+          - "Prefer not to say"
+        note: >
+          Amazon survey has 4 education levels (verified against the real
+          CSV): "Some high school or less" (n=46), "High school diploma
+          or GED" (1860), "Bachelor's degree" (2219), "Graduate or
+          professional degree" (870). Mapping leaves an intentional gap
+          at ordinal 3 ("Some college") because the survey does not
+          capture that level. 32 respondents refuse ("Prefer not to
+          say"); dropped at translate time. Post-standardization the
+          gap is absorbed (education is a standardized scalar in z_d).
 
       health_rating:
         source: null

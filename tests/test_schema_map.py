@@ -88,9 +88,9 @@ def _raw_amazon_persons() -> pd.DataFrame:
             "Q-amazon-use-hh-size": ["1 (just me!)", "2", "3", "4+", "2"],
             "Q-demos-state": ["CA", "NY", "TX", "FL", "WA"],
             "Q-demos-education": [
-                "Some high school",
+                "Some high school or less",
                 "High school diploma or GED",
-                "Some college",
+                "Bachelor's degree",
                 "Bachelor's degree",
                 "Graduate or professional degree (MA, MS, MBA, PhD, JD, MD, DDS, etc)",
             ],

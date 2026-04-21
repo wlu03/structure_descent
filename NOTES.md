@@ -878,3 +878,121 @@ end-to-end).
   → translate_z_d pipeline against a fully synthetic 5-customer YAML
   built entirely in `tmp_path`, with no import from `amazon_ecom/` or
   `configs/datasets/amazon.yaml`). All 17 green.
+
+
+## Wave 10 — glue modules
+
+**`src/data/alt_rendering.py`** (design doc §2).
+- **Unique-ASIN basis, not event-weighted.** Quantiles over the
+  training-split popularity distribution are computed after
+  `drop_duplicates(subset=["asin"], keep="first")` — a popular ASIN
+  that appears in thousands of events contributes weight 1, not its
+  event-frequency. Skipping the de-dup would compress thresholds
+  toward the high end and collapse most bands.
+- **Four fixed bands.** The ladder is `q95 → q75 → q50 → bottom`,
+  returning exactly `"top 5%" / "top 25%" / "top 50%" / "bottom 50%"`
+  (exposed as module-level `BAND_LABELS`). Spec-locked strings; the
+  LLM prompt template in §3.2 substitutes them verbatim.
+- **Adapter-registration contract.** `register_on_adapter(adapter,
+  train_events)` mutates the Wave-9 `_popularity_percentile_fn` slot
+  on a `YamlAdapter` instance. Before register: `alt_text` emits the
+  `"popularity score N"` stub; after: a valid band string. Idempotent
+  — rebuilding after each split overwrites cleanly.
+- **Quantile-collapse fallback.** When all unique popularities are
+  equal (e.g. every ASIN = 1), `q95 == q75 == q50`; the ladder still
+  works because the first matching clause wins. Function never
+  crashes and always returns a band label — only the specific band is
+  unspecified (tested as `band in BAND_LABELS`, not `band == "top 5%"`).
+- **Picklable closure.** The returned callable is a
+  `_PopularityPercentileFn` class (not a `def`-inside-function), so
+  `pickle.dumps` and `copy.deepcopy` round-trip cleanly for
+  reproducibility manifests.
+- Tests: `tests/test_alt_rendering.py`, 8 cases, all green (3
+  synthetic behavior, 2 error paths, 1 pickle, 1 adapter-hookup, 1
+  Amazon-fixture end-to-end).
+
+**`src/data/batching.py`** (design doc §3).
+- `AssembledBatch` dataclass holds CPU-resident `z_d (N,p)`, `E
+  (N,J,K,d_e)`, `c_star (N,)`, `omega (N,)`, `prices (N,J)` plus the
+  §12/§13 diagnostics (`customer_ids`, `chosen_asins`,
+  `outcomes_nested`). Training loop is responsible for any device move.
+- `p` and `J` are derived from records[0] (z_d width and len(choice_asins)
+  respectively); every other record is asserted to match, catching the
+  vocabulary-drift regression that motivated Wave 10's schema-declared
+  vocabularies.
+- One encoder pass per batch, not per record: outcome strings are
+  collected in row-major `(i, j, k)` order into a single flat list of
+  `N*J*K` entries, then `encode_batch(flat_texts, client=encoder,
+  cache=embeddings_cache)` is called exactly once and the result is
+  reshaped to `(N, J, K, d_e)`. Verified by `test_encoder_called_once_per_assemble`.
+- Boundary invariants (named in AssertionError messages): `z_d_width_uniform`,
+  `J_uniform`, `z_d_shape`, `E_shape`, `E_no_nan`, `z_d_finite`,
+  `c_star_in_range`, `prices_shape`, `prices_non_negative`, `omega_shape`.
+  Each fires before return so shape bugs surface inside `assemble_batch`,
+  not two layers deep in the training loop.
+- `iter_to_torch_batches` always forwards `batch.prices` to
+  `src.train.loop.iter_batches`, so the §9.2 monotonicity regularizer
+  fires whenever `reg_cfg.monotonicity_enabled` is True (Wave-8 bug fix:
+  upstream callers routinely dropped prices).
+- Outcome generation flows through `generate_outcomes` (reading
+  `.outcomes` off the returned `OutcomesPayload`) and caches via the
+  existing `OutcomesCache` / `EmbeddingsCache` — no re-implementation.
+  `diversity_filter` is plumbed through unchanged; `omega=None` ->
+  `torch.ones(N)`.
+- Tests: `tests/test_batching.py`, 15 cases, all green (4 happy-path, 2
+  cache-wiring, 4 invariants, 1 diversity, 2 omega, 1 `iter_to_torch_batches`,
+  1 Amazon-fixture end-to-end).
+
+**`scripts/run_dataset.py`** (design doc §4).
+- CLI contract: `--adapter {amazon,synthetic}` (required), `--n-customers
+  INT` (required), `--stub-llm` / `--real-llm` (mutually exclusive;
+  default stub), plus `--seed`, `--config`, `--n-epochs`, `--batch-size`,
+  `--min-events-per-customer`, `--output-dir`, `--K`, `--dataset-config`.
+- 17-stage pipeline: args -> dataset YAML -> `YamlAdapter` -> `load` ->
+  `clean_events` -> `join_survey` -> `compute_state_features` ->
+  min-events filter -> `temporal_split` -> `attach_train_popularity` ->
+  `try_import_subsample_weights` (Appendix-C) ->
+  `subsample_diagnostics.json` -> `register_on_adapter` + orphan filter
+  (train ∩ survey) -> `translate_z_d` (fit-on-train) ->
+  `build_choice_sets` (on `events_subset` = train+val rows) ->
+  `assemble_batch` (train + val) -> `POLEU` (p derived from
+  `batch_train.z_d.shape[1]`, NOT hardcoded) -> `fit` with
+  `TrainConfig.from_default()` overrides -> `compute_all` metrics on val
+  -> `run_all_reports` §12 JSONs -> `smoke_summary.json` -> final
+  stdout summary.
+- Graceful failure: `try_import_subsample_weights` returning `(None,
+  None)` is treated as a fatal error (logged ERROR and `return 1`) per
+  the brief — no silent full-population fallback when the user asked
+  for `--n-customers`.
+- Val/test z_d fit caveat (deferred to Wave 11/12): I run
+  `build_choice_sets` ONCE on the combined train+val rows of
+  `events_subset`. `persons_canonical` lists only train-customer z_d, so
+  the §2.1 fit-on-train assertion passes. Every record (including
+  val-split rows) receives z_d from the TRAIN fit — which is the right
+  thing at inference time. Downside: the val split cannot include
+  customers who have no train events for the same selected subset; in
+  Wave 10 that's fine because the brief explicitly scopes "train + val
+  enough" and test is deferred. Fixing this properly requires a
+  `stats`-aware `build_choice_sets` entry point (or a companion
+  `transform_person_features` call on val persons) — a Wave-11 task.
+- Caveat #2: `sklearn.cluster.KMeans` inside `subsample_customers` has
+  residual thread-driven non-determinism even under `random_state`.
+  Between two back-to-back `main()` calls in the same process the
+  selected customer subset can differ by 1-2 customers, which defeats
+  cross-run cache reuse. The stub-LLM cache-reuse test therefore
+  exercises the cache wiring directly at the `assemble_batch` layer
+  (same records, shared `OutcomesCache` / `EmbeddingsCache`, counting
+  stub) — the end-to-end main-twice variant is covered by hand via
+  `scripts/smoke_end_to_end.py` on synthetic data.
+- Tests: `tests/test_run_dataset_smoke.py`, 5 cases, all green. Main
+  gate: `test_stub_llm_end_to_end_on_amazon_fixture` runs the full
+  pipeline on the 100-row Amazon fixture with `--stub-llm
+  --n-customers 10 --n-epochs 1 --batch-size 4
+  --min-events-per-customer 5` and asserts all seven expected JSON
+  artifacts land on disk (`metrics.json`, `head_naming.json`,
+  `per_decision.json`, `dominant_attribute.json`, `counterfactual.json`,
+  `subsample_diagnostics.json`, `smoke_summary.json`) plus finite NLL
+  / train_loss / val_nll plus at least one INFO caplog record. Three
+  argparse edge-case tests (mutually-exclusive LLM flags, missing
+  `--adapter`, default-stub at argparse layer) round out the suite.
+  Real-LLM runs are exercised by hand — no CI coverage per the brief.

@@ -74,6 +74,43 @@ _HOUSEHOLD_SIZE_CATEGORIES: tuple[str, ...] = ("1", "2", "3", "4", "5+")
 
 
 # --------------------------------------------------------------------------- #
+# Schema-declared vocabularies (Wave 10)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class CategoricalVocabularies:
+    """Closed-set canonical vocabularies for the one-hot z_d columns.
+
+    When passed to :func:`fit_person_features`, these override the
+    learn-from-data default. :func:`transform_person_features` then uses
+    the declared vocabularies, which guarantees a stable 26-dim output
+    width regardless of which customers appear in the training slice.
+
+    Rationale (NOTES.md Wave 9 / Wave 10): the 100-customer Amazon
+    fixture does not cover every age / income / city bucket declared in
+    the schema; a learn-from-data fit therefore produces z_d with width
+    < 26, which mismatches the model's input expectation. The adapter
+    computes this object from the schema's ``values:`` dicts and passes
+    it through the fit so the output width is schema-authoritative.
+
+    Attributes
+    ----------
+    age_bucket, income_bucket, city_size:
+        Tuples of canonical labels (order = one-hot slot order).
+    household_size_categories:
+        Defaults to the orchestrator-fixed ``("1", "2", "3", "4", "5+")``;
+        override only if a future dataset uses a different household-size
+        scheme.
+    """
+
+    age_bucket: tuple[str, ...]
+    income_bucket: tuple[str, ...]
+    city_size: tuple[str, ...]
+    household_size_categories: tuple[str, ...] = ("1", "2", "3", "4", "5+")
+
+
+# --------------------------------------------------------------------------- #
 # Stats container
 # --------------------------------------------------------------------------- #
 
@@ -159,6 +196,26 @@ def _canonical_categories(series: pd.Series) -> list[str]:
     """Return sorted, stringified unique categories (deterministic order)."""
     values = series.dropna().unique().tolist()
     return sorted([str(v) for v in values])
+
+
+def _assert_values_in_vocab(
+    df: pd.DataFrame, column: str, vocab: list[str]
+) -> None:
+    """Raise ValueError if df[column] contains any value outside ``vocab``.
+
+    Used only when an explicit :class:`CategoricalVocabularies` was
+    supplied to :func:`fit_person_features`. Catches the "schema drift"
+    case: a new label appeared in the raw data without a corresponding
+    YAML update.
+    """
+    observed = {str(v) for v in df[column].dropna().unique()}
+    unknown = observed - set(vocab)
+    if unknown:
+        raise ValueError(
+            f"Column {column!r} contains value(s) not in the declared "
+            f"vocabulary: {sorted(unknown)!r}. Declared vocab: {vocab!r}. "
+            f"Either add the value to the schema YAML or drop the rows."
+        )
 
 
 def _bucket_household_size(hs: int | float) -> str:
@@ -274,7 +331,11 @@ def _household_size_one_hot(series: pd.Series) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 
-def fit_person_features(df: pd.DataFrame) -> PersonFeatureStats:
+def fit_person_features(
+    df: pd.DataFrame,
+    *,
+    vocabularies: CategoricalVocabularies | None = None,
+) -> PersonFeatureStats:
     """Fit standardization stats and category vocabularies on a training split.
 
     Parameters
@@ -282,6 +343,15 @@ def fit_person_features(df: pd.DataFrame) -> PersonFeatureStats:
     df:
         Tidy pandas DataFrame. Must contain every column in
         :data:`_REQUIRED_COLUMNS`.
+    vocabularies:
+        Optional closed-set vocabularies for the one-hot columns
+        (``age_bucket``, ``income_bucket``, ``city_size``,
+        ``household_size``). When supplied, the stats use these tuples
+        as authoritative; when ``None`` (the default), vocabularies are
+        learned from ``df`` — which is fine for tests but can produce
+        z_d width < 26 on small training slices (Wave 10 integration
+        concern). Adapter-driven runs should pass this in via
+        :meth:`DatasetAdapter.categorical_vocabularies`.
 
     Returns
     -------
@@ -289,6 +359,14 @@ def fit_person_features(df: pd.DataFrame) -> PersonFeatureStats:
         Frozen container with means/stds for the standardized scalars and
         canonical category vocabularies. The 26-element ``feature_columns``
         list fixes the column order used by :func:`transform_person_features`.
+
+    Raises
+    ------
+    ValueError:
+        When ``vocabularies`` is supplied and ``df`` contains a value in
+        one of the categorical columns that is not in the declared
+        vocabulary — this catches schema drift (new label appeared in
+        data without a YAML update).
 
     Notes
     -----
@@ -300,17 +378,28 @@ def fit_person_features(df: pd.DataFrame) -> PersonFeatureStats:
     """
     _validate_columns(df)
 
-    # Categorical vocabularies (learned from training split).
-    age_categories = _canonical_categories(df["age_bucket"])
-    income_categories = _canonical_categories(df["income_bucket"])
-    city_size_categories = _canonical_categories(df["city_size"])
+    if vocabularies is None:
+        # Learn-from-data (unchanged pre-Wave-10 behavior).
+        age_categories = _canonical_categories(df["age_bucket"])
+        income_categories = _canonical_categories(df["income_bucket"])
+        city_size_categories = _canonical_categories(df["city_size"])
+        household_size_categories = list(_HOUSEHOLD_SIZE_CATEGORIES)
+    else:
+        # Schema-declared vocabularies (Wave 10). Strict: any df value
+        # not in the declared vocabulary raises.
+        age_categories = list(vocabularies.age_bucket)
+        income_categories = list(vocabularies.income_bucket)
+        city_size_categories = list(vocabularies.city_size)
+        household_size_categories = list(vocabularies.household_size_categories)
+        _assert_values_in_vocab(df, "age_bucket", age_categories)
+        _assert_values_in_vocab(df, "income_bucket", income_categories)
+        _assert_values_in_vocab(df, "city_size", city_size_categories)
 
     # Household size has a fixed vocabulary from the orchestrator override;
     # validate that every raw value is in-range during the fit so errors
     # surface early.
     for raw in df["household_size"].to_list():
         _bucket_household_size(raw)
-    household_size_categories = list(_HOUSEHOLD_SIZE_CATEGORIES)
 
     # log1p purchase_frequency before computing mean/std.
     pf_log = np.log1p(df["purchase_frequency"].to_numpy(dtype=np.float64))

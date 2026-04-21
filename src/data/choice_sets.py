@@ -145,8 +145,20 @@ def build_choice_sets(
 
     # z_d: fit standardization stats on persons_canonical (which is a
     # subset of train, guaranteed by the assertion above) and transform
-    # those same rows into the 26-dim float32 matrix.
-    stats = fit_person_features(persons_canonical)
+    # those same rows into the float32 matrix. When the adapter supplies
+    # a ``categorical_vocabularies`` method (Wave-10 fix), use its
+    # closed-set vocab so the output width is schema-authoritative; this
+    # prevents the z_d-width drift observed in Wave 9 when fitting on
+    # small training slices that don't cover every one-hot bucket.
+    vocabs = None
+    if hasattr(adapter, "categorical_vocabularies"):
+        try:
+            vocabs = adapter.categorical_vocabularies()
+        except Exception:
+            # Defensive: adapters without a usable vocabulary fall back
+            # to learn-from-data (Wave-1 default).
+            vocabs = None
+    stats = fit_person_features(persons_canonical, vocabularies=vocabs)
     z_d_matrix = transform_person_features(persons_canonical, stats)
     customer_ids_zd = persons_canonical["customer_id"].to_numpy()
     customer_to_zd: dict = {
