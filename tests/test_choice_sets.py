@@ -2,11 +2,12 @@
 
 v1 port behavior preservation + v2 augmentation (z_d / c_d / alt_texts) +
 the fit-on-train assertion + an Amazon-fixture end-to-end integration
-test.
+test + Wave-11 dedup guard (post-dryrun fix).
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -427,3 +428,273 @@ def test_amazon_fixture_end_to_end():
         assert len(r["alt_texts"]) == 10
 
 
+# --------------------------------------------------------------------------- #
+# Wave 11 dedup guard (post-dryrun fix).
+#
+# The 1-customer real-LLM dry-run showed alt[0] and alt[2] returning the
+# identical outcome because the same ASIN appeared twice in a choice set
+# (small catalog + popularity-weighted sampling-with-replacement). At
+# scale this is vanishingly rare, but the guard eliminates it altogether
+# and records a ``metadata["dedup_fallback"]`` bool when the temporally-
+# available pool is smaller than J.
+# --------------------------------------------------------------------------- #
+
+
+def _make_tiny_catalog_events(
+    n_events: int = 12,
+    n_asins: int = 4,
+    start_date: str = "2024-01-01",
+) -> pd.DataFrame:
+    """Build a 1-customer events frame with an intentionally tiny catalog.
+
+    With ``n_asins=4`` and ``n_negatives=9``, the temporally-available
+    pool can never reach J=10 distinct alternatives, so the dedup guard
+    MUST fall back on cyclic padding and flag the record.
+    """
+    rows = []
+    for e in range(n_events):
+        d = pd.to_datetime(start_date) + pd.Timedelta(days=e)
+        asin_idx = e % n_asins
+        rows.append(
+            dict(
+                customer_id="C00",
+                order_date=d,
+                asin=f"A{asin_idx:03d}",
+                category="CAT0",
+                price=5.0 + asin_idx,
+                title=f"title A{asin_idx:03d} word{e}",
+                routine=int(e > 0),
+                novelty=int(e == 0),
+                recency_days=999 if e == 0 else 7,
+                cat_affinity=e,
+                brand="brand_x",
+            )
+        )
+    df = pd.DataFrame(rows)
+    pop = df.groupby("asin").size().rename("popularity").reset_index()
+    df = df.merge(pop, on="asin", how="left")
+    df = df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
+    # Single-customer split: mark the tail events val/test so the train
+    # partition has enough rows for persons_canonical.
+    n = len(df)
+    n_test = max(1, int(n * 0.2))
+    n_val = max(1, int(n * 0.2))
+    if n_test + n_val >= n:
+        n_test, n_val = 1, 0
+    n_train = n - n_test - n_val
+    df["split"] = ["train"] * n_train + ["val"] * n_val + ["test"] * n_test
+    return df
+
+
+def _make_scale_events(
+    n_customers: int = 8,
+    n_asins: int = 200,
+    n_categories: int = 4,
+    n_events_per_customer: int = 12,
+    start_date: str = "2024-01-01",
+) -> pd.DataFrame:
+    """Build an events frame with a LARGE catalog so every event has
+    ``available_pool >> J``. The first ``n_asins`` days of "seed" events
+    spread one-asin-per-day front-load the first-seen dates so all
+    real-customer events happen after every ASIN has first-seen.
+    """
+    rows = []
+    # Seed phase: one event per ASIN, earliest dates, on a single seed
+    # customer that we drop from the persons frame (they won't be in the
+    # train split when we re-split below... actually we need them to be
+    # train so build_choice_sets is happy). Simpler: embed the seed
+    # events into customer 0's early history.
+    seed_start = pd.to_datetime(start_date)
+    # Customer 0 seeds the catalog across the first n_asins days.
+    for a in range(n_asins):
+        rows.append(
+            dict(
+                customer_id="C_SEED",
+                order_date=seed_start + pd.Timedelta(days=a),
+                asin=f"A{a:04d}",
+                category=f"CAT{a % n_categories}",
+                price=5.0 + (a % 10),
+                title=f"title A{a:04d}",
+                routine=0,
+                novelty=1,
+                recency_days=999,
+                cat_affinity=0,
+                brand="brand_x",
+            )
+        )
+    # Real customers purchase AFTER all seed events.
+    real_start = seed_start + pd.Timedelta(days=n_asins + 1)
+    for c in range(n_customers):
+        for e in range(n_events_per_customer):
+            d = real_start + pd.Timedelta(days=c * n_events_per_customer + e)
+            asin_idx = (c * 13 + e * 5) % n_asins
+            rows.append(
+                dict(
+                    customer_id=f"C{c:02d}",
+                    order_date=d,
+                    asin=f"A{asin_idx:04d}",
+                    category=f"CAT{asin_idx % n_categories}",
+                    price=5.0 + (asin_idx % 10),
+                    title=f"title A{asin_idx:04d} word{e}",
+                    routine=int(e > 0),
+                    novelty=int(e == 0),
+                    recency_days=999 if e == 0 else 7,
+                    cat_affinity=e,
+                    brand="brand_x",
+                )
+            )
+    df = pd.DataFrame(rows)
+    pop = df.groupby("asin").size().rename("popularity").reset_index()
+    df = df.merge(pop, on="asin", how="left")
+    df = df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
+    splits = []
+    for _, grp in df.groupby("customer_id", sort=False):
+        n = len(grp)
+        n_test = max(1, int(n * 0.2))
+        n_val = max(1, int(n * 0.2))
+        if n_test + n_val >= n:
+            n_test, n_val = 1, 0
+        n_train = n - n_test - n_val
+        splits.extend(["train"] * n_train + ["val"] * n_val + ["test"] * n_test)
+    df["split"] = splits
+    return df
+
+
+def test_dedup_at_scale():
+    """Large catalog: every record has J distinct ASINs and no fallback.
+
+    200 ASINs front-loaded by seed events, J=10 → every real-customer
+    event sees a pool >> J and the dedup loop converges without the
+    fallback branch.
+    """
+    events = _make_scale_events(n_customers=6, n_asins=200)
+    persons = _persons_for(events)
+    adapter = _StubAdapter()
+    records = build_choice_sets(
+        events, persons, adapter, n_negatives=9, seed=42, n_resamples=1
+    )
+    # Skip the ``C_SEED`` records — those are fixture scaffolding with a
+    # deliberately sparse early-catalog and may legitimately fall back.
+    real_records = [r for r in records if r["customer_id"] != "C_SEED"]
+    assert len(real_records) > 0
+    for r in real_records:
+        assert len(r["choice_asins"]) == 10
+        assert len(set(r["choice_asins"])) == 10, (
+            f"duplicate ASIN in choice set for customer={r['customer_id']}: "
+            f"{r['choice_asins']}"
+        )
+        assert r["metadata"]["dedup_fallback"] is False, (
+            f"unexpected fallback for customer={r['customer_id']}"
+        )
+
+
+def test_dedup_fallback_small_catalog(caplog):
+    """Tiny catalog: pool < J triggers cyclic padding AND a WARNING."""
+    events = _make_tiny_catalog_events(n_events=12, n_asins=4)
+    persons = _persons_for(events)
+    adapter = _StubAdapter()
+    with caplog.at_level(logging.WARNING, logger="src.data.choice_sets"):
+        records = build_choice_sets(
+            events, persons, adapter, n_negatives=9, seed=42, n_resamples=1
+        )
+
+    # At least one record should have fallen back (the later events have
+    # 4 available ASINs but J=10).
+    fallback_records = [r for r in records if r["metadata"]["dedup_fallback"]]
+    assert len(fallback_records) > 0, "expected at least one dedup fallback"
+
+    # Every record has exactly J=10 entries (padding preserves shape).
+    for r in records:
+        assert len(r["choice_asins"]) == 10
+
+    # At least one WARNING logged for the dedup fallback path.
+    warn_messages = [rec.message for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("dedup fallback" in m for m in warn_messages), (
+        f"expected dedup-fallback WARNING; got: {warn_messages}"
+    )
+
+
+def test_dedup_preserves_chosen():
+    """Chosen ASIN always sits at choice_asins[chosen_idx], fallback or not."""
+    events = _make_tiny_catalog_events(n_events=12, n_asins=4)
+    persons = _persons_for(events)
+    adapter = _StubAdapter()
+    records = build_choice_sets(
+        events, persons, adapter, n_negatives=9, seed=42, n_resamples=1
+    )
+    for r in records:
+        assert r["choice_asins"][r["chosen_idx"]] == r["chosen_asin"]
+
+
+def test_dedup_determinism():
+    """Same seed + same events produce byte-identical dedup output."""
+    events = _make_tiny_catalog_events(n_events=12, n_asins=4)
+    persons = _persons_for(events)
+    r1 = build_choice_sets(events, persons, _StubAdapter(), seed=42)
+    r2 = build_choice_sets(events, persons, _StubAdapter(), seed=42)
+    assert len(r1) == len(r2)
+    for x, y in zip(r1, r2):
+        assert x["choice_asins"] == y["choice_asins"]
+        assert x["chosen_idx"] == y["chosen_idx"]
+        assert x["metadata"]["dedup_fallback"] == y["metadata"]["dedup_fallback"]
+
+
+def test_dedup_does_not_change_large_fixture():
+    """100-customer Amazon fixture: most records are dedup_fallback==False.
+
+    Don't assert zero — small-catalog categories inside the fixture can
+    still trigger it legitimately. Just confirm the dominant record path
+    is the non-fallback branch AND every resulting choice set has J
+    entries.
+    """
+    if not EVENTS_FIXTURE.exists() or not PERSONS_FIXTURE.exists():
+        pytest.skip("Amazon fixtures not available")
+
+    from src.data.clean import clean_events
+    from src.data.load import load
+    from src.data.schema_map import load_schema, translate_persons
+    from src.data.split import temporal_split
+    from src.data.state_features import (
+        attach_train_popularity,
+        compute_state_features,
+    )
+    from src.data.survey_join import join_survey
+
+    schema = load_schema(AMAZON_YAML)
+    events_raw, persons_raw = load(
+        schema, events_path=EVENTS_FIXTURE, persons_path=PERSONS_FIXTURE
+    )
+    cleaned = clean_events(events_raw, schema)
+    joined = join_survey(cleaned, persons_raw, schema)
+    with_state = compute_state_features(joined)
+    split_df = temporal_split(with_state, schema)
+    with_pop = attach_train_popularity(split_df)
+    train_events = with_pop.loc[with_pop["split"] == "train"]
+    z_df_all = translate_persons(persons_raw, schema, training_events=train_events)
+    train_customers = set(train_events["customer_id"].unique())
+    z_df = z_df_all.loc[z_df_all["customer_id"].isin(train_customers)].reset_index(
+        drop=True
+    )
+    known = set(z_df["customer_id"].unique())
+    events_for_cs = with_pop.loc[with_pop["customer_id"].isin(known)].reset_index(
+        drop=True
+    )
+    adapter = _StubAdapter(
+        suppress_fields=("has_kids", "city_size", "health_rating", "risk_tolerance")
+    )
+    records = build_choice_sets(
+        events_for_cs, z_df, adapter, n_negatives=9, seed=42, n_resamples=1
+    )
+
+    # Every record has J=10 entries.
+    for r in records:
+        assert len(r["choice_asins"]) == 10
+
+    # Dominant path is non-fallback: > 50% of records clean. (We do not
+    # assert zero — the Amazon fixture has sparse categories that can
+    # trigger the guard for very-early events.)
+    n_clean = sum(1 for r in records if not r["metadata"]["dedup_fallback"])
+    assert n_clean / len(records) > 0.5, (
+        f"expected majority of records to be dedup-clean; "
+        f"got {n_clean}/{len(records)} clean"
+    )

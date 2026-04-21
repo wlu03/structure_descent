@@ -169,6 +169,53 @@ def _omega_stats(weights: np.ndarray | None) -> dict[str, float]:
     }
 
 
+def _p_reduction_reason(adapter: Any) -> str:
+    """Diagnose which canonical one-hot vocabularies shrank below spec width.
+
+    §2.1 nominal widths: age_bucket=6, income_bucket=5, city_size=4,
+    household_size=5, plus 6 continuous dims -> canonical p=26. When a
+    dataset adapter declares a smaller vocabulary (or ships an empty
+    external_lookup), the corresponding one-hot slice shrinks and
+    ``batch_train.z_d`` carries ``effective_p < 26``. This helper inspects
+    :meth:`adapter.categorical_vocabularies` and returns a human-readable
+    string summarizing every shortfall, or ``"none"`` when everything is
+    canonical.
+    """
+    try:
+        vocabs = adapter.categorical_vocabularies()
+    except Exception:  # pragma: no cover - adapter may not implement it
+        return "adapter does not expose categorical_vocabularies()"
+
+    reasons: list[str] = []
+    city = getattr(vocabs, "city_size", ())
+    if len(city) < 4:
+        reasons.append(
+            f"city_size vocabulary reduced to {len(city)} label(s) "
+            f"(canonical 4)"
+        )
+    age = getattr(vocabs, "age_bucket", ())
+    if len(age) < 6:
+        reasons.append(
+            f"age_bucket vocabulary reduced to {len(age)} label(s) "
+            f"(canonical 6)"
+        )
+    income = getattr(vocabs, "income_bucket", ())
+    if len(income) < 5:
+        reasons.append(
+            f"income_bucket vocabulary reduced to {len(income)} label(s) "
+            f"(canonical 5)"
+        )
+    hh = getattr(vocabs, "household_size_categories", ())
+    if len(hh) < 5:
+        reasons.append(
+            f"household_size_categories vocabulary reduced to {len(hh)} "
+            f"label(s) (canonical 5)"
+        )
+    if not reasons:
+        return "none"
+    return "; ".join(reasons)
+
+
 def _build_llm_and_encoder(args: argparse.Namespace, config: dict) -> tuple[Any, Any]:
     """Instantiate the LLM client + sentence encoder.
 
@@ -480,10 +527,12 @@ def main(args: argparse.Namespace) -> int:
     split_by_idx = events_subset["split"].tolist()
     records_train = [r for r, s in zip(records_all, split_by_idx) if s == "train"]
     records_val = [r for r, s in zip(records_all, split_by_idx) if s == "val"]
+    records_test = [r for r, s in zip(records_all, split_by_idx) if s == "test"]
     logger.info(
-        "records: train=%d val=%d (test deferred to Wave 11/12 per brief).",
+        "records: train=%d val=%d test=%d.",
         len(records_train),
         len(records_val),
+        len(records_test),
     )
 
     if len(records_train) == 0:
@@ -563,6 +612,37 @@ def main(args: argparse.Namespace) -> int:
             omega=None,
         )
 
+    # Test batch: §9.1 held-out split, un-weighted. Reuse val batch when
+    # empty so we can still emit metrics_test.json (with a WARNING) -- this
+    # matches the 1-customer edge case where temporal_split leaves exactly
+    # one test event.
+    if len(records_test) == 0:
+        logger.warning(
+            "test records empty after cascaded filters; reusing val batch "
+            "for metrics_test.json. Test metrics will equal val metrics."
+        )
+        batch_test = batch_val
+    else:
+        logger.info("stage: assemble_batch (test)")
+        batch_test = assemble_batch(
+            records_test,
+            adapter=adapter,
+            llm_client=llm_client,
+            encoder=encoder,
+            outcomes_cache=outcomes_cache,
+            embeddings_cache=embeddings_cache,
+            K=K,
+            seed=int(args.seed),
+            diversity_filter=_default_div_filter,
+            omega=None,
+        )
+        if len(batch_test) < 10:
+            logger.warning(
+                "n_test=%d < 10; test metrics have large variance "
+                "(single-customer / tiny-fixture edge case).",
+                len(batch_test),
+            )
+
     # ---- 11. POLEU model + training setup -----------------------------
     from src.model.po_leu import POLEU
     from src.train.loop import TrainConfig, fit
@@ -597,6 +677,43 @@ def main(args: argparse.Namespace) -> int:
     train_cfg.batch_size = int(args.batch_size)
     train_cfg.max_epochs = int(args.n_epochs)
     reg_cfg = RegularizerConfig.from_default()
+
+    # ---- dataset-dependent p + regularizers-active diagnostics -----------
+    # Spec §2.1 canonical p=26. Amazon-style datasets with collapsed
+    # vocabularies (e.g. a single city_size label under an empty
+    # external_lookup) ship a smaller effective p. Surface both in
+    # artifacts and log once.
+    canonical_p = int((config.get("model") or {}).get("p", 26))
+    effective_p = int(batch_train.z_d.shape[1])
+    p_is_dataset_dependent = bool(effective_p != canonical_p)
+    p_reduction_reason = (
+        _p_reduction_reason(adapter) if p_is_dataset_dependent else "none"
+    )
+    if p_is_dataset_dependent:
+        logger.info(
+            "effective_p=%d (canonical=%d, dataset-dependent; reason: %s)",
+            effective_p, canonical_p, p_reduction_reason,
+        )
+    else:
+        logger.info("effective_p=%d (matches canonical)", effective_p)
+
+    # §9.2 regularizer activation map. ``monotonicity`` requires the
+    # config gate AND a real ``prices`` tensor on the train batch -- the
+    # AssembledBatch dataclass declares ``prices`` non-optional, but we
+    # guard via ``getattr`` for robustness.
+    batch_prices = getattr(batch_train, "prices", None)
+    regularizers_active = {
+        "weight_l2": bool(reg_cfg.weight_l2 > 0),
+        "salience_entropy": bool(reg_cfg.salience_entropy > 0),
+        "monotonicity": bool(
+            reg_cfg.monotonicity_enabled
+            and reg_cfg.monotonicity > 0
+            and batch_prices is not None
+        ),
+        "diversity": bool(reg_cfg.diversity > 0),
+    }
+    active_list = [k for k, v in regularizers_active.items() if v]
+    logger.info("regularizers active: %s", ", ".join(active_list) or "none")
 
     g_train = torch.Generator().manual_seed(int(args.seed))
 
@@ -646,7 +763,35 @@ def main(args: argparse.Namespace) -> int:
         n_params=model.num_params(),
         n_train=len(batch_train),
     )
-    (out_dir / "metrics.json").write_text(json.dumps(metrics.to_dict(), indent=2))
+
+    # Diagnostics merged into both metrics.json and smoke_summary.json.
+    diagnostics_fields: dict[str, Any] = {
+        "effective_p": effective_p,
+        "canonical_p": canonical_p,
+        "p_is_dataset_dependent": p_is_dataset_dependent,
+        "p_reduction_reason": p_reduction_reason,
+        "regularizers_active": regularizers_active,
+    }
+
+    metrics_payload = dict(metrics.to_dict())
+    metrics_payload.update(diagnostics_fields)
+    (out_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2))
+
+    logger.info("stage: evaluate (test)")
+    with torch.no_grad():
+        logits_test, _interm_test = model(batch_test.z_d, batch_test.E)
+    test_metrics = compute_all(
+        logits_test,
+        batch_test.c_star,
+        n_params=model.num_params(),
+        n_train=len(batch_train),
+    )
+    test_metrics_payload = dict(test_metrics.to_dict())
+    test_metrics_payload.update(diagnostics_fields)
+    test_metrics_payload["n_test_records"] = int(len(batch_test))
+    (out_dir / "metrics_test.json").write_text(
+        json.dumps(test_metrics_payload, indent=2)
+    )
 
     # ---- 13. §12 reports (interpretability) ---------------------------
     from src.eval.interpret import run_all_reports
@@ -682,6 +827,7 @@ def main(args: argparse.Namespace) -> int:
             "d_e": d_e,
             "n_train_records": int(len(batch_train)),
             "n_val_records": int(len(batch_val)),
+            "n_test_records": int(len(batch_test)),
             "llm_mode": "real" if args.real_llm else "stub",
         },
         "train_state": {
@@ -694,6 +840,12 @@ def main(args: argparse.Namespace) -> int:
             "stopped_early": bool(state.stopped_early),
         },
         "metrics": metrics.to_dict(),
+        "metrics_test": test_metrics.to_dict(),
+        "effective_p": effective_p,
+        "canonical_p": canonical_p,
+        "p_is_dataset_dependent": p_is_dataset_dependent,
+        "p_reduction_reason": p_reduction_reason,
+        "regularizers_active": regularizers_active,
         "reports_written": reports_written,
     }
     (out_dir / "smoke_summary.json").write_text(

@@ -996,3 +996,119 @@ end-to-end).
   argparse edge-case tests (mutually-exclusive LLM flags, missing
   `--adapter`, default-stub at argparse layer) round out the suite.
   Real-LLM runs are exercised by hand — no CI coverage per the brief.
+
+## Wave 11 post-dryrun fixes
+
+**Driver hardening: test records + effective_p + regularizers report + monotonicity default** (scripts/run_dataset.py, default.yaml).
+
+- Test-records flow: `build_choice_sets` already materialises the full
+  `events_subset` (train+val+test rows share one `persons_canonical`
+  fit-on-train, per the Wave-10 caveat). The driver now splits the flat
+  record list three ways and assembles a third `batch_test` via
+  `assemble_batch(... omega=None ...)` — test is §9.1 un-weighted.
+  After training we forward `batch_test.z_d, batch_test.E` through
+  `compute_all(..., n_params=model.num_params(), n_train=len(batch_train))`
+  and write `reports/<out_dir>/metrics_test.json`. When `records_test`
+  is empty (the 1-customer dry-run edge case) we reuse `batch_val`,
+  log a WARNING, and still emit the file. When `n_test < 10` we log a
+  variance warning. `metrics.json` remains the val payload for
+  backward compat with the existing smoke assertions.
+- `effective_p` reporting: Amazon ships `p=23` (not the spec's 26)
+  because the schema's `external_lookup` city_size table is empty, so
+  its vocabulary collapses to the single fallback label. The driver
+  now emits `effective_p` (= `int(batch_train.z_d.shape[1])`),
+  `canonical_p` (= `configs/default.yaml:model.p`),
+  `p_is_dataset_dependent`, and a human-readable `p_reduction_reason`
+  into both `metrics.json` and `smoke_summary.json` and logs the
+  triple at INFO once per run. `_p_reduction_reason` inspects
+  `adapter.categorical_vocabularies()` and names the offending
+  column(s); returns `"none"` when canonical.
+- `regularizers_active` schema: a `{weight_l2, salience_entropy,
+  monotonicity, diversity}` bool map derived from `reg_cfg`.
+  `monotonicity` is `True` iff
+  `reg_cfg.monotonicity_enabled and reg_cfg.monotonicity > 0 and
+  batch_train.prices is not None` — this keeps the field honest when
+  a future driver forgets to thread prices. Logged at INFO once
+  during fit startup; surfaced in both JSON artifacts.
+- Monotonicity default rationale + opt-out: `configs/default.yaml`
+  now ships `regularizers.monotonicity.enabled: true`. Spec §9.2 says
+  the price-monotonicity prior is "applied only if domain prior
+  holds"; for purchase-event datasets (Amazon is the canonical case),
+  the prior trivially holds and the Wave-8 bug-fix already threads
+  `prices` through `iter_batches -> compute_loss`. Non-purchase
+  datasets (e.g. synthetic no-price workloads, browse-only event
+  streams) should disable the term via a per-dataset override YAML
+  that sets `regularizers.monotonicity.enabled: false`.
+- Tests: one new smoke assertion block on `test_stub_llm_end_to_end_on_amazon_fixture`
+  verifies `metrics_test.json` lands, and that both metrics and
+  smoke_summary carry `effective_p`, `canonical_p`,
+  `p_is_dataset_dependent`, `p_reduction_reason`, and
+  `regularizers_active` with monotonicity = True. Full suite:
+  462 passed.
+
+## Wave 11 post-dryrun fixes
+
+- **c_d signal enrichment** (Amazon survey columns that were unused
+  before). The 1-customer real-LLM dryrun showed only ~480 distinct
+  paragraphs across 5,027 customers once the 4 Amazon sentinels
+  (`has_kids`, `city_size`, `health_rating`, `risk_tolerance`) were
+  suppressed. Three previously-unused survey columns now feed `c_d`
+  as narrative context *without* touching z_d (p=23 stays pinned):
+  `Q-demos-gender` → inline "as a <gender>" on the age line (drops
+  `Other` / `Prefer not to say`); `Q-life-changes` → a new
+  "- Recent life event: ..." line right after income (skips NaN);
+  `Q-amazon-use-how-oft` → a new "- Shops on Amazon ..." line next
+  to the event-derived purchase_frequency line (paraphrased to keep
+  "10 times per month" bucket codes out of the text). Mechanism: a
+  new `extra_fields=` kwarg on `build_context_string` and a public
+  `extract_extra_fields_from_row(row, yaml_block)` helper that
+  translates raw persons columns via a free-form YAML block
+  (`persons.c_d_extra_fields` — parallel to `z_d_mapping` but ignored
+  by `schema_map.load_schema`). Default `extra_fields=None` preserves
+  byte-identical pre-fix output; `adapter.py` / `schema_map.py` /
+  `person_features.py` are untouched. Driver plumb point: in
+  `scripts/run_dataset.py` (or any caller of `build_context_string`),
+  load the YAML with `yaml.safe_load`, pull
+  `doc['dataset']['persons']['c_d_extra_fields']`, call
+  `extract_extra_fields_from_row(raw_persons_row, yaml_block)` per
+  customer, and pass the result as `extra_fields=...`. Line-count
+  ceiling relaxed from 8 to 12 to accommodate base 6 + 2 optional
+  (recent / current_time) + 2 extras (life_event / amazon_frequency);
+  the warn-if-<5 behavior is unchanged. Tests: 17 new cases appended
+  to `tests/test_context_string.py` covering gender inline /
+  drop-on-Other, life_event NaN-guard, frequency paraphrase,
+  compose-with-suppression hitting 5-8 lines again, and the
+  `extract_extra_fields_from_row` helper contract. All 63 tests
+  green.
+- **Choice-set deduplication guard** (`src/data/choice_sets.py`). The
+  1-customer real-LLM dryrun surfaced `alt[0] == alt[2]` collisions
+  within a choice set: the customer had only 9 unique ASINs, so
+  popularity-weighted sampling-with-replacement produced duplicates
+  that the outer loop then scored identically. Rule: after assembling
+  the `J = n_negatives + 1` alternatives, reduce to unique negatives
+  against a `seen` set that already includes `chosen_code`, then
+  top-up via the existing per-event `local_rng` (seed formula
+  `seed + 1_000_003 * k_rep + event_index` preserved verbatim — no
+  new RNG streams) until we reach `min(J, available_pool + 1)`
+  distinct alternatives. Resample cap: `MAX_RESAMPLE_ROUNDS = 5`
+  (the module-local constant at the top of the per-event loop) —
+  beyond that the guard gives up and pads. Fallback-padding
+  semantics: when the temporally-available pool is genuinely smaller
+  than `J` (e.g. the very first events in a sparse dataset), cycle
+  through the existing unique negatives to fill to `n_negatives`;
+  the degenerate `avail_len <= 0` case falls back to
+  `[chosen_code] * n_negatives` (matching v1's
+  `_sample_random` behavior). Every fallback is logged via
+  `logger.warning` with `customer_id`, `event_index`, and
+  `available_pool_size`, and the new `metadata["dedup_fallback"]`
+  bool (scalar for `n_resamples==1`, list-of-bool for `n_resamples>1`)
+  lets the batching layer surface the frequency in diagnostics. The
+  chosen's random-slot shuffle (and hence `chosen_idx`) is unaffected
+  — dedup only touches negatives. At scale (200+ ASIN catalogs) the
+  guard converges in zero extra resample rounds and the record's
+  `dedup_fallback` is `False`, so large-fixture behavior is
+  unchanged. Tests: 5 new cases in `tests/test_choice_sets.py`
+  (`test_dedup_at_scale`, `test_dedup_fallback_small_catalog`,
+  `test_dedup_preserves_chosen`, `test_dedup_determinism`,
+  `test_dedup_does_not_change_large_fixture`); full suite 462
+  passed.

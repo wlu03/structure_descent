@@ -181,6 +181,46 @@ dataset:
           Mean of the per-event novelty flag. Requires compute_state_features
           to have run so the novelty column exists on the train DataFrame.
 
+    # Wave-11 c_d signal enrichment. These are NOT z_d columns (the p=23
+    # contract stays fixed) — they ride alongside c_d via the
+    # `extra_fields` kwarg of `build_context_string`. The driver (or
+    # choice_sets.py caller) runs `extract_extra_fields_from_row` on the
+    # RAW persons DataFrame (pre-translate) and passes the resulting dict
+    # through to the renderer. Adding entries here does not change z_d
+    # shape, schema_map parsing, or adapter behavior — load_schema
+    # ignores unknown keys on the `persons:` block.
+    c_d_extra_fields:
+      gender:
+        source: "Q-demos-gender"
+        kind: categorical_map
+        values:
+          "Female": "Female"
+          "Male": "Male"
+        drop_on_unknown:
+          - "Other"
+          - "Prefer not to say"
+        note: >
+          Ambiguous / withheld gender adds noise to the narrative but not
+          information; dropped per the Wave-11 dryrun-fix spec.
+      life_event:
+        source: "Q-life-changes"
+        kind: passthrough
+        note: >
+          Raw Q-life-changes values are already natural English
+          ("Lost a job ", "Had a child", "Moved place of residence",
+          multi-select joined with commas). ~67% of respondents have
+          NaN here; those rows skip the clause entirely. Trailing
+          whitespace in raw values is normalized by extract_extra_fields.
+      amazon_frequency:
+        source: "Q-amazon-use-how-oft"
+        kind: passthrough
+        note: >
+          Raw values ("Less than 5 times per month", "5 - 10 times per
+          month", "More than 10 times per month") are paraphrased inside
+          build_context_string to keep bucket codes out of the rendered
+          c_d. Complementary to the event-derived purchase_frequency
+          field (self-reported vs. observed cadence).
+
   training:
     choice_set_size: 10
     n_resamples: 1

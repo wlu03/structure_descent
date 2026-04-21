@@ -137,6 +137,7 @@ def test_stub_llm_end_to_end_on_amazon_fixture(tmp_path: Path, caplog):
     out_dir = Path(args.output_dir)
     expected = {
         "metrics.json",
+        "metrics_test.json",
         "head_naming.json",
         "per_decision.json",
         "dominant_attribute.json",
@@ -148,13 +149,43 @@ def test_stub_llm_end_to_end_on_amazon_fixture(tmp_path: Path, caplog):
     missing = expected - written
     assert not missing, f"missing artifacts: {missing}; got {written}"
 
-    # metrics.json: §13 fields + finite NLL.
+    # metrics.json: §13 fields + finite NLL + Wave-11 diagnostics.
     metrics = json.loads((out_dir / "metrics.json").read_text())
     for field in ("top1", "top5", "mrr_val", "nll_val",
                   "aic_val", "bic_val"):
         assert field in metrics, f"metrics.json missing {field!r}"
         # NLL / AIC / BIC must be finite.
     assert _isfinite(metrics["nll_val"]), "nll_val must be finite"
+
+    # Wave-11 diagnostics: effective_p + regularizers_active in metrics.json.
+    for field in ("effective_p", "canonical_p", "p_is_dataset_dependent",
+                  "p_reduction_reason", "regularizers_active"):
+        assert field in metrics, f"metrics.json missing {field!r}"
+    assert isinstance(metrics["effective_p"], int)
+    assert isinstance(metrics["canonical_p"], int)
+    assert isinstance(metrics["p_is_dataset_dependent"], bool)
+    assert isinstance(metrics["p_reduction_reason"], str)
+    reg_active = metrics["regularizers_active"]
+    for name in ("weight_l2", "salience_entropy", "monotonicity", "diversity"):
+        assert name in reg_active, f"regularizers_active missing {name!r}"
+    # default.yaml has all four λ's > 0 AND monotonicity is now on by
+    # default + the driver threads prices through batch_train -- all four
+    # terms must fire on Amazon.
+    assert reg_active["weight_l2"] is True
+    assert reg_active["salience_entropy"] is True
+    assert reg_active["monotonicity"] is True, (
+        "monotonicity must fire on Amazon (enabled by default + prices "
+        "threaded through batch_train)."
+    )
+    assert reg_active["diversity"] is True
+
+    # metrics_test.json: §13 fields + Wave-11 diagnostics.
+    test_metrics = json.loads((out_dir / "metrics_test.json").read_text())
+    for field in ("top1", "top5", "mrr_val", "nll_val",
+                  "aic_val", "bic_val", "effective_p", "canonical_p",
+                  "p_is_dataset_dependent", "p_reduction_reason",
+                  "regularizers_active", "n_test_records"):
+        assert field in test_metrics, f"metrics_test.json missing {field!r}"
 
     # smoke_summary.json: train_state with finite train_loss + val_nll.
     summary = json.loads((out_dir / "smoke_summary.json").read_text())
@@ -164,6 +195,18 @@ def test_stub_llm_end_to_end_on_amazon_fixture(tmp_path: Path, caplog):
     assert ts["val_nll"] is not None and _isfinite(ts["val_nll"]), (
         "train_state.val_nll must be a finite number"
     )
+
+    # Wave-11 diagnostics mirrored in smoke_summary.json.
+    for field in ("effective_p", "canonical_p", "p_is_dataset_dependent",
+                  "p_reduction_reason", "regularizers_active",
+                  "metrics_test"):
+        assert field in summary, f"smoke_summary.json missing {field!r}"
+    sreg = summary["regularizers_active"]
+    assert sreg["monotonicity"] is True
+    assert sreg["weight_l2"] is True
+    assert sreg["salience_entropy"] is True
+    assert sreg["diversity"] is True
+    assert summary["config"].get("n_test_records") is not None
 
     # caplog: at least one INFO line.
     info_records = [r for r in caplog.records if r.levelno >= logging.INFO]

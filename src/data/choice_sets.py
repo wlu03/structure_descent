@@ -435,7 +435,15 @@ def build_choice_sets(
                 out.append(adapter.alt_text(asin_lookup.get(a, dict(_DEFAULT_ALT))))
         return out
 
+    # Hard cap on resample rounds for the dedup guard (prevents infinite
+    # loops when the available pool is pathologically small). See the
+    # "Wave 11 post-dryrun fixes" entry in NOTES.md for the fallback
+    # semantics.
+    MAX_RESAMPLE_ROUNDS = 5
+    J = n_negatives + 1
+
     records: List[dict] = []
+    dedup_fallback_any = False
     for i in range(n_events):
         chosen_code = int(chosen_int[i])
         ev_date = order_dates_ns[i]
@@ -443,8 +451,21 @@ def build_choice_sets(
         ev_cat_name = categories[i]
         is_unknown = (ev_cat_code == unknown_cat_code) or (ev_cat_name == "Unknown")
 
+        # Available negative-pool size for this event = number of ASINs
+        # first-seen strictly before the event date, minus the chosen
+        # (which occupies slot 0 of the choice set). ``avail_prefix[i]``
+        # already holds the full temporally-available count; subtract 1
+        # if the chosen is inside that prefix.
+        avail_len_i = int(avail_prefix[i])
+        chosen_in_prefix = int(
+            first_seen_by_code[chosen_code] < ev_date
+        )
+        available_neg_pool_size = max(0, avail_len_i - chosen_in_prefix)
+        dedup_target_size = min(J, available_neg_pool_size + 1)
+
         samples_per_k: List[List[str]] = []
         chosen_idx_per_k: List[int] = []
+        dedup_fallback_per_k: List[bool] = []
         for k_rep in range(n_resamples):
             # Deterministic per-event per-resample RNG seeding (v1 formula
             # — DO NOT change). This is what pins the integration test.
@@ -462,12 +483,81 @@ def build_choice_sets(
                 )
                 negs = np.concatenate([cat_negs, rand_negs])
 
-            alt_codes = np.concatenate([[chosen_code], negs])
+            # --- Dedup guard (Wave 11 post-dryrun fix) ----------------- #
+            # The popularity-weighted samplers draw with replacement and
+            # may collide with each other or with the chosen; small
+            # catalogs (e.g. the 1-customer dry-run) make this visible.
+            # Reduce to unique negatives, resample up to
+            # MAX_RESAMPLE_ROUNDS rounds using the SAME per-event
+            # local_rng (no new RNG streams), and fall back to cyclic
+            # padding only when the available pool is genuinely too
+            # small.
+            seen: set = {chosen_code}
+            negs_unique: List[int] = []
+            for n in negs.tolist():
+                if n not in seen:
+                    negs_unique.append(int(n))
+                    seen.add(int(n))
+
+            resample_round = 0
+            while (
+                len(negs_unique) + 1 < dedup_target_size
+                and resample_round < MAX_RESAMPLE_ROUNDS
+            ):
+                n_needed = dedup_target_size - (len(negs_unique) + 1)
+                extra = _sample_random_for_event_avail(
+                    ev_date, chosen_code, n_needed, local_rng
+                )
+                for n in extra.tolist():
+                    if n not in seen:
+                        negs_unique.append(int(n))
+                        seen.add(int(n))
+                resample_round += 1
+
+            dedup_fallback = False
+            if len(negs_unique) + 1 < J:
+                # Pool exhausted; pad by cycling the unique negatives so
+                # training does not crash. Record the fallback on the
+                # record's metadata for downstream diagnostics.
+                dedup_fallback = True
+                dedup_fallback_any = True
+                logger.warning(
+                    "choice_sets: dedup fallback for customer=%r event=%d; "
+                    "available_pool=%d, got %d distinct alternatives "
+                    "(need J=%d). Padding by cycling.",
+                    customer_ids[i],
+                    i,
+                    available_neg_pool_size,
+                    len(negs_unique) + 1,
+                    J,
+                )
+                if len(negs_unique) == 0:
+                    # Degenerate: no negatives available at all (e.g. the
+                    # very first event in the dataset). Pad with the
+                    # chosen code — matches the v1 ``avail_len<=0``
+                    # fallback in ``_sample_random``.
+                    negs_unique = [chosen_code] * n_negatives
+                else:
+                    # Cycle through the unique pool to fill remaining
+                    # slots (n.b. the sketch's
+                    # ``negs_unique[len(negs_unique) % len(negs_unique)]``
+                    # always indexes zero; we cycle explicitly via the
+                    # original unique-count instead).
+                    unique_count = len(negs_unique)
+                    cycle_pos = 0
+                    while len(negs_unique) < n_negatives:
+                        negs_unique.append(negs_unique[cycle_pos % unique_count])
+                        cycle_pos += 1
+
+            alt_codes = np.asarray(
+                [chosen_code] + negs_unique[:n_negatives], dtype=np.int64
+            )
             perm = local_rng.permutation(len(alt_codes))
             alt_codes = alt_codes[perm]
             chosen_pos = int(np.argmax(alt_codes == chosen_code))
             samples_per_k.append(catalog[alt_codes].tolist())
             chosen_idx_per_k.append(chosen_pos)
+            dedup_fallback_per_k.append(dedup_fallback)
 
         # Build the chosen-alt dict from the event's own row (policy: the
         # chosen item IS the event, no lookup needed).
@@ -504,6 +594,15 @@ def build_choice_sets(
             "brand": str(brand_arr[i] or ""),
         }
 
+        # Dedup-fallback flag (Wave 11 post-dryrun fix). Scalar bool for
+        # n_resamples==1 to match the single-set shape of the other per-
+        # event fields; list-of-bool for n_resamples>1 mirroring the
+        # nested shape of ``choice_asins`` / ``chosen_idx``.
+        if n_resamples == 1:
+            dedup_fallback_field = dedup_fallback_per_k[0]
+        else:
+            dedup_fallback_field = list(dedup_fallback_per_k)
+
         cid = customer_ids[i]
         record = {
             # v1 keys
@@ -518,6 +617,7 @@ def build_choice_sets(
                 "is_repeat": bool(routines[i] > 0),
                 "price": float(prices[i]),
                 "routine": int(routines[i]),
+                "dedup_fallback": dedup_fallback_field,
             },
             # v2 additions
             "z_d": customer_to_zd[cid],
@@ -526,5 +626,11 @@ def build_choice_sets(
         }
         records.append(record)
 
-    logger.info("build_choice_sets: done (%d choice sets built).", len(records))
+    logger.info(
+        "build_choice_sets: done (%d choice sets built%s).",
+        len(records),
+        "; dedup fallback triggered on at least one event"
+        if dedup_fallback_any
+        else "",
+    )
     return records

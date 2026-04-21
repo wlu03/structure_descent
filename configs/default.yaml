@@ -63,7 +63,7 @@ regularizers:
   weight_l2: 1.0e-4          # §9.2 λ_wL2
   salience_entropy: 1.0e-3   # §9.2 λ_entropy (encourages spread)
   monotonicity:              # §9.2 λ_mono (optional)
-    enabled: false
+    enabled: true            # Amazon purchase events: domain prior holds (§9.2). Override per-dataset when inappropriate.
     lambda: 1.0e-3
     price_key: "price"
   diversity: 1.0e-4          # §9.2 λ_div

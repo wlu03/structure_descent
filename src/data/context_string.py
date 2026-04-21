@@ -42,6 +42,7 @@ _SUPPRESSIBLE_FIELDS: frozenset[str] = frozenset({
 __all__ = [
     "DEFAULT_PHRASINGS",
     "build_context_string",
+    "extract_extra_fields_from_row",
     "paraphrase_rules_check",
 ]
 
@@ -127,6 +128,23 @@ DEFAULT_PHRASINGS: dict[str, dict[Any, str]] = {
         "one_child": "one child",
         "two_children": "two children",
         "several_children": "several children",
+    },
+    # Wave 11 c_d signal enrichment: gender / life event / Amazon-use-frequency
+    # clauses surfaced through the ``extra_fields`` kwarg of
+    # ``build_context_string``. These are NOT z_d columns (the p=23 contract
+    # stays fixed); they ride alongside c_d only.
+    "gender": {
+        "Female": "female",
+        "Male": "male",
+    },
+    # Raw Amazon ``Q-amazon-use-how-oft`` values → natural-English paraphrases.
+    # The raw strings must NOT appear verbatim in the rendered c_d (they
+    # contain "5" / "10" substrings from the survey scale); see
+    # test_extra_amazon_frequency_paraphrased.
+    "amazon_frequency": {
+        "Less than 5 times per month": "a few times a month",
+        "5 - 10 times per month": "several times a month",
+        "More than 10 times per month": "more than ten times a month",
     },
 }
 
@@ -261,6 +279,7 @@ def build_context_string(
     recent_purchases: list[str] | None = None,
     current_time: str | None = None,
     suppress_fields: Iterable[str] = (),
+    extra_fields: Mapping[str, Any] | None = None,
 ) -> str:
     """Render the person-context paragraph ``c_d``.
 
@@ -285,15 +304,36 @@ def build_context_string(
         is a constant 0). Suppressible fields:
         ``{has_kids, city_size, education, health_rating, risk_tolerance}``.
         Unknown names are silently ignored.
+    extra_fields : Mapping[str, Any], optional
+        Wave-11 c_d signal-enrichment kwarg. Optional narrative signals
+        that do NOT belong to z_d (which is pinned by the §2.1 / Wave-8
+        p=23 contract) but are useful context for the LLM generator.
+        Recognized keys:
+
+        * ``gender`` — ``"Female"`` / ``"Male"`` emits an inline
+          "as a female" / "as a male" phrase in the age/household line.
+          Any other value (or absent key / ``None``) omits the clause.
+        * ``life_event`` — non-empty string emits an additional line
+          ``"- Recent life event: <event>."`` right after the income
+          line. ``None``, empty string, and pandas NaN sentinel are
+          all treated as "no clause".
+        * ``amazon_frequency`` — raw Amazon ``Q-amazon-use-how-oft``
+          value. Rendered as a paraphrased "- Shops on Amazon <freq>."
+          line near the purchase_frequency line. Unknown values are
+          dropped silently (never passed through verbatim).
+
+        When ``None`` (the default), this function produces
+        byte-identical output to the pre-fix behavior.
 
     Returns
     -------
     str
-        2-8 non-empty lines of plain text. No raw column names, no raw bucket
-        codes, no numeric test-time truths. Deterministic. A WARNING is
-        logged when the output falls below 5 lines (the paper's "5-8 short
-        lines" target); typically this only happens when suppress_fields
-        is non-empty.
+        2-12 non-empty lines of plain text (extras + optional lines can
+        push the count above the paper's 5-8 target). No raw column
+        names, no raw bucket codes, no numeric test-time truths.
+        Deterministic. A WARNING is logged when the output falls below
+        5 lines (the paper's "5-8 short lines" target); typically this
+        only happens when suppress_fields is non-empty.
 
     Notes
     -----
@@ -302,6 +342,7 @@ def build_context_string(
     prompt).
     """
     suppress = frozenset(suppress_fields)
+    extras = _normalize_extra_fields(extra_fields)
 
     # --- phrasings -------------------------------------------------------
     age_phrase = _phrase_age(row["age_bucket"])
@@ -331,17 +372,29 @@ def build_context_string(
     # --- lines -----------------------------------------------------------
     lines: list[str] = ["Person profile"]
 
-    # Line 2: age + household [+ kids].
+    # Line 2: age + household [+ kids] [+ gender extra]. Gender renders as
+    # an inline "as a <gender>" phrase appended to the subject description.
+    gender_suffix = ""
+    if extras.get("gender"):
+        gender_suffix = f", as a {extras['gender']}"
     if "has_kids" in suppress:
-        lines.append(f"- Age: {age_phrase}; household of {household_size}.")
+        lines.append(
+            f"- Age: {age_phrase}; household of {household_size}"
+            f"{gender_suffix}."
+        )
     else:
         kids_phrase = _phrase_kids(bool(row["has_kids"]), household_size)
         lines.append(
-            f"- Age: {age_phrase}; household of {household_size} ({kids_phrase})."
+            f"- Age: {age_phrase}; household of {household_size} "
+            f"({kids_phrase}){gender_suffix}."
         )
 
     # Line 3: income (not suppressible).
     lines.append(f"- Income: {income_phrase}.")
+
+    # Wave-11 extra: Recent life event line, right after income.
+    if extras.get("life_event"):
+        lines.append(f"- Recent life event: {extras['life_event']}.")
 
     # Line 4: city + education. Drop the line only when BOTH are suppressed.
     if city_phrase is not None and education_phrase is not None:
@@ -370,6 +423,12 @@ def build_context_string(
         f"{share_phrase} of orders are first-time products."
     )
 
+    # Wave-11 extra: self-reported Amazon shopping cadence (complements the
+    # event-derived purchase_frequency line above; they measure different
+    # signals and agreement / disagreement is itself informative).
+    if extras.get("amazon_frequency"):
+        lines.append(f"- Shops on Amazon {extras['amazon_frequency']}.")
+
     # --- optional lines --------------------------------------------------
     if recent_purchases:
         joined = ", ".join(str(p) for p in recent_purchases)
@@ -381,14 +440,18 @@ def build_context_string(
     text = "\n".join(lines)
     paraphrase_rules_check(text, row)
 
-    # Relaxed floor: 2-8 non-empty lines. The paper's "5-8 short lines"
+    # Relaxed floor: 2-12 non-empty lines. The paper's "5-8 short lines"
     # target still stands as an intent; we WARN rather than hard-fail
     # below 5 so adapter-driven sentinel suppression (Amazon: has_kids,
     # city_size, health_rating, risk_tolerance) doesn't block rendering.
+    # The Wave-11 ``extra_fields`` kwarg can push the count upward —
+    # gender rides inline so adds 0 lines, life_event adds 1,
+    # amazon_frequency adds 1, and the two optional lines (recent /
+    # current_time) add up to 2 more — hence the relaxed ceiling of 12.
     n_lines = sum(1 for ln in text.split("\n") if ln.strip())
-    if not 2 <= n_lines <= 8:
+    if not 2 <= n_lines <= 12:
         raise AssertionError(
-            f"context string has {n_lines} non-empty lines; expected 2-8"
+            f"context string has {n_lines} non-empty lines; expected 2-12"
         )
     if n_lines < 5:
         logger.warning(
@@ -418,6 +481,159 @@ def _novelty_share_phrase(novelty_rate: float) -> str:
     if n < 0.8:
         return "most"
     return "nearly all"
+
+
+# ---------------------------------------------------------------------------
+# Extra-field normalization (Wave 11 c_d signal enrichment)
+# ---------------------------------------------------------------------------
+
+
+def _is_missing(value: Any) -> bool:
+    """True if *value* should be treated as "no clause": None, empty string,
+    or the pandas/NumPy NaN sentinel (float('nan')).
+    """
+    if value is None:
+        return True
+    # pandas NaN is a float that != itself; this catches NumPy NaN too.
+    try:
+        if isinstance(value, float) and value != value:  # noqa: PLR0124
+            return True
+    except Exception:
+        pass
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped.lower() == "nan":
+            return True
+    return False
+
+
+def _normalize_extra_fields(
+    extra_fields: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Return a dict of already-paraphrased extra-field phrases.
+
+    Missing / unrecognized entries are silently dropped (so callers can
+    pass raw survey values without a pre-flight guard). Recognized keys:
+
+    * ``gender`` — lowercased "female" / "male"; anything else is dropped
+      (so "Other" / "Prefer not to say" produce no clause).
+    * ``life_event`` — passed through as a trimmed string when non-empty,
+      else dropped. pandas NaN is detected via _is_missing.
+    * ``amazon_frequency`` — mapped via
+      ``DEFAULT_PHRASINGS["amazon_frequency"]`` when the raw value matches
+      a known survey option; otherwise dropped (never passed through, to
+      avoid leaking "More than 10 times per month" verbatim).
+    """
+    out: dict[str, str] = {}
+    if extra_fields is None:
+        return out
+
+    raw_gender = extra_fields.get("gender")
+    if not _is_missing(raw_gender):
+        # Accept both raw-survey ("Female"/"Male") and already-paraphrased
+        # ("female"/"male") inputs — the helper upstream may have mapped
+        # through the YAML already.
+        gender_map = DEFAULT_PHRASINGS["gender"]
+        phrased = gender_map.get(raw_gender)
+        if phrased is None and isinstance(raw_gender, str):
+            for key, val in gender_map.items():
+                if key.lower() == raw_gender.lower():
+                    phrased = val
+                    break
+        if phrased is not None:
+            out["gender"] = phrased
+        # else: "Other" / "Prefer not to say" / unknown → drop silently.
+
+    raw_life = extra_fields.get("life_event")
+    if not _is_missing(raw_life):
+        text = str(raw_life).strip()
+        if text:
+            out["life_event"] = text
+
+    raw_freq = extra_fields.get("amazon_frequency")
+    if not _is_missing(raw_freq):
+        phrased = DEFAULT_PHRASINGS["amazon_frequency"].get(raw_freq)
+        if phrased is not None:
+            out["amazon_frequency"] = phrased
+        # else: unknown freq → drop silently (never leak raw "10 times"
+        # through; paraphrase_rules_check wouldn't block it, but the
+        # Wave-11 test asserts the raw form is absent).
+
+    return out
+
+
+def extract_extra_fields_from_row(
+    row: Mapping[str, Any],
+    yaml_block: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    """Translate a raw persons-row dict into the canonical ``extra_fields``
+    dict that :func:`build_context_string` consumes.
+
+    Parameters
+    ----------
+    row :
+        One raw persons-row mapping (e.g. a ``pandas.Series`` or dict of
+        the original survey columns for a single customer).
+    yaml_block :
+        The parsed ``persons.c_d_extra_fields`` YAML block, as a free-form
+        Python dict. Keys are canonical extra-field names (``gender``,
+        ``life_event``, ``amazon_frequency``); values are per-field spec
+        dicts with at least a ``source`` (raw column name) and a ``kind``
+        (one of ``passthrough``, ``categorical_map`` — matching the
+        schema_map vocabulary).
+
+        ``None`` or empty → returns an empty dict.
+
+    Returns
+    -------
+    dict
+        Canonical extra-fields dict ready to pass as
+        ``build_context_string(..., extra_fields=...)``. Missing /
+        unknown raw values are dropped (they simply don't appear in the
+        returned dict), matching the spec's "drop the clause entirely"
+        rule for ambiguous or NaN signals.
+
+    Notes
+    -----
+    This helper lives alongside the renderer rather than in
+    ``schema_map.py`` because extra_fields are c_d-only — they never
+    touch z_d and therefore aren't part of the frozen
+    :class:`DatasetSchema` contract. Driver code (e.g.
+    ``scripts/run_dataset.py`` or ``src/data/choice_sets.py``) calls
+    this helper after :func:`schema_map.translate_persons` to plumb the
+    extra signals through to ``build_context_string``.
+    """
+    if not yaml_block:
+        return {}
+
+    out: dict[str, Any] = {}
+    for canonical, spec in yaml_block.items():
+        if not isinstance(spec, Mapping):
+            continue
+        source = spec.get("source")
+        kind = spec.get("kind", "passthrough")
+        if source is None or source not in row:
+            continue
+        raw_value = row[source]
+        if _is_missing(raw_value):
+            continue
+
+        if kind == "passthrough":
+            out[canonical] = raw_value
+        elif kind == "categorical_map":
+            values = spec.get("values") or {}
+            drop = tuple(spec.get("drop_on_unknown") or ())
+            if raw_value in drop:
+                continue
+            if raw_value in values:
+                out[canonical] = values[raw_value]
+            # else: unknown value; drop silently.
+        else:
+            # Unknown kind: be conservative and drop. (This helper
+            # intentionally supports only the two kinds used by the
+            # Wave-11 Amazon YAML; extending it is a small follow-up.)
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------

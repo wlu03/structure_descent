@@ -9,6 +9,7 @@ import pytest
 from src.data.context_string import (
     DEFAULT_PHRASINGS,
     build_context_string,
+    extract_extra_fields_from_row,
     paraphrase_rules_check,
 )
 
@@ -463,3 +464,243 @@ def test_suppress_default_empty_tuple_changes_nothing():
     c = build_context_string(row, suppress_fields=[])
     assert a == b == c
     assert 5 <= len(_nonempty_lines(a)) <= 8  # target range unaffected
+
+
+# ---------------------------------------------------------------------------
+# Wave 11: extra_fields kwarg — c_d signal enrichment
+# ---------------------------------------------------------------------------
+
+def test_extra_gender_inline():
+    """extras={'gender':'Female'} → 'as a female' appears in the age line."""
+    row = _base_row()
+    out_f = build_context_string(row, extra_fields={"gender": "Female"})
+    out_m = build_context_string(row, extra_fields={"gender": "Male"})
+    # The gender clause is expected to be inline in the second (age) line.
+    age_line_f = _nonempty_lines(out_f)[1]
+    age_line_m = _nonempty_lines(out_m)[1]
+    assert "as a female" in age_line_f, f"gender=Female did not render inline: {age_line_f!r}"
+    assert "as a male" in age_line_m, f"gender=Male did not render inline: {age_line_m!r}"
+    # And the raw "Female"/"Male" titlecase strings must not leak.
+    assert "Female" not in out_f
+    assert "Male" not in out_m
+
+
+def test_extra_gender_other_dropped():
+    """extras={'gender':'Other'} → no gender clause."""
+    row = _base_row()
+    base = build_context_string(row)
+    out = build_context_string(row, extra_fields={"gender": "Other"})
+    # 'Other' maps to no paraphrase → no clause → output identical to base.
+    assert out == base
+    assert "as a " not in out.split("\n")[1].lower()
+
+
+def test_extra_gender_prefer_not_to_say_dropped():
+    """'Prefer not to say' is treated the same as 'Other' — no clause."""
+    row = _base_row()
+    base = build_context_string(row)
+    out = build_context_string(row, extra_fields={"gender": "Prefer not to say"})
+    assert out == base
+
+
+def test_extra_life_event_adds_line():
+    """extras={'life_event':'Had a child'} → a new line containing that phrase."""
+    row = _base_row()
+    base = build_context_string(row)
+    out = build_context_string(row, extra_fields={"life_event": "Had a child"})
+    assert len(_nonempty_lines(out)) == len(_nonempty_lines(base)) + 1
+    assert "Had a child" in out
+    assert "Recent life event" in out
+
+
+def test_extra_life_event_empty_no_line():
+    """extras={'life_event':''} → no extra line added."""
+    row = _base_row()
+    base = build_context_string(row)
+    out = build_context_string(row, extra_fields={"life_event": ""})
+    assert out == base
+
+
+def test_extra_life_event_nan_handled():
+    """extras={'life_event': float('nan')} → no extra line (pandas-NaN guard)."""
+    row = _base_row()
+    base = build_context_string(row)
+    out = build_context_string(row, extra_fields={"life_event": float("nan")})
+    assert out == base
+    assert "Recent life event" not in out
+
+
+def test_extra_life_event_none_handled():
+    """extras={'life_event': None} → no extra line."""
+    row = _base_row()
+    base = build_context_string(row)
+    out = build_context_string(row, extra_fields={"life_event": None})
+    assert out == base
+
+
+def test_extra_amazon_frequency_paraphrased():
+    """'More than 10 times per month' → 'more than ten times a month'.
+
+    The exact raw string must NOT appear verbatim.
+    """
+    row = _base_row()
+    out = build_context_string(
+        row,
+        extra_fields={"amazon_frequency": "More than 10 times per month"},
+    )
+    assert "more than ten times a month" in out
+    # Raw form must be fully paraphrased:
+    assert "More than 10 times per month" not in out
+    # 'Shops on Amazon' prefix indicates the new extras line.
+    assert "Shops on Amazon more than ten times a month" in out
+
+
+def test_extra_amazon_frequency_all_three_values_paraphrased():
+    """Each of the three Q-amazon-use-how-oft values has a paraphrase."""
+    row = _base_row()
+    raw_to_paraphrase = {
+        "Less than 5 times per month": "a few times a month",
+        "5 - 10 times per month": "several times a month",
+        "More than 10 times per month": "more than ten times a month",
+    }
+    for raw, phrase in raw_to_paraphrase.items():
+        out = build_context_string(row, extra_fields={"amazon_frequency": raw})
+        assert phrase in out
+        assert raw not in out
+
+
+def test_extras_default_none_unchanged():
+    """Not passing extra_fields (or passing None) must be byte-identical to
+    the pre-Wave-11 call site."""
+    row = _base_row()
+    a = build_context_string(row)
+    b = build_context_string(row, extra_fields=None)
+    c = build_context_string(row, extra_fields={})
+    assert a == b == c
+
+
+def test_extras_compose_with_suppression():
+    """Amazon's 4 sentinels suppressed + all 3 extras provided → 5-8 lines
+    restored (the paper's target range)."""
+    row = _base_row()
+    sup = ["has_kids", "city_size", "health_rating", "risk_tolerance"]
+    extras = {
+        "gender": "Female",
+        "life_event": "Had a child",
+        "amazon_frequency": "5 - 10 times per month",
+    }
+    out = build_context_string(row, suppress_fields=sup, extra_fields=extras)
+    n = len(_nonempty_lines(out))
+    assert 5 <= n <= 8, f"expected 5-8 lines after restoring extras; got {n}:\n{out}"
+    # All three signals should have shown up.
+    assert "as a female" in out
+    assert "Recent life event: Had a child" in out
+    assert "several times a month" in out
+
+
+def test_extras_paraphrase_rules_still_pass():
+    """Extras must not break paraphrase_rules_check."""
+    row = _base_row()
+    extras = {
+        "gender": "Female",
+        "life_event": "Lost a job",
+        "amazon_frequency": "More than 10 times per month",
+    }
+    out = build_context_string(row, extra_fields=extras)
+    # Explicit idempotent re-check.
+    paraphrase_rules_check(out, row)
+
+
+def test_extra_amazon_frequency_unknown_dropped():
+    """Unknown freq value → dropped silently (never leaked verbatim)."""
+    row = _base_row()
+    base = build_context_string(row)
+    out = build_context_string(
+        row, extra_fields={"amazon_frequency": "some unknown cadence"}
+    )
+    # The unknown raw value is dropped entirely.
+    assert out == base
+    assert "some unknown cadence" not in out
+
+
+# ---------------------------------------------------------------------------
+# extract_extra_fields_from_row helper
+# ---------------------------------------------------------------------------
+
+def test_extract_extra_fields_from_row():
+    """Given raw persons row + minimal YAML-like block, return canonical dict."""
+    raw_row = {
+        "Survey ResponseID": "R_x",
+        "Q-demos-gender": "Female",
+        "Q-life-changes": "Had a child",
+        "Q-amazon-use-how-oft": "5 - 10 times per month",
+    }
+    yaml_block = {
+        "gender": {
+            "source": "Q-demos-gender",
+            "kind": "categorical_map",
+            "values": {"Female": "Female", "Male": "Male"},
+            "drop_on_unknown": ["Other", "Prefer not to say"],
+        },
+        "life_event": {"source": "Q-life-changes", "kind": "passthrough"},
+        "amazon_frequency": {
+            "source": "Q-amazon-use-how-oft",
+            "kind": "passthrough",
+        },
+    }
+    out = extract_extra_fields_from_row(raw_row, yaml_block)
+    assert set(out.keys()) == {"gender", "life_event", "amazon_frequency"}
+    assert out["gender"] == "Female"
+    assert out["life_event"] == "Had a child"
+    assert out["amazon_frequency"] == "5 - 10 times per month"
+
+    # The returned dict plugs straight into build_context_string.
+    row = _base_row()
+    rendered = build_context_string(row, extra_fields=out)
+    assert "as a female" in rendered
+    assert "Had a child" in rendered
+    assert "several times a month" in rendered
+
+
+def test_extract_extra_fields_respects_drop_on_unknown():
+    """Gender='Other' → helper omits the 'gender' key from its output."""
+    raw_row = {
+        "Q-demos-gender": "Other",
+        "Q-life-changes": "Moved place of residence",
+    }
+    yaml_block = {
+        "gender": {
+            "source": "Q-demos-gender",
+            "kind": "categorical_map",
+            "values": {"Female": "Female", "Male": "Male"},
+            "drop_on_unknown": ["Other", "Prefer not to say"],
+        },
+        "life_event": {"source": "Q-life-changes", "kind": "passthrough"},
+    }
+    out = extract_extra_fields_from_row(raw_row, yaml_block)
+    assert "gender" not in out, "Other / Prefer not to say must be dropped"
+    assert out["life_event"] == "Moved place of residence"
+
+
+def test_extract_extra_fields_empty_inputs():
+    """None / {} yaml_block → empty dict; missing source column → skip."""
+    raw_row = {"Q-demos-gender": "Female"}
+    assert extract_extra_fields_from_row(raw_row, None) == {}
+    assert extract_extra_fields_from_row(raw_row, {}) == {}
+    # Missing source column in the raw row: the canonical key should be
+    # absent from the output.
+    yaml_block = {
+        "life_event": {"source": "Q-life-changes", "kind": "passthrough"},
+    }
+    out = extract_extra_fields_from_row(raw_row, yaml_block)
+    assert "life_event" not in out
+
+
+def test_extract_extra_fields_skips_nan_source_values():
+    """Raw life_event = NaN → canonical dict has no life_event key."""
+    raw_row = {"Q-life-changes": float("nan")}
+    yaml_block = {
+        "life_event": {"source": "Q-life-changes", "kind": "passthrough"},
+    }
+    out = extract_extra_fields_from_row(raw_row, yaml_block)
+    assert "life_event" not in out
