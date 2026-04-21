@@ -801,3 +801,80 @@ assignment. **validate_split hook**: the post-stage invariant
 before return, so a standalone 1-event customer raises `InvariantError`
 because v1's collapse labels that single row `"test"`. Tests:
 `tests/test_data_split.py`, 12 cases, all green.
+
+
+## Wave 9 — DatasetAdapter Protocol + v2 choice_sets
+
+**`src/data/choice_sets.py`** (v1 port from data_prep.py:228-493, design doc §5).
+Logic-preserving port of v1 `build_choice_sets`: temporal availability
+filter (first_seen strictly < order_date), popularity-weighted random
+negatives, category-stratified same-cat negatives (`n_negatives // 2`
+same-cat + remainder random), collision handling via the `+1`-sort-
+position bump, `n_resamples` list-of-lists dichotomy, and the v1 per-
+event per-resample RNG seeding formula `seed + 1_000_003 * k_rep + i`
+preserved verbatim. The McFadden caveat docstring (v1 lines 235-238) is
+retained. All `print` statements are replaced by `logging.getLogger
+(__name__)` (INFO at stage boundaries, DEBUG on numeric diagnostics).
+**v2 augmentation** attaches three new keys to every record: `z_d`
+(shape `(p,)` float32, per-customer), `c_d` (rendered once per customer
+via `build_context_string(..., suppress_fields=adapter.suppress_fields_for_c_d())`),
+and `alt_texts` (list of `J = n_negatives + 1` dicts — the chosen
+alternative uses the event's own row, negatives use a pre-built
+`asin_lookup` dict keyed by the causally-earliest row per asin). A
+§2.1 **fit-on-train assertion** runs before the main loop: any
+`persons_canonical` customer_id not in `events_df[split_column] ==
+"train"` raises `AssertionError` so the standardization stats are never
+fit on non-train rows. **Per-customer caches** (O(n_customers), not
+O(n_events)) amortize z_d transform and c_d rendering; the main loop's
+record construction only dict-looks-up by customer_id. The adapter is
+imported under `TYPE_CHECKING` (forward-reference only) and called
+duck-typed at runtime, so this module has no hard dep on
+`src/data/adapter.py` — the sibling Wave-9 adapter module can be
+co-developed without triggering circular-import risk. Tests:
+`tests/test_choice_sets.py`, 13 cases, all green (4 v1-preservation, 5
+v2-augmentation, 2 fit-on-train, 1 NaN-guard, 1 Amazon-fixture
+end-to-end).
+
+
+## Wave 9 — DatasetAdapter Protocol + v2 choice_sets
+
+**`src/data/adapter.py`** (design doc §2, §3).
+- Eight-member Protocol surface (`@runtime_checkable`): `load_events`,
+  `load_persons`, `event_column_map`, `person_id_column`,
+  `translate_z_d`, `derived_z_d_columns`, `alt_text`, plus the
+  `suppress_fields_for_c_d` helper. `name` + `schema` are attributes
+  so `isinstance(adapter, DatasetAdapter)` is a useful runtime smoke
+  test.
+- **Caching policy.** `YamlAdapter` memoises both raw frames on the
+  instance. First call to either `load_events` or `load_persons` runs
+  `src.data.load.load(self.schema)` once and stores the resulting
+  `(events_raw, persons_raw)` pair; every subsequent call on either
+  method returns the cached frame. Matters for the 1.5M-row Amazon
+  events file: callers frequently want both frames and a naive
+  per-method read would double the disk traffic.
+- **`AmazonAdapter()` factory.** One-line call — returns
+  `YamlAdapter("configs/datasets/amazon.yaml")`. Named as a
+  capital-C factory so call-sites read like a constructor.
+- **suppress rule** (cached once at `__init__`, returned as a tuple):
+  `kind == "constant"` → suppress; `kind == "external_lookup"` AND the
+  lookup CSV is missing / unreadable / header-only → suppress; every
+  other kind passes through. On Amazon this yields
+  `("has_kids", "city_size")` — `has_kids` is a constant sentinel and
+  the `state_to_citysize.csv` ships empty so every row falls through
+  to the same `"medium"` fallback.
+- **alt_text Wave-10 handoff.** `_popularity_percentile_fn` is `None`
+  at construction; Wave 10's `alt_rendering.build_popularity_percentiles`
+  is expected to populate it. Until then, `alt_text` renders
+  `popularity_rank` as the stub `f"popularity score {n}"` with a DEBUG
+  log so the pre-Wave-10 smoke test is exercisable. Other keys
+  (`title`, `category`, `price`) are read directly off the event row.
+- **Delegation, not reimplementation.** `translate_z_d` forwards to
+  `schema_map.translate_persons`; `load_events`/`load_persons` forward
+  to `data.load.load`. No z_d kind handlers live in this module.
+- Tests: `tests/test_adapter.py` (15 cases against the real Amazon
+  YAML + 100-row fixtures) and `tests/test_adapter_synthetic.py`
+  (2 cases, one of them the "dataset #2 costs you nothing" gate that
+  runs the full clean → join → state_features → split → popularity
+  → translate_z_d pipeline against a fully synthetic 5-customer YAML
+  built entirely in `tmp_path`, with no import from `amazon_ecom/` or
+  `configs/datasets/amazon.yaml`). All 17 green.

@@ -20,7 +20,24 @@ byte).
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+import logging
+from typing import Any, Iterable, Mapping
+
+logger = logging.getLogger(__name__)
+
+#: Canonical column names whose rendered clauses in ``c_d`` may be
+#: suppressed by a caller (adapter-driven). Non-suppressible columns —
+#: age_bucket, income_bucket, household_size, purchase_frequency,
+#: novelty_rate — always render because they carry per-customer signal
+#: on every dataset we've considered. Unknown names in ``suppress_fields``
+#: are silently ignored so adapter drift can't break the renderer.
+_SUPPRESSIBLE_FIELDS: frozenset[str] = frozenset({
+    "has_kids",
+    "city_size",
+    "education",
+    "health_rating",
+    "risk_tolerance",
+})
 
 __all__ = [
     "DEFAULT_PHRASINGS",
@@ -243,8 +260,9 @@ def build_context_string(
     *,
     recent_purchases: list[str] | None = None,
     current_time: str | None = None,
+    suppress_fields: Iterable[str] = (),
 ) -> str:
-    """Render the 5-8 line person-context paragraph ``c_d``.
+    """Render the person-context paragraph ``c_d``.
 
     Parameters
     ----------
@@ -259,12 +277,23 @@ def build_context_string(
     current_time : str, optional
         Free-text phrase like ``"Tuesday evening, late April"``. If given and
         non-empty, emits a final "Current time: ..." line.
+    suppress_fields : Iterable[str], optional
+        Canonical column names whose rendered clauses are omitted from the
+        output. Intended for adapter-level suppression of sentinel /
+        constant fields whose values carry no per-customer signal (e.g.
+        ``has_kids`` when the dataset has no kids question and the field
+        is a constant 0). Suppressible fields:
+        ``{has_kids, city_size, education, health_rating, risk_tolerance}``.
+        Unknown names are silently ignored.
 
     Returns
     -------
     str
-        5-8 non-empty lines of plain text. No raw column names, no raw bucket
-        codes, no numeric test-time truths. Deterministic.
+        2-8 non-empty lines of plain text. No raw column names, no raw bucket
+        codes, no numeric test-time truths. Deterministic. A WARNING is
+        logged when the output falls below 5 lines (the paper's "5-8 short
+        lines" target); typically this only happens when suppress_fields
+        is non-empty.
 
     Notes
     -----
@@ -272,37 +301,68 @@ def build_context_string(
     rule 1 ("will buy X next" is test-time truth and must never enter the
     prompt).
     """
+    suppress = frozenset(suppress_fields)
+
     # --- phrasings -------------------------------------------------------
     age_phrase = _phrase_age(row["age_bucket"])
     income_phrase = _phrase_income(row["income_bucket"])
-    city_phrase = _phrase_city(row["city_size"])
-    education_phrase = _phrase_education(row["education"])
-    health_phrase = _phrase_health(row["health_rating"])
-    risk_phrase = _phrase_risk(row["risk_tolerance"])
     freq_phrase = _phrase_purchase_frequency(row["purchase_frequency"])
     novelty_phrase = _phrase_novelty(row["novelty_rate"])
-
     household_size = int(row["household_size"])
-    has_kids = bool(row["has_kids"])
-    kids_phrase = _phrase_kids(has_kids, household_size)
+
+    # Suppressible phrasings: only resolved if needed.
+    city_phrase = (
+        None if "city_size" in suppress else _phrase_city(row["city_size"])
+    )
+    education_phrase = (
+        None if "education" in suppress else _phrase_education(row["education"])
+    )
+    health_phrase = (
+        None
+        if "health_rating" in suppress
+        else _phrase_health(row["health_rating"])
+    )
+    risk_phrase = (
+        None
+        if "risk_tolerance" in suppress
+        else _phrase_risk(row["risk_tolerance"])
+    )
 
     # --- lines -----------------------------------------------------------
     lines: list[str] = ["Person profile"]
 
-    # Line 2: age + household + kids
-    lines.append(
-        f"- Age: {age_phrase}; household of {household_size} ({kids_phrase})."
-    )
-    # Line 3: income
+    # Line 2: age + household [+ kids].
+    if "has_kids" in suppress:
+        lines.append(f"- Age: {age_phrase}; household of {household_size}.")
+    else:
+        kids_phrase = _phrase_kids(bool(row["has_kids"]), household_size)
+        lines.append(
+            f"- Age: {age_phrase}; household of {household_size} ({kids_phrase})."
+        )
+
+    # Line 3: income (not suppressible).
     lines.append(f"- Income: {income_phrase}.")
-    # Line 4: city + education
-    lines.append(f"- Lives in a {city_phrase}; {education_phrase}.")
-    # Line 5: health + risk
-    lines.append(f"- Self-reports {health_phrase}; {risk_phrase}.")
-    # Line 6: purchase frequency + novelty share.
-    # novelty_phrase (e.g. "rarely tries new products") is carried through
-    # DEFAULT_PHRASINGS-style coverage via _phrase_novelty; the "<share> of
-    # orders are first-time products" clause matches the §2.2 template.
+
+    # Line 4: city + education. Drop the line only when BOTH are suppressed.
+    if city_phrase is not None and education_phrase is not None:
+        lines.append(f"- Lives in a {city_phrase}; {education_phrase}.")
+    elif city_phrase is not None:
+        lines.append(f"- Lives in a {city_phrase}.")
+    elif education_phrase is not None:
+        # Keep education as a standalone demographic line; capitalize.
+        lines.append(f"- {education_phrase[:1].upper()}{education_phrase[1:]}.")
+    # else: both suppressed; skip.
+
+    # Line 5: health + risk. Drop when BOTH are suppressed.
+    if health_phrase is not None and risk_phrase is not None:
+        lines.append(f"- Self-reports {health_phrase}; {risk_phrase}.")
+    elif health_phrase is not None:
+        lines.append(f"- Self-reports {health_phrase}.")
+    elif risk_phrase is not None:
+        lines.append(f"- {risk_phrase[:1].upper()}{risk_phrase[1:]}.")
+    # else: both suppressed; skip.
+
+    # Line 6: purchase frequency + novelty share (not suppressible).
     _ = novelty_phrase  # surfaced only for DEFAULT_PHRASINGS-coverage tests
     share_phrase = _novelty_share_phrase(float(row["novelty_rate"]))
     lines.append(
@@ -321,11 +381,21 @@ def build_context_string(
     text = "\n".join(lines)
     paraphrase_rules_check(text, row)
 
-    # Invariant: 5-8 non-empty lines.
+    # Relaxed floor: 2-8 non-empty lines. The paper's "5-8 short lines"
+    # target still stands as an intent; we WARN rather than hard-fail
+    # below 5 so adapter-driven sentinel suppression (Amazon: has_kids,
+    # city_size, health_rating, risk_tolerance) doesn't block rendering.
     n_lines = sum(1 for ln in text.split("\n") if ln.strip())
-    if not 5 <= n_lines <= 8:
+    if not 2 <= n_lines <= 8:
         raise AssertionError(
-            f"context string has {n_lines} non-empty lines; expected 5-8"
+            f"context string has {n_lines} non-empty lines; expected 2-8"
+        )
+    if n_lines < 5:
+        logger.warning(
+            "context string rendered only %d non-empty lines (target 5-8); "
+            "suppress_fields=%s",
+            n_lines,
+            sorted(suppress) or "()",
         )
     return text
 

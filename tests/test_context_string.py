@@ -316,3 +316,150 @@ def test_optional_lines_partial():
     assert "Current time" in b
     assert "Recent purchases" not in b
     assert 5 <= len(_nonempty_lines(b)) <= 8
+
+
+# ---------------------------------------------------------------------------
+# Wave 9: suppress_fields — adapter-driven sentinel suppression.
+# ---------------------------------------------------------------------------
+
+def test_suppress_has_kids_removes_kids_clause():
+    """Suppressing ``has_kids`` drops the kids parenthetical from line 2."""
+    row = _base_row(has_kids=True, household_size=4)
+    with_kids = build_context_string(row)
+    without = build_context_string(row, suppress_fields=["has_kids"])
+    # The kids phrasing is present in the default render...
+    assert "two children" in with_kids
+    # ...and gone in the suppressed render.
+    assert "two children" not in without
+    # Line 2 should still exist and mention the household size.
+    assert "household of 4" in without
+
+
+def test_suppress_city_size_removes_city_clause():
+    """Suppressing ``city_size`` drops the "Lives in a …" clause.
+
+    Education still renders — the line collapses to a standalone
+    education clause rather than disappearing.
+    """
+    row = _base_row(city_size="large", education=4)
+    full = build_context_string(row)
+    sup = build_context_string(row, suppress_fields=["city_size"])
+    assert "large U.S. city" in full
+    assert "large U.S. city" not in sup
+    assert "Lives in" not in sup
+    # The surviving education clause should still be in the output.
+    assert "college-educated" in sup.lower() or "College-educated" in sup
+
+
+def test_suppress_health_and_risk_drops_entire_line():
+    """Suppressing both ``health_rating`` and ``risk_tolerance`` drops line 5."""
+    row = _base_row()
+    full = build_context_string(row)
+    sup = build_context_string(
+        row, suppress_fields=["health_rating", "risk_tolerance"]
+    )
+    # Line 5 ("Self-reports … ; …") should be present in full, absent when
+    # both clauses are suppressed.
+    assert "Self-reports" in full
+    assert "Self-reports" not in sup
+
+
+def test_suppress_only_health_keeps_risk_standalone():
+    """Suppressing only health still renders the risk clause alone."""
+    row = _base_row(risk_tolerance=-1.0)  # cautious
+    sup = build_context_string(row, suppress_fields=["health_rating"])
+    # "Self-reports" prefix should be gone; risk phrase remains.
+    assert "Self-reports" not in sup
+    assert "cautious" in sup.lower()
+
+
+def test_suppress_only_risk_keeps_health_standalone():
+    row = _base_row(health_rating=5)
+    sup = build_context_string(row, suppress_fields=["risk_tolerance"])
+    assert "Self-reports excellent health" in sup
+    # No dangling separator.
+    assert ";" not in sup.split("Self-reports", 1)[1].splitlines()[0]
+
+
+def test_suppress_all_four_amazon_sentinels_produces_minimal_c_d(caplog):
+    """Amazon's has_kids + city_size + health_rating + risk_tolerance
+    suppression yields a minimal but coherent c_d with at least 2 lines.
+
+    Logs a WARNING because the result falls below the paper's 5-line
+    target.
+    """
+    import logging
+    row = _base_row()
+    caplog.set_level(logging.WARNING, logger="src.data.context_string")
+    sup = build_context_string(
+        row,
+        suppress_fields=[
+            "has_kids", "city_size", "health_rating", "risk_tolerance",
+        ],
+    )
+    lines = _nonempty_lines(sup)
+    # Must have: profile header, age/household, income, education
+    # (standalone), purchase/novelty. That's 5 lines — still at the
+    # paper's floor. A WARNING might still fire if rendering dropped
+    # to 4; either way must be >= 2 and <= 8.
+    assert 2 <= len(lines) <= 8
+    # Amazon's sentinels must not leak any of the suppressed content.
+    assert "children" not in sup
+    assert "city" not in sup.lower()
+    assert "Self-reports" not in sup
+    assert "risk" not in sup.lower()
+
+
+def test_suppress_paraphrase_rules_still_pass():
+    """Suppression must not break paraphrase_rules_check."""
+    row = _base_row()
+    sup = build_context_string(
+        row,
+        suppress_fields=[
+            "has_kids", "city_size", "health_rating", "risk_tolerance",
+        ],
+    )
+    # paraphrase_rules_check runs inside build_context_string. If it
+    # failed we'd have seen an AssertionError. Re-run explicitly to
+    # ensure idempotence.
+    paraphrase_rules_check(sup, row)
+
+
+def test_suppress_unknown_field_silently_ignored():
+    """Unknown names in suppress_fields do not raise."""
+    row = _base_row()
+    out = build_context_string(row, suppress_fields=["not_a_real_field"])
+    # Should render identically to the default call.
+    default = build_context_string(row)
+    assert out == default
+
+
+def test_suppress_below_five_lines_logs_warning(caplog):
+    """Force a <5-line render via suppression; assert WARNING is logged."""
+    import logging
+    row = _base_row()
+    caplog.set_level(logging.WARNING, logger="src.data.context_string")
+    # Suppress enough to force 4 lines. Suppressing both city and
+    # education drops line 4 entirely; suppressing both health and risk
+    # drops line 5 entirely. That leaves: profile, age/household,
+    # income, purchase/novelty = 4 lines.
+    out = build_context_string(
+        row,
+        suppress_fields=[
+            "city_size", "education", "health_rating", "risk_tolerance",
+        ],
+    )
+    assert len(_nonempty_lines(out)) == 4
+    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warns) == 1
+    assert "4 non-empty lines" in warns[0].getMessage()
+
+
+def test_suppress_default_empty_tuple_changes_nothing():
+    """Calling with the default empty suppress_fields matches pre-kwarg behavior."""
+    row = _base_row()
+    a = build_context_string(row)
+    b = build_context_string(row, suppress_fields=())
+    c = build_context_string(row, suppress_fields=[])
+    assert a == b == c
+    assert 5 <= len(_nonempty_lines(a)) <= 8  # target range unaffected
