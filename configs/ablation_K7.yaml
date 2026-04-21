@@ -1,0 +1,96 @@
+# PO-LEU secondary ablation: K=7.
+# Standalone file — copy of configs/default.yaml with K sweep per
+# redesign.md §11 "Secondary ablations". Do not edit default.yaml.
+
+ablation:
+  id: "K7"
+  description: "K sweep: K=7 outcomes per alternative (redesign.md §11 secondary)."
+
+seed: 0
+
+model:
+  M: 5
+  K: 7
+  J: 10
+  d_e: 768
+  p: 26
+
+  attribute_heads:
+    hidden: 128
+    activation: relu
+  weight_net:
+    hidden: 32
+    normalization: softmax
+  salience_net:
+    hidden: 64
+  temperature: 1.0
+  person_dependent_heads: false
+  uniform_salience: false
+
+data:
+  split: temporal
+  choice_set_size: 10
+
+outcomes:
+  K: 7
+  generator:
+    model_id: "stub"
+    temperature: 0.8
+    top_p: 0.95
+    max_tokens: 180
+    prompt_version: "v1"
+  encoder:
+    model_id: "sentence-transformers/all-mpnet-base-v2"
+    pooling: mean
+    l2_normalize: true
+    max_length: 64
+  diversity_filter:
+    enabled: true
+    cos_sim_threshold: 0.9
+    max_retries: 2
+  cache:
+    outcomes_path: "outcomes_cache/outcomes.sqlite"
+    embeddings_path: "embeddings_cache/embeddings.sqlite"
+
+train:
+  batch_size: 128
+  lr: 1.0e-3
+  lr_min: 1.0e-4
+  optimizer: adam
+  beta1: 0.9
+  beta2: 0.999
+  max_epochs: 30
+  early_stopping_patience: 5
+  grad_clip: 1.0
+  seeds: [0, 1, 2]
+
+regularizers:
+  weight_l2: 1.0e-4
+  salience_entropy: 1.0e-3
+  monotonicity:
+    enabled: false
+    lambda: 1.0e-3
+    price_key: "price"
+  diversity: 1.0e-4
+
+eval:
+  top_k_list: [1, 5]
+  strata:
+    - category
+    - repeat_or_novel
+    - activity_tertile
+    - time_of_day
+    - dominant_attribute
+
+subsample:
+  enabled: false
+  n_customers: 500
+  n_pca_components: 20
+  min_per_category_cluster: 2
+  seed: 42
+
+paths:
+  outcomes_cache: "outcomes_cache/"
+  embeddings_cache: "embeddings_cache/"
+  checkpoints: "checkpoints/"
+  reports: "reports/"

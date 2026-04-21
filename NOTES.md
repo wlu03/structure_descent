@@ -477,7 +477,59 @@ preserved.
 
 ## Wave 7 — interpretability + ablation configs
 
-(pending)
+**`src/eval/interpret.py`** (§12).
+- Four reporting functions plus `run_all_reports`. Pure, deterministic;
+  torch + numpy + stdlib only (`json`, `pathlib`). All returned dicts are
+  JSON-serializable (tensors flattened via `.tolist()` before return).
+- `DEFAULT_HEAD_NAMES = ["financial","health","convenience","emotional","social"]`
+  (§5.2). Per-head dict keys are always `"m{idx}"` for schema stability;
+  the pretty names live in the top-level `"head_names"` list.
+- `dominant_attribute_report` is a thin wrapper over
+  `src.eval.strata.dominant_attribute_breakdown`, re-keyed as `"m{idx}"`
+  and with the per-bucket `"n"` split into a companion `n_by_attribute`
+  dict so metric dicts stay pure scores.
+- Default counterfactual perturbation in `run_all_reports`: **add +1.0
+  to `z_d[event_idx, 0]`** (documented here; callers wanting
+  semantically meaningful perturbations like "+1 child" should supply
+  their own `perturbation_fn` and call `counterfactual_report` directly).
+  Counterfactual holds `E` fixed across the two forward passes so
+  outcome narratives are not regenerated.
+- JSON write-out policy: files are written **only when `out_dir` is
+  not None**; the directory is created if missing, with one JSON per
+  sub-report (`head_naming.json`, `per_decision.json`,
+  `dominant_attribute.json`, `counterfactual.json`). `out_dir=None`
+  (default) is a pure in-memory call with no side effects.
+- Tests: `tests/test_interpret.py`, 11 cases, all green.
+
+**Ablation YAML set** (§11).
+- 16 standalone `configs/ablation_*.yaml` files, each a copy of
+  `configs/default.yaml` with only the §11-called-out keys overridden and a
+  top-level `ablation: {id, description}` block for self-documentation.
+- A1-A3 M sweep touches `model.M` plus `model.attribute_heads.names`
+  (`["financial","health","other"]` for A1; `null` for the latent A2/A3).
+  A4 sets `model.weight_net.normalization = "softplus"`. A6 sets
+  `model.uniform_salience = true`. A7/A8 use a new `model.backbone`
+  switch (`"concat_utility"` / `"film_utility"`) — the training-loop
+  entry script (out of this wave's scope) uses it to instantiate
+  `ConcatUtility` / `FiLMUtility` from `src/model/ablations.py` in place
+  of `POLEU`.
+- **A5 is config-only.** `model.attribute_heads.person_dependent: true`
+  (mirrored at `model.person_dependent_heads`) is a flag with no code
+  path in this build — Wave 5's `src/model/attribute_heads.py` is
+  person-independent per §5.3 default; §11 reporting must treat the
+  A5 row as a placeholder until the head learns to take `z_d`.
+- Secondary sweeps: K ∈ {1, 5, 7} touches **both** `model.K` and
+  `outcomes.K` (enforced by `test_K_sweep_consistency` and by
+  `scripts/validate_configs.py`). τ ∈ {0.5, 2.0} touches
+  `model.temperature`. The encoder swap touches
+  `outcomes.encoder.model_id` **and** `model.d_e = 1024` together. The
+  generator swap touches only `outcomes.generator.model_id`. The
+  `no_subsample` file sets `subsample.enabled = false` explicitly as a
+  control (matches default).
+- Tests: `tests/test_ablation_configs.py`, 17 cases, all green. Helper:
+  `scripts/validate_configs.py` cross-checks top-level, model, and
+  attribute-heads keys against `default.yaml` plus an allow-list of
+  known extras.
 
 ---
 
