@@ -311,7 +311,48 @@ preserved.
 
 ## Wave 5 — assembly + ablations
 
-(pending)
+**`src/model/po_leu.py`** (§8, §9.4, App A).
+- `POLEU` composes `AttributeHeadStack` + `WeightNet` + (`SalienceNet` or
+  `UniformSalience`). `forward(z_d, E)` returns a **tuple**
+  `(logits, POLEUIntermediates)` rather than a dict: the dataclass gives
+  attribute access for §12 interpretability (`.A, .w, .U, .S, .V`) and a
+  `to_dict()` escape hatch for tests and `interpret.py`.
+- Temperature τ is stored as a plain Python float (not a `nn.Parameter` or
+  buffer), per §8.2 + §9.5. `test_temperature_is_not_trainable` asserts no
+  parameter named `temperature` and no parameter holding the τ value.
+- `cross_entropy_loss(logits, c*, omega=None)` is the §9.1 contract:
+  plain mean when `omega is None`, weighted mean `sum(ω·ℓ)/sum(ω)`
+  otherwise. Invariant `loss(…) == loss(…, ones(B))` to 1e-6.
+- `EXPECTED_PARAM_COUNT_DEFAULT = 544_779` (492_805 heads + 1_029 weight
+  net + 50_945 salience), matching the orchestrator reconciliation above.
+  A6 uniform-salience ablation drops salience to 0 params.
+- Tests: `tests/test_po_leu.py`, 13 cases, all green.
+
+**`src/model/ablations.py`** (§11 A7, A8).
+- `ConcatUtility` (A7) runs a single MLP over `[e_k; z_d]`;
+  `FiLMUtility` (A8) conditions a shared utility MLP on `z_d` via FiLM
+  affine params `(γ, β) = modulator(z_d)`. Both still pass through
+  `SalienceNet` / `UniformSalience` and softmax-choice (§7, §8) so they
+  drop in for `POLEU` at the training-loop level.
+- Hidden-dim choice: `DEFAULT_HIDDEN = 128`, mirroring §5.1 attribute-
+  heads hidden so A7/A8 have comparable per-outcome capacity to A0's
+  M=5 width-128 stack. §11 explicitly frames these as structural
+  ablations, not capacity-matched, so param counts are not pinned.
+- FiLM γ-near-1 init trick: `modulator` is a single `Linear(p, 2·hidden)`
+  producing `raw_γ || β`; the forward pass computes `γ = raw_γ + 1.0`
+  so Xavier-uniform init starts training from near-identity
+  conditioning. The offset lives in `forward` (not the bias) so
+  `named_modules()` still sees a plain `Linear(p, 2·hidden)`.
+- Salience reuse: imports `SalienceNet` / `UniformSalience`; no
+  reimplementation. `uniform_salience=True` composes A6 with A7/A8.
+- Forward contract: `(z_d, E) → (logits, intermediates)` where
+  `ConcatIntermediates` exposes `U, S, V` only (no `A`/`w` — that's
+  the decomposition A7 drops) and `FiLMIntermediates` additionally
+  exposes `theta_d = (γ, β)`. Temperature is a non-trainable buffer
+  (§8.2).
+- `cross_entropy_loss` is not re-implemented; callers (and the CE-loss
+  integration test) import it from `src.model.po_leu`.
+- Tests: `tests/test_ablations.py`, 10 cases, all green.
 
 ---
 
