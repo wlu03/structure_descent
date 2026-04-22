@@ -105,9 +105,19 @@ DEFAULT_PHRASINGS: dict[str, dict[Any, str]] = {
         "neutral": "risk-neutral",
         "high": "comfortable with risk",
     },
-    # ``purchase_frequency`` is a continuous count/week; the renderer bins it
-    # into the three labeled regions below.
+    # ``purchase_frequency`` is a continuous events-per-week rate.
+    # The driver (scripts/run_dataset.py) normalizes the raw
+    # derived_from_events count by the train-window duration in weeks
+    # BEFORE feeding persons_canonical to build_choice_sets, so the
+    # renderer sees a rate, not a total count.
+    #
+    # Bucket thresholds (events/week):
+    #   <0.1  -> "very_rare"  (≲ once every 2-3 months)
+    #   <1    -> "rare"       ("a few times per month")
+    #   1-3   -> "weekly"     ("roughly N times per week")
+    #   >3    -> "daily"      ("almost daily")
     "purchase_frequency": {
+        "very_rare": "rarely",
         "rare": "a few times per month",
         "weekly": "roughly twice per week",
         "daily": "almost daily",
@@ -228,7 +238,23 @@ def _phrase_risk(risk_tolerance: float) -> str:
 
 
 def _phrase_purchase_frequency(purchase_frequency: float) -> str:
+    """Render a natural-English phrase for events-per-week rate.
+
+    Input is an events-per-week rate; the driver normalizes the raw
+    derived_from_events count by the train-window duration before this
+    function sees it. Bucket boundaries: <0.1 → "rarely shops",
+    <1 → "a few times per month", 1-3 → "roughly N times per week",
+    >3 → "almost daily".
+
+    Prior bug (fixed Wave 11): this function was being called with the
+    raw total event count instead of a rate, so customers with low
+    absolute counts (e.g. 9 events over 5 years) rendered as
+    "almost daily". The driver now divides by window_weeks before
+    calling.
+    """
     f = float(purchase_frequency)
+    if f < 0.1:
+        return DEFAULT_PHRASINGS["purchase_frequency"]["very_rare"]
     if f < 1.0:
         return "a few times per month"
     if f <= 3.0:

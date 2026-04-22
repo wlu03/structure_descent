@@ -39,6 +39,7 @@ if str(REPO_ROOT) not in sys.path:
 # Heavy / optional imports kept lazy inside main() per the Wave-10 brief
 # (anthropic + sentence_transformers are imported only on --real-llm).
 import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 import yaml  # noqa: E402
 
@@ -469,6 +470,30 @@ def main(args: argparse.Namespace) -> int:
         persons_raw_keep,
         training_events=train_events_subset,
     )
+
+    # Wave-11 fix: normalize purchase_frequency from total count to
+    # events-per-week using the actual training-window duration. Without
+    # this, context_string._phrase_purchase_frequency misreads a
+    # 9-events-in-5-years customer as "almost daily". The transform is
+    # applied to BOTH z_d inputs (via the canonical column) and c_d
+    # rendering (via the same column); standardization stats fit on
+    # the rate are numerically equivalent to stats fit on the count,
+    # just on a different natural scale.
+    if len(train_events_subset) > 0:
+        _train_dates = pd.to_datetime(train_events_subset["order_date"])
+        _window_days = max((_train_dates.max() - _train_dates.min()).days, 1)
+        _window_weeks = max(_window_days / 7.0, 1.0)
+        if "purchase_frequency" in persons_canonical.columns:
+            persons_canonical = persons_canonical.copy()
+            persons_canonical["purchase_frequency"] = (
+                persons_canonical["purchase_frequency"].astype(float)
+                / _window_weeks
+            )
+            logger.info(
+                "normalized purchase_frequency count -> events/week over a "
+                "%d-day (%.1f-week) training window.",
+                _window_days, _window_weeks,
+            )
 
     # Post-translate orphan filter: translate_z_d may drop rows via
     # drop_on_unknown (e.g. "Prefer not to say" on income/education).

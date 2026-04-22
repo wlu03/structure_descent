@@ -704,3 +704,46 @@ def test_extract_extra_fields_skips_nan_source_values():
     }
     out = extract_extra_fields_from_row(raw_row, yaml_block)
     assert "life_event" not in out
+
+
+# ---------------------------------------------------------------------------
+# Wave 11: purchase_frequency bucket boundaries on events/week rate.
+# ---------------------------------------------------------------------------
+
+
+def test_phrase_purchase_frequency_very_rare_bucket():
+    """Very low rates (<0.1 events/week ≈ < once every 2.5 months) render
+    as 'rarely shops on Amazon', not the prior miscalibrated 'a few times
+    per month'. This pins the Wave-11 count-as-rate bug fix.
+    """
+    from src.data.context_string import _phrase_purchase_frequency
+    # 9 events over 5 years → ~0.034 events/week → must be very_rare.
+    # Phrase is "rarely" (short form) so it composes inside the template
+    # "Buys on Amazon <phrase>" as "Buys on Amazon rarely" without
+    # duplicating "shops on Amazon".
+    assert _phrase_purchase_frequency(0.034) == "rarely"
+    assert _phrase_purchase_frequency(0.0) == "rarely"
+    assert _phrase_purchase_frequency(0.09) == "rarely"
+
+
+def test_phrase_purchase_frequency_boundary_crossings():
+    """Boundary transitions between all four buckets."""
+    from src.data.context_string import _phrase_purchase_frequency
+    # 0.1 is the boundary between very_rare and rare
+    assert _phrase_purchase_frequency(0.10) == "a few times per month"
+    # 0.99 is still in the monthly bucket
+    assert _phrase_purchase_frequency(0.99) == "a few times per month"
+    # Weekly starts at 1.0
+    assert _phrase_purchase_frequency(1.0) == "roughly once per week"
+    assert _phrase_purchase_frequency(2.0) == "roughly twice per week"
+    assert _phrase_purchase_frequency(3.0) == "roughly 3 times per week"
+    # Daily starts above 3.0
+    assert _phrase_purchase_frequency(3.5) == "almost daily"
+    assert _phrase_purchase_frequency(10.0) == "almost daily"
+
+
+def test_very_rare_phrasing_in_default_phrasings():
+    """DEFAULT_PHRASINGS now includes a very_rare key that the renderer uses."""
+    from src.data.context_string import DEFAULT_PHRASINGS
+    assert "very_rare" in DEFAULT_PHRASINGS["purchase_frequency"]
+    assert DEFAULT_PHRASINGS["purchase_frequency"]["very_rare"] == "rarely"
