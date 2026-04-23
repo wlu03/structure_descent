@@ -132,11 +132,30 @@ def build_user_block(
             + f"; required keys are {list(_REQUIRED_ALT_FIELDS)}"
         )
 
+    # V2-6 fix: reject any ``optional_fields`` entry whose key collides
+    # with a canonical §3.2 field. Canonical fields render via their
+    # dedicated lines in ``USER_BLOCK_TEMPLATE``; allowing them to slip
+    # in through ``optional_fields`` would double-render them (once
+    # canonically, once as "- key: value") and desync the cache-key
+    # prompt_version from the visible prompt text.
+    if optional_fields:
+        collisions = [
+            k for k in optional_fields.keys() if k in _REQUIRED_ALT_FIELDS
+        ]
+        if collisions:
+            raise ValueError(
+                "optional_fields contains canonical alt key(s): "
+                + ", ".join(collisions)
+                + f"; canonical keys {list(_REQUIRED_ALT_FIELDS)} must be "
+                "set via the ``alt`` mapping, not ``optional_fields``."
+            )
+
     # Any keys in ``alt`` beyond the required four (e.g. ``brand``,
     # ``is_repeat``, ``state`` added by the Wave-11 richer alt_text)
     # are merged into ``optional_fields`` so they render as
     # "- key: value" lines after the canonical four. An explicit
-    # ``optional_fields`` kwarg wins on key collision.
+    # ``optional_fields`` kwarg wins on key collision for non-canonical
+    # keys (canonical collisions are rejected above).
     extras_from_alt = {
         k: alt[k] for k in alt.keys() if k not in _REQUIRED_ALT_FIELDS
     }

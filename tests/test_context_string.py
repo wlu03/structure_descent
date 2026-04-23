@@ -128,6 +128,34 @@ def test_has_kids_phrasing_three_person_household():
 # 4. Every bucket in DEFAULT_PHRASINGS renders without error
 # ---------------------------------------------------------------------------
 
+def test_income_midpoints_are_pinned():
+    """V4 fix: income_bucket midpoints are load-bearing — they govern
+    what dollar amount the LLM sees for every customer in every prompt
+    and so shift the generated-outcome distribution. Pin them to the
+    exact strings so a silent edit to ``DEFAULT_PHRASINGS["income_bucket"]``
+    breaks this test (and forces a conscious PROMPT_VERSION bump).
+
+    Option-B collapse + US Census ACS 2022 PUMS anchors:
+        <25k     → "about $15k/year"   (<$25k mean ≈ $14.2k → $15k)
+        25-50k   → "about $38k/year"   (distribution-weighted midpoint)
+        50-100k  → "about $73k/year"   (merges $50-74k and $75-99k)
+        100-150k → "about $125k/year"  (arithmetic midpoint)
+        150k+    → "around $200k/year" (≥$150k mean ≈ $221k → $200k)
+    """
+    expected = {
+        "<25k": "about $15k/year",
+        "25-50k": "about $38k/year",
+        "50-100k": "about $73k/year",
+        "100-150k": "about $125k/year",
+        "150k+": "around $200k/year",
+    }
+    assert DEFAULT_PHRASINGS["income_bucket"] == expected, (
+        "income_bucket midpoints drifted from the pinned values. If the "
+        "change is intentional, update this test AND bump PROMPT_VERSION "
+        "in src/outcomes/prompts.py so the cache invalidates."
+    )
+
+
 def test_all_phrase_buckets_render():
     """For every categorical bucket in DEFAULT_PHRASINGS, each legal category
     must produce a valid 5-8 line c_d when plugged into the otherwise-default

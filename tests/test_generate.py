@@ -7,6 +7,7 @@ real SDK is never contacted.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import logging
 import sys
@@ -40,6 +41,12 @@ _ALT = {
     "popularity_rank": 42,
 }
 _C_D = "Person profile\n- Age: mid-30s; household of 4.\n- Income: about $55k/year."
+# Cache-key suffix component for the canonical test c_d (V5-B1 fix:
+# generate.py folds a sha256(c_d)[:16] prefix into cache_prompt_version
+# so per-event c_d variations don't collide under the same (cust, asin,
+# seed) tuple). Tests that read cache entries by composite key must use
+# this fragment.
+_CD_HASH = hashlib.sha256(_C_D.encode("utf-8")).hexdigest()[:16]
 
 
 def _make_cache(tmp_cache_dir: Path) -> OutcomesCache:
@@ -209,10 +216,14 @@ def test_cache_value_shape(tmp_cache_dir: Path) -> None:
             K=3, seed=1, prompt_version=PROMPT_VERSION,
             client=client, cache=cache,
         )
-        # generate_outcomes folds K into the cache-key's prompt_version
-        # field ("v1-K3"); the raw key-level read-back must use that
-        # composite value to find the entry.
-        raw = cache.get_outcomes("cust-A", "B-A", 1, f"{PROMPT_VERSION}-K3")
+        # generate_outcomes folds K, the producing client's model_id,
+        # AND a sha256 prefix of c_d into the cache-key's prompt_version
+        # field (e.g. "v2-K3-stub-v1-cd<hash>"); the raw key-level
+        # read-back must use that full composite value to find the entry.
+        raw = cache.get_outcomes(
+            "cust-A", "B-A", 1,
+            f"{PROMPT_VERSION}-K3-stub-v1-cd{_CD_HASH}",
+        )
     finally:
         cache.close()
 
@@ -229,11 +240,114 @@ def test_cache_value_shape(tmp_cache_dir: Path) -> None:
         "finish_reason",
         "seed",
         "prompt_version",
+        "cache_prompt_version",
         "timestamp",
     ):
         assert required in metadata, f"missing metadata field: {required}"
+    # User-supplied prompt_version is preserved verbatim; the composite
+    # cache_prompt_version folds in K and the sanitised model_id so a
+    # stub-run entry can't collide with a real-run entry.
     assert metadata["prompt_version"] == PROMPT_VERSION
+    assert metadata["cache_prompt_version"] == (
+        f"{PROMPT_VERSION}-K3-stub-v1-cd{_CD_HASH}"
+    )
     assert metadata["model_id"] == "stub-v1"
+
+
+class _FakeRealClient:
+    """Non-stub pseudo-client used to verify cache-key isolation.
+
+    Does NOT set ``_is_stub`` and does NOT inherit a "Stub"-prefixed
+    class name, so :func:`src.data.batching._is_stub_client` will
+    classify it as real. ``model_id`` is a plausible real value so the
+    cache composite ``{prompt_version}-K{K}-{model_id}`` diverges from
+    the stub's ``stub-v1`` fragment.
+    """
+
+    def __init__(self, model_id: str = "claude-test-7") -> None:
+        self.model_id = model_id
+        self.calls = 0
+
+    def generate(self, messages, *, temperature, top_p, max_tokens, seed):
+        self.calls += 1
+        # Deterministic, recognisably-non-stub completion so the test
+        # can tell at a glance that the "real" path produced it.
+        lines = [f"I am a real-client outcome number {i + 1}." for i in range(3)]
+        # Pad / expand so word counts don't trip any downstream validator.
+        lines = [
+            f"{ln} It runs for the sake of the cache-isolation test."
+            for ln in lines
+        ]
+        return GenerationResult(
+            text="\n".join(lines),
+            finish_reason="stop",
+            model_id=self.model_id,
+        )
+
+
+def test_cache_key_separates_stub_and_real(tmp_cache_dir: Path) -> None:
+    """A cache populated by a stub must NOT short-circuit a real-client
+    call on the same ``(customer_id, asin, seed, prompt_version)`` tuple.
+
+    This is the regression the model_id fold is for: before the fix, a
+    stub run would happily hand its outcomes back to a subsequent real
+    run sharing the base key. Post-fix the composite
+    ``{prompt_version}-K{K}-{model_id}`` is different, so the real
+    client must actually be invoked (cache miss on the real-keyed
+    lookup) and its outcomes must be what we get back.
+    """
+    stub = StubLLMClient()
+    real = _FakeRealClient(model_id="claude-test-7")
+    cache = _make_cache(tmp_cache_dir)
+    try:
+        # Populate the cache with a stub outcome.
+        stub_payload = generate_outcomes(
+            "cust", "B01", _C_D, _ALT,
+            K=3, seed=11, prompt_version=PROMPT_VERSION,
+            client=stub, cache=cache,
+        )
+        assert stub_payload.metadata["model_id"] == "stub-v1"
+
+        # Now call with a "real" client using the SAME base tuple.
+        # Pre-fix behaviour: this would have returned the stub outcomes.
+        # Post-fix: cache miss on the real-keyed composite -> real client
+        # is invoked exactly once and its outcomes come back.
+        real_payload = generate_outcomes(
+            "cust", "B01", _C_D, _ALT,
+            K=3, seed=11, prompt_version=PROMPT_VERSION,
+            client=real, cache=cache,
+        )
+
+        assert real.calls == 1, "real client must be invoked on cache miss"
+        assert real_payload.metadata["model_id"] == "claude-test-7"
+        # Outcomes must come from the real client, NOT the stub.
+        assert real_payload.outcomes != stub_payload.outcomes
+        # Sanity: both cache entries coexist under distinct composite keys.
+        stub_raw = cache.get_outcomes(
+            "cust", "B01", 11,
+            f"{PROMPT_VERSION}-K3-stub-v1-cd{_CD_HASH}",
+        )
+        real_raw = cache.get_outcomes(
+            "cust", "B01", 11,
+            f"{PROMPT_VERSION}-K3-claude-test-7-cd{_CD_HASH}",
+        )
+        assert stub_raw is not None
+        assert real_raw is not None
+        assert stub_raw["outcomes"] == stub_payload.outcomes
+        assert real_raw["outcomes"] == real_payload.outcomes
+    finally:
+        cache.close()
+
+
+def test_stub_llm_client_carries_is_stub_flag() -> None:
+    """``StubLLMClient`` must expose ``_is_stub=True`` so downstream
+    guards can reliably distinguish it from real clients without
+    resorting to class-name sniffing."""
+    client = StubLLMClient()
+    assert getattr(client, "_is_stub", False) is True
+    # Class-level presence: subclasses or test wrappers that expose the
+    # attribute still test True.
+    assert getattr(StubLLMClient, "_is_stub", False) is True
 
 
 def test_generation_kwargs_respected(tmp_cache_dir: Path) -> None:

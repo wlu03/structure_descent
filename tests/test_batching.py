@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -198,11 +199,20 @@ def test_prices_from_alt_texts():
 
 
 class _CountingLLMClient:
-    """Wrap StubLLMClient and tally generate() calls."""
+    """Wrap StubLLMClient and tally generate() calls.
+
+    Carries ``_is_stub = True`` so the stub-contamination guard in
+    :func:`src.data.batching.assemble_batch` treats this wrapper the
+    same as a raw :class:`StubLLMClient` — otherwise the guard would
+    fire on every (legitimately stub-sourced) outcome.
+    """
+
+    _is_stub: bool = True
 
     def __init__(self) -> None:
         self._inner = StubLLMClient()
         self.n_calls = 0
+        self.model_id = self._inner.model_id
 
     def generate(self, *args: Any, **kwargs: Any) -> GenerationResult:
         self.n_calls += 1
@@ -593,12 +603,20 @@ def test_parallel_assemble_produces_identical_output():
 
 
 class _ThreadSafeCountingLLMClient:
-    """Thread-safe tally-counting wrapper around StubLLMClient."""
+    """Thread-safe tally-counting wrapper around StubLLMClient.
+
+    ``_is_stub = True`` marker so the stub-contamination guard in
+    :func:`src.data.batching.assemble_batch` treats this as a stub
+    client (the inner client is a real :class:`StubLLMClient`).
+    """
+
+    _is_stub: bool = True
 
     def __init__(self) -> None:
         self._inner = StubLLMClient()
         self._lock = __import__("threading").Lock()
         self.n_calls = 0
+        self.model_id = self._inner.model_id
 
     def generate(self, *args: Any, **kwargs: Any) -> GenerationResult:
         with self._lock:
@@ -668,6 +686,137 @@ def test_parallel_cache_threadsafe(tmp_path: Path):
     cache.close()
 
 
+# --------------------------------------------------------------------------- #
+# Stub-contamination guard
+# --------------------------------------------------------------------------- #
+
+
+class _FakeRealLLMClient:
+    """A plausible non-stub LLM client for contamination tests.
+
+    No ``_is_stub`` attribute; class name does not begin with ``Stub``;
+    ``model_id`` is a real-looking value. ``_is_stub_client`` must
+    classify it as NOT a stub.
+    """
+
+    def __init__(self, model_id: str = "claude-test-7") -> None:
+        self.model_id = model_id
+        self._inner = StubLLMClient()
+
+    def generate(self, *args: Any, **kwargs: Any) -> GenerationResult:
+        # Delegate to the stub's text generation but re-label the
+        # provenance so cache writes under this client land under a
+        # different composite prompt_version than a stub would.
+        inner = self._inner.generate(*args, **kwargs)
+        return GenerationResult(
+            text=inner.text,
+            finish_reason=inner.finish_reason,
+            model_id=self.model_id,
+        )
+
+
+def _precompute_stub_contamination(cache: Any, records: list[dict]) -> None:
+    """Pre-populate ``cache`` with stub-metadata entries under the keys
+    that a non-stub client with ``model_id="claude-test-7"`` would look
+    up.
+
+    This simulates the failure mode the guard catches: earlier stub
+    runs left entries under a composite key that the post-fix real-run
+    composite now happens to match (e.g. after a botched cleanup, or
+    any pre-fold legacy entry that a rewrite of
+    ``cache_prompt_version`` exposed).
+
+    We write under the *real* client's composite key
+    ("v1-K3-claude-test-7") but stamp ``metadata['model_id']="stub-v1"``
+    so the guard sees a stub-origin payload arriving through a
+    real-client lookup.
+    """
+    for rec in records:
+        # V5-B1: generate.py now folds sha256(c_d)[:16] into the
+        # composite prompt_version, so the stub entry has to land under
+        # the same composite the real-client lookup will compute.
+        cd_hash = hashlib.sha256(
+            rec["c_d"].encode("utf-8")
+        ).hexdigest()[:16]
+        composite = f"v1-K3-claude-test-7-cd{cd_hash}"
+        for j, asin in enumerate(rec["choice_asins"]):
+            cache.put_outcomes(
+                str(rec["customer_id"]),
+                str(asin),
+                0,  # seed
+                composite,  # composite matches real client
+                ["stub outcome 1.", "stub outcome 2.", "stub outcome 3."],
+                {"model_id": "stub-v1", "prompt_version": "v1"},
+            )
+
+
+def test_assemble_refuses_stub_cache_contamination(tmp_path: Path):
+    """A cache pre-populated with stub-origin entries under the keys a
+    real client would read must cause ``assemble_batch`` to raise
+    ``RuntimeError`` with a message mentioning "stub"."""
+    from src.outcomes.cache import OutcomesCache
+
+    records = _make_records(N=2, J=2, p=26)
+    o_cache = OutcomesCache(tmp_path / "out.sqlite")
+    _precompute_stub_contamination(o_cache, records)
+
+    real_client = _FakeRealLLMClient(model_id="claude-test-7")
+
+    with pytest.raises(RuntimeError, match=r"stub"):
+        assemble_batch(
+            records,
+            adapter=None,
+            llm_client=real_client,
+            encoder=StubEncoder(d_e=64),
+            outcomes_cache=o_cache,
+            embeddings_cache=None,
+            K=3,
+            seed=0,
+            prompt_version="v1",
+        )
+    o_cache.close()
+
+
+def test_assemble_accepts_clean_cache(tmp_path: Path):
+    """Same scope as the contamination test, but with an empty cache:
+    the real client populates fresh entries and assembly completes."""
+    from src.outcomes.cache import OutcomesCache
+
+    records = _make_records(N=2, J=2, p=26)
+    o_cache = OutcomesCache(tmp_path / "out.sqlite")
+
+    real_client = _FakeRealLLMClient(model_id="claude-test-7")
+
+    batch = assemble_batch(
+        records,
+        adapter=None,
+        llm_client=real_client,
+        encoder=StubEncoder(d_e=64),
+        outcomes_cache=o_cache,
+        embeddings_cache=None,
+        K=3,
+        seed=0,
+        prompt_version="v1",
+    )
+    assert isinstance(batch, AssembledBatch)
+    assert tuple(batch.E.shape) == (2, 2, 3, 64)
+    # And the cache now holds entries under the real composite key.
+    # V5-B1: the cache composite now includes a sha256 of the record's
+    # c_d, so compute the hash here to locate the fresh entry.
+    cd_hash_0 = hashlib.sha256(
+        records[0]["c_d"].encode("utf-8")
+    ).hexdigest()[:16]
+    got = o_cache.get_outcomes(
+        records[0]["customer_id"],
+        records[0]["choice_asins"][0],
+        0,
+        f"v1-K3-claude-test-7-cd{cd_hash_0}",
+    )
+    assert got is not None
+    assert got["metadata"]["model_id"] == "claude-test-7"
+    o_cache.close()
+
+
 def test_parallel_error_propagates():
     """A RuntimeError raised inside a worker must surface from
     assemble_batch (no silent swallow)."""
@@ -676,10 +825,15 @@ def test_parallel_error_propagates():
     records = _make_records(N=4, J=5, p=26)  # N*J = 20 calls
 
     class _FailingClient:
+        # Wraps a StubLLMClient; mark as stub so the stub-contamination
+        # guard in assemble_batch doesn't pre-empt the synthetic failure.
+        _is_stub: bool = True
+
         def __init__(self) -> None:
             self._inner = StubLLMClient()
             self._lock = threading.Lock()
             self._count = 0
+            self.model_id = self._inner.model_id
 
         def generate(self, *args: Any, **kwargs: Any) -> GenerationResult:
             with self._lock:

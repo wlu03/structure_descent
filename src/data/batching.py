@@ -58,6 +58,35 @@ __all__ = [
 
 
 # --------------------------------------------------------------------------- #
+# Stub-contamination guard
+# --------------------------------------------------------------------------- #
+
+
+def _is_stub_client(client: Any) -> bool:
+    """Return True if ``client`` looks like a stub LLM client.
+
+    Two signals, short-circuited in order:
+
+    1. ``client._is_stub`` — the explicit marker set on
+       :class:`src.outcomes.generate.StubLLMClient`. Preferred because
+       it survives subclassing and test-local wrappers that keep the
+       attribute exposed.
+    2. ``type(client).__name__`` starts with ``"Stub"`` — fallback for
+       third-party stubs / test doubles (``_ThreadSafeCountingLLMClient``
+       wrapping a :class:`StubLLMClient`, ad-hoc subclasses in test
+       modules) that don't thread the attribute through.
+
+    Used by :func:`assemble_batch` to decide whether a stub-origin
+    outcome (``metadata['model_id']`` starting with ``"stub"``) is
+    expected (test mode) or indicates cache contamination (production
+    mode, must raise).
+    """
+    if getattr(client, "_is_stub", False):
+        return True
+    return type(client).__name__.startswith("Stub")
+
+
+# --------------------------------------------------------------------------- #
 # Thread-safety wrapper for SQLite-backed OutcomesCache
 # --------------------------------------------------------------------------- #
 
@@ -366,6 +395,10 @@ def assemble_batch(
     progress_lock = threading.Lock()
     calls_done = 0
 
+    # Precompute once — we use it inside every worker call to decide
+    # whether a stub-origin outcome is contamination or expected.
+    caller_is_stub = _is_stub_client(llm_client)
+
     def _generate_one(i: int, j: int) -> tuple[int, int, list[str]]:
         rec = records[i]
         payload = generate_outcomes(
@@ -380,6 +413,25 @@ def assemble_batch(
             cache=thread_safe_cache,
             diversity_filter=diversity_filter,
         )
+        # Defense-in-depth: if generate_outcomes handed us a payload whose
+        # metadata says a stub produced it, but the caller's llm_client is
+        # itself not a stub, the cache has been contaminated by a prior
+        # stub run under a key that a real run now happens to hit. Refuse
+        # to proceed — silently training on stub outputs is the failure
+        # mode that motivated the model_id fold in the cache_prompt_version
+        # composite. The model_id fold alone would prevent fresh collisions;
+        # this guard catches pre-existing entries that pre-date the fold.
+        payload_model_id = str(payload.metadata.get("model_id", ""))
+        if (
+            payload_model_id.lower().startswith("stub")
+            and not caller_is_stub
+        ):
+            raise RuntimeError(
+                "Refusing to proceed: generate_outcomes returned a stub "
+                f"outcome (model_id={payload_model_id!r}) but "
+                f"llm_client={llm_client!r} is not a stub. This indicates "
+                "stub-contaminated cache entries. Clean the cache and retry."
+            )
         outcome_strs = list(payload.outcomes)
         if len(outcome_strs) != K:
             raise AssertionError(
@@ -465,6 +517,22 @@ def assemble_batch(
             raise AssertionError(
                 f"omega_shape: omega has shape {omega_np.shape}, want {(N,)}"
             )
+        # V4 fix: omega is an Appendix-C leverage weight and must be
+        # non-negative. A negative entry would silently flip the sign
+        # of the per-event loss contribution, so fail loud at the
+        # boundary rather than corrupt training.
+        if not np.all(np.isfinite(omega_np)):
+            bad_idx = int(np.argmax(~np.isfinite(omega_np)))
+            raise AssertionError(
+                f"omega_finite: non-finite omega at index {bad_idx} "
+                f"(value={omega_np[bad_idx]!r})"
+            )
+        if not np.all(omega_np >= 0.0):
+            bad_idx = int(np.argmax(omega_np < 0.0))
+            raise AssertionError(
+                f"omega_non_negative: negative omega at index {bad_idx} "
+                f"(value={float(omega_np[bad_idx])!r})"
+            )
 
     # ----- to torch --------------------------------------------------------
     z_d_t = torch.from_numpy(z_d_np).to(torch.float32)
@@ -489,6 +557,30 @@ def assemble_batch(
         raise AssertionError(
             f"E_no_nan: E contains NaN at (n={idx[0]}, j={idx[1]}, k={idx[2]})"
         )
+    # V4 fix: the §4 encoder contract promises L2-normalized embeddings
+    # on the last axis (SentenceTransformers returns unit-norm vectors
+    # when ``normalize_embeddings=True``). Verify at the boundary so a
+    # misconfigured encoder can't silently poison the value function
+    # with unnormalised ``e`` vectors.
+    if E_t.numel() > 0:
+        norms = torch.linalg.vector_norm(E_t, ord=2, dim=-1)
+        if not torch.allclose(
+            norms, torch.ones_like(norms), atol=1e-3, rtol=0.0
+        ):
+            bad = (
+                (norms - 1.0).abs().argmax().item()
+            )
+            flat_norms = norms.reshape(-1)
+            n_stride = J * K
+            k_stride = K
+            n_idx = bad // n_stride
+            rem = bad % n_stride
+            j_idx = rem // k_stride
+            k_idx = rem % k_stride
+            raise AssertionError(
+                f"E_l2_normalized: |E[{n_idx},{j_idx},{k_idx}]|_2 = "
+                f"{float(flat_norms[bad])!r} (expected ~1.0, atol=1e-3)"
+            )
     if not torch.isfinite(z_d_t).all().item():
         bad_rows = (~torch.isfinite(z_d_t).all(dim=-1)).nonzero(as_tuple=False).flatten().tolist()
         raise AssertionError(

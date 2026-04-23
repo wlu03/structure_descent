@@ -30,6 +30,12 @@ Design notes
   so that ``import src.outcomes.generate`` succeeds in environments that do
   not have the ``llm`` extra installed (e.g. CI runners that only exercise
   the stub).
+* ``generate_outcomes`` folds ``K`` AND the client's ``model_id`` into the
+  ``prompt_version`` argument passed to the cache. The §3.4 cache layer's
+  four-field key semantics stay unchanged; the caller-layer composite
+  (e.g. ``"v2-K3-claude-sonnet-4-6"``) guarantees that stub outputs and
+  real-LLM outputs can never be served interchangeably for the same
+  ``(customer_id, asin, seed, prompt_version)`` base tuple.
 """
 
 from __future__ import annotations
@@ -175,7 +181,16 @@ class StubLLMClient:
 
     ``K`` is inferred from the user prompt's ``Generate K={K}`` footer; if
     absent or malformed we fall back to ``K=3`` (the spec default).
+
+    Carries a class-level ``_is_stub = True`` marker so downstream guards
+    (e.g. :func:`src.data.batching.assemble_batch`) can cheaply distinguish
+    hermetic CI / test runs from production LLM runs without string-matching
+    class names. Real clients (e.g. :class:`AnthropicLLMClient`) do not set
+    this attribute.
     """
+
+    # Defense-in-depth marker consumed by assemble_batch's stub guard.
+    _is_stub: bool = True
 
     def __init__(self, model_id: str = "stub-v1") -> None:
         self.model_id = model_id
@@ -534,6 +549,18 @@ _DEFAULT_GEN_KWARGS: dict[str, Any] = {
 }
 
 
+def _sanitize_model_id(model_id: str) -> str:
+    """Normalize ``model_id`` for safe inclusion in cache keys.
+
+    Strips whitespace, lower-cases, and replaces ``/`` with ``_`` so that
+    forward-slashed provider-namespaced ids (e.g. ``"anthropic/claude-..."``)
+    stay filesystem- and cache-safe. Pure-string transform; no external
+    dependencies. Consumed by :func:`generate_outcomes` when composing
+    ``cache_prompt_version``.
+    """
+    return str(model_id).strip().replace("/", "_").lower()
+
+
 def generate_outcomes(
     customer_id: str,
     asin: str,
@@ -563,6 +590,26 @@ def generate_outcomes(
          ``ok=True``.
     4. Record metadata (decoding settings + provenance) and persist to the
        cache.
+
+    Cache-key composition
+    ---------------------
+    The cache layer (§3.4) keys on four fields:
+    ``(customer_id, asin, seed, prompt_version)``. To keep that layer
+    spec-compliant while still distinguishing runs that must never share
+    entries, we fold two extra dimensions into the ``prompt_version``
+    argument passed down to the cache:
+
+    * ``K`` — so ``K=1`` validation runs never collide with ``K=3``
+      ablation runs on the same base prompt.
+    * ``client.model_id`` (sanitised via :func:`_sanitize_model_id`) —
+      so a stub client's outputs can never be read back by a real-LLM
+      run with the same base tuple, and vice versa. This is the
+      defence against the 44k-entry stub contamination regression.
+
+    The composite key lives in metadata as ``cache_prompt_version``
+    (e.g. ``"v2-K3-claude-sonnet-4-6"``); the user-supplied
+    ``prompt_version`` (e.g. ``"v2"``) is preserved verbatim in the
+    ``prompt_version`` metadata field.
 
     Parameters
     ----------
@@ -603,12 +650,48 @@ def generate_outcomes(
         ``outcomes`` is exactly ``K`` strings; ``metadata`` carries the
         fields listed in the module docstring.
     """
-    # Cache-key ``prompt_version`` includes K so different K values (e.g.
-    # K=1 validation vs K=3 ablation) never collide in the §3.4 cache.
-    # §3.4 lists four key fields — we fold K into ``prompt_version``
-    # rather than adding a fifth field, keeping the cache layer spec-
-    # compliant. Documented in NOTES.md Wave 11 dry-run.
-    cache_prompt_version = f"{prompt_version}-K{int(K)}"
+    # Cache-key ``prompt_version`` folds in ``K``, the client's
+    # ``model_id``, *and* a hash of the per-event context string ``c_d``.
+    # §3.4 lists four key fields (customer_id, asin, seed,
+    # prompt_version); we fold the extra dimensions into
+    # ``prompt_version`` rather than adding fifth/sixth key fields,
+    # keeping the cache layer itself spec-compliant while every caller-
+    # layer dimension that must change the key is accounted for.
+    #
+    # K fold: different K values (K=1 validation vs K=3 ablation) must
+    # not share cache entries — the outcome *count* is a user-visible
+    # output shape.
+    #
+    # model_id fold: fix for a silent contamination bug — a stub-LLM
+    # run wrote entries under a given (cust, asin, seed, prompt_version-K)
+    # composite, and a subsequent real-LLM run with the same base tuple
+    # would transparently hit the stub's outputs.
+    #
+    # c_d fold (V5-B1 fix): per-event context strings vary by recent-
+    # purchases slice (Wave-12 per-event c_d), so the same
+    # (customer_id, asin, seed) tuple can legitimately render different
+    # outcomes on different events. Without folding c_d into the key,
+    # whichever event ran first would silently poison the cache for
+    # every subsequent event sharing the base tuple. A 16-char sha256
+    # prefix is collision-resistant in practice for the scales we run.
+    #
+    # Sanitisation (``_sanitize_model_id``): strip whitespace, lower,
+    # replace ``/`` → ``_``. Keeps the composite safe as a cache/fs
+    # fragment regardless of provider namespacing convention.
+    model_id_tag = _sanitize_model_id(getattr(client, "model_id", "unknown"))
+    cd_hash = hashlib.sha256(c_d.encode("utf-8")).hexdigest()[:16]
+    cache_prompt_version = (
+        f"{prompt_version}-K{int(K)}-{model_id_tag}-cd{cd_hash}"
+    )
+    logger.debug(
+        "generate_outcomes cache composite prompt_version=%r "
+        "(base=%r K=%d model_id=%r cd_hash=%s)",
+        cache_prompt_version,
+        prompt_version,
+        int(K),
+        model_id_tag,
+        cd_hash,
+    )
 
     # ---- 1. cache lookup ------------------------------------------------
     if cache is not None:
@@ -672,6 +755,11 @@ def generate_outcomes(
         raise RuntimeError("generate_outcomes: client.generate was never called")
 
     # ---- 4. metadata + cache write -------------------------------------
+    # ``prompt_version`` is the user-supplied tag (e.g. "v2"); the
+    # ``cache_prompt_version`` we *actually* keyed the cache by folds in
+    # K and the sanitised model_id. We write both so cache introspection
+    # tooling can tell real-LLM entries apart from stub entries without
+    # re-deriving the composite.
     metadata: dict[str, Any] = {
         "temperature": temperature,
         "top_p": top_p,
@@ -680,6 +768,7 @@ def generate_outcomes(
         "finish_reason": result.finish_reason,
         "seed": seed_used,
         "prompt_version": prompt_version,
+        "cache_prompt_version": cache_prompt_version,
         "timestamp": time.time(),
     }
 

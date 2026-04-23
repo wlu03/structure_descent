@@ -119,7 +119,7 @@ preserved.
 **`src/data/context_string.py`** (§2.2).
 - `DEFAULT_PHRASINGS` commits to phrasings the spec left open: age buckets
   → "early 20s / late 20s-early 30s / mid-30s / mid-40s / mid-50s / mid-60s or
-  older"; income midpoints $15k / $35k / $60k / $110k / "above $150k"; city
+  older"; income midpoints $15k / $38k / $73k / $125k / "around $200k" (Option-B collapse, distribution-weighted ACS 2022 PUMS anchors); city
   → "rural area / small town / mid-size city / large U.S. city"; education
   1-5 → "some high school … graduate degree"; health 1-5 → "poor … excellent
   health"; risk-tolerance thresholds ±0.5 → "cautious / risk-neutral /
@@ -1112,3 +1112,62 @@ end-to-end).
   `test_dedup_preserves_chosen`, `test_dedup_determinism`,
   `test_dedup_does_not_change_large_fixture`); full suite 462
   passed.
+
+## Outcomes-cache model_id fold + stub-contamination guard
+
+**Motivation.** `generate_outcomes` previously composed
+`cache_prompt_version = f"{prompt_version}-K{K}"` and wrote that as
+the fourth cache-key field. `model_id` never entered the key, so a
+stub run writing under `(cust, asin, seed, "v1-K3")` served its
+outcomes straight back to a subsequent real-LLM run with the same
+base tuple — the regression that silently fed 44,385 stub entries
+into a real training run.
+
+**Fix (Option A: keep stubs, bulletproof the cache).** Two layers:
+
+- `src/outcomes/generate.py::generate_outcomes` now folds the
+  sanitised producing client's `model_id` into the composite passed
+  to the cache:
+  `cache_prompt_version = f"{prompt_version}-K{K}-{_sanitize_model_id(client.model_id)}"`.
+  Sanitisation strips whitespace, lower-cases, and replaces `/` with
+  `_` so provider-namespaced ids (e.g. `anthropic/claude-...`) stay
+  cache-/fs-safe. The §3.4 cache layer's four-field key semantics
+  are unchanged — the fold lives entirely at the caller layer.
+  Metadata now records both `prompt_version` (the user-supplied tag,
+  e.g. `"v2"`) and `cache_prompt_version` (the composite,
+  e.g. `"v2-K3-claude-sonnet-4-6"`) so cache introspection tools
+  don't need to re-derive the composite. `StubLLMClient` gets a
+  class-level `_is_stub = True` marker so downstream guards can
+  classify it without string-matching class names.
+- `src/data/batching.py::assemble_batch` adds a defense-in-depth
+  post-generation guard. After each `generate_outcomes` call, if
+  the returned payload's `metadata['model_id']` starts with `"stub"`
+  AND the caller's `llm_client` is itself not a stub
+  (`_is_stub_client` helper: checks `_is_stub` attribute first, then
+  falls back to `type(client).__name__.startswith("Stub")`), the
+  guard raises `RuntimeError("Refusing to proceed: generate_outcomes
+  returned a stub outcome ... This indicates stub-contaminated
+  cache entries. Clean the cache and retry.")`. The model_id fold
+  alone prevents fresh collisions; the guard catches pre-existing
+  entries that pre-date the fold.
+
+**Tests.** Two added to `tests/test_generate.py`:
+`test_cache_key_separates_stub_and_real` (populate with stub, call
+with real client on same base tuple, assert real client is actually
+invoked and its outputs — not the stub's — come back; both entries
+coexist under distinct composites) and
+`test_stub_llm_client_carries_is_stub_flag`. Two added to
+`tests/test_batching.py`:
+`test_assemble_refuses_stub_cache_contamination` (pre-seed the
+cache with stub-metadata entries under the real-client composite
+key, assemble with a fake real client, assert `RuntimeError` with
+"stub" in the message) and `test_assemble_accepts_clean_cache`.
+Existing `test_cache_value_shape` updated to assert
+`cache_prompt_version == "v1-K3-stub-v1"` in metadata and to use
+the new composite when reading raw keys; no other tests needed
+changes.
+
+**Cleanup.** The fold only separates NEW writes; legacy stub-keyed
+entries in production caches (`outcomes_cache/*.sqlite`) need a
+one-time purge. That's an orchestrator concern, not a library
+concern — no delete path lives in `generate.py` or `batching.py`.

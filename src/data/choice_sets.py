@@ -505,6 +505,11 @@ def build_choice_sets(
         if "brand" in df.columns
         else np.array([""] * n_events, dtype=object)
     )
+    state_arr = (
+        df["state"].to_numpy()
+        if "state" in df.columns
+        else np.array([""] * n_events, dtype=object)
+    )
 
     logger.debug(
         "build_choice_sets: feature arrays ready (n_events=%d, "
@@ -697,13 +702,21 @@ def build_choice_sets(
             dedup_fallback_per_k.append(dedup_fallback)
 
         # Build the chosen-alt dict from the event's own row (policy: the
-        # chosen item IS the event, no lookup needed).
+        # chosen item IS the event, no lookup needed). V3-B1 fix:
+        # thread routine/brand/state so ``adapter.alt_text`` can derive
+        # ``is_repeat`` (from routine > 0) and populate brand/state on
+        # the chosen alternative — previously these were dropped, so
+        # every CHOSEN alt silently rendered ``is_repeat=False`` and
+        # ``brand="unknown_brand"`` regardless of ground truth.
         chosen_asin = catalog[chosen_code]
         event_row_alt = {
             "title": str(titles_arr[i] or ""),
             "category": ev_cat_name,
             "price": float(prices[i] or 0.0),
             "popularity": int(popularity_train_arr[i] or 0),
+            "routine": int(routines[i] or 0),
+            "brand": str(brand_arr[i] or ""),
+            "state": str(state_arr[i] or ""),
         }
 
         if n_resamples == 1:
