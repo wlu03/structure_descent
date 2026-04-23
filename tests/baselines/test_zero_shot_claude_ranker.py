@@ -223,7 +223,7 @@ def test_call_llm_for_ranking_stub_path_uses_hash():
 
 def test_score_events_shape_and_length():
     batch = _make_batch(n_events=10, J=4, seed=1)
-    ranker = ZeroShotClaudeRanker(client=StubLLMClient(), K=4)
+    ranker = ZeroShotClaudeRanker(llm_client=StubLLMClient(), K=4)
     fitted = ranker.fit(batch, batch)
     scores = fitted.score_events(batch)
     assert len(scores) == 10
@@ -247,7 +247,7 @@ def test_single_permutation_matches_argmax_for_pathological_stub():
 
     client = _ConstantStubClient(constant_text)
     batch = _make_batch(n_events=8, J=4, seed=3)
-    ranker = ZeroShotClaudeRanker(client=client, K=1)
+    ranker = ZeroShotClaudeRanker(llm_client=client, K=1)
     fitted = ranker.fit(batch, batch)
     scores = fitted.score_events(batch)
     for s in scores:
@@ -276,14 +276,14 @@ def test_permutation_debiasing_cancels_synthetic_bias():
     client = _ConstantStubClient(constant_text)
     batch = _make_batch(n_events=32, J=4, seed=11)
 
-    ranker_k1 = ZeroShotClaudeRanker(client=client, K=1)
+    ranker_k1 = ZeroShotClaudeRanker(llm_client=client, K=1)
     fitted_k1 = ranker_k1.fit(batch, batch)
     scores_k1 = fitted_k1.score_events(batch)
     argmax_k1 = [int(np.argmax(s)) for s in scores_k1]
     # K=1: every event's argmax is canonical alt 0 (the stub's forced slot).
     assert set(argmax_k1) == {0}
 
-    ranker_k4 = ZeroShotClaudeRanker(client=client, K=4)
+    ranker_k4 = ZeroShotClaudeRanker(llm_client=client, K=4)
     fitted_k4 = ranker_k4.fit(batch, batch)
     scores_k4 = fitted_k4.score_events(batch)
     # With K=4 Latin square + a constant stub, each canonical alt receives
@@ -303,7 +303,7 @@ def test_permutation_debiasing_cancels_synthetic_bias():
 def test_fitted_description_and_n_params():
     batch = _make_batch(n_events=3, J=4, seed=5)
     ranker = ZeroShotClaudeRanker(
-        client=StubLLMClient(model_id="stub-v1"),
+        llm_client=StubLLMClient(model_id="stub-v1"),
         K=4,
         temperature=0.0,
     )
@@ -335,7 +335,7 @@ def test_fit_raises_on_wrong_J():
         categories=["cat0"],
         raw_events=raw_events,
     )
-    ranker = ZeroShotClaudeRanker(client=StubLLMClient())
+    ranker = ZeroShotClaudeRanker(llm_client=StubLLMClient())
     with pytest.raises(ValueError, match="n_alternatives"):
         ranker.fit(batch, batch)
 
@@ -349,7 +349,7 @@ def test_fit_raises_without_raw_events():
         categories=["x"] * 3,
         raw_events=None,
     )
-    ranker = ZeroShotClaudeRanker(client=StubLLMClient())
+    ranker = ZeroShotClaudeRanker(llm_client=StubLLMClient())
     with pytest.raises(ValueError, match="raw_events"):
         ranker.fit(batch, batch)
 
@@ -363,7 +363,7 @@ def test_fit_raises_on_empty_batch():
         categories=[],
         raw_events=[],
     )
-    ranker = ZeroShotClaudeRanker(client=StubLLMClient())
+    ranker = ZeroShotClaudeRanker(llm_client=StubLLMClient())
     with pytest.raises(ValueError, match="empty"):
         ranker.fit(batch, batch)
 

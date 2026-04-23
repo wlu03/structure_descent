@@ -90,7 +90,7 @@ class ZeroShotClaudeRankerFitted:
     """
 
     name: str = "ZeroShot-Claude"
-    client: LLMClient = field(default_factory=StubLLMClient, repr=False)
+    llm_client: LLMClient = field(default_factory=StubLLMClient, repr=False)
     n_permutations: int = 4
     seed: int = 0
     temperature: float = 0.0
@@ -202,7 +202,7 @@ class _ZeroShotRankerImpl(LLMRankerBase):
 
 def _build_ranker(fitted: ZeroShotClaudeRankerFitted) -> _ZeroShotRankerImpl:
     return _ZeroShotRankerImpl(
-        llm_client=fitted.client,
+        llm_client=fitted.llm_client,
         n_permutations=fitted.n_permutations,
         seed=fitted.seed,
         letters=fitted.letters,
@@ -243,7 +243,7 @@ class ZeroShotClaudeRanker:
 
     def __init__(
         self,
-        client: Optional[LLMClient] = None,
+        llm_client: Optional[LLMClient] = None,
         *,
         K: int = 4,
         temperature: float = 0.0,
@@ -253,7 +253,7 @@ class ZeroShotClaudeRanker:
     ) -> None:
         if K <= 0:
             raise ValueError(f"K must be positive, got {K}")
-        self.client: LLMClient = client if client is not None else StubLLMClient()
+        self.llm_client: LLMClient = llm_client if llm_client is not None else StubLLMClient()
         self.K = int(K)
         self.temperature = float(temperature)
         self.max_tokens = int(max_tokens)
@@ -288,10 +288,10 @@ class ZeroShotClaudeRanker:
                 "records_to_baseline_batch so these fields survive."
             )
 
-        model_id = str(getattr(self.client, "model_id", "unknown") or "unknown")
+        model_id = str(getattr(self.llm_client, "model_id", "unknown") or "unknown")
         return ZeroShotClaudeRankerFitted(
             name=self.name,
-            client=self.client,
+            llm_client=self.llm_client,
             n_permutations=self.K,
             seed=self.seed,
             temperature=self.temperature,
