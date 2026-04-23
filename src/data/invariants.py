@@ -648,6 +648,76 @@ def validate_split(events_df: pd.DataFrame) -> None:
         )
 
 
+def validate_cold_start_split(events_df: pd.DataFrame) -> None:
+    """Post-cold-start-split validator.
+
+    The cold-start split partitions *customers* into disjoint train / val /
+    test groups (every event for a given customer lands in the same
+    split). This differs from :func:`validate_split`, which assumes
+    within-customer splits and therefore requires every customer to
+    have a train row — an invariant cold-start deliberately violates.
+
+    Checks:
+
+    - ``split`` column present.
+    - Every ``split`` value is in ``{"train", "val", "test"}``.
+    - **Every customer_id is fully contained in exactly one split**
+      (``customer_split_disjoint``). This is the core cold-start
+      contract: no event leakage for any held-out customer.
+    - At least one customer exists in the ``"train"`` split
+      (``cold_start_train_nonempty``). Val/test may legitimately be
+      empty for tiny datasets; a zero-train run would crash downstream
+      so we fail loud.
+    """
+    stage = "cold_start_split"
+
+    assert_columns_present(
+        events_df,
+        ["split", "customer_id"],
+        invariant_name="split_column_present",
+        stage=stage,
+    )
+
+    assert_values_in_set(
+        events_df,
+        "split",
+        _SPLIT_VALUES,
+        invariant_name="split_values_subset",
+        stage=stage,
+    )
+
+    # Disjointness: a customer must appear under exactly one split label.
+    per_customer = events_df.groupby("customer_id")["split"].nunique()
+    offending_ids = per_customer[per_customer > 1].index.tolist()
+    if offending_ids:
+        offending = events_df.loc[
+            events_df["customer_id"].isin(offending_ids[:5])
+        ].head(20)
+        _raise(
+            "customer_split_disjoint",
+            stage,
+            f"{len(offending_ids)} customer_id(s) appear under more than "
+            f"one split label: {sorted(offending_ids)[:10]!r}"
+            + (" ..." if len(offending_ids) > 10 else ""),
+            column="customer_id",
+            offending=offending,
+        )
+
+    train_customers = events_df.loc[
+        events_df["split"] == "train", "customer_id"
+    ].unique()
+    if len(train_customers) == 0:
+        _raise(
+            "cold_start_train_nonempty",
+            stage,
+            "cold-start split produced 0 train customers; cannot fit a "
+            "downstream baseline. Check val_customer_frac + "
+            "test_customer_frac do not sum to ~1.0.",
+            column="customer_id",
+            offending=None,
+        )
+
+
 def validate_popularity(events_df: pd.DataFrame) -> None:
     """Post ``attach_train_popularity`` validator.
 
