@@ -2,7 +2,8 @@
 
 Covers: Top-1 / Top-5 accuracy, MRR (1/(rank+1)), NLL (natural log),
 AIC (``2k + 2 n_train * NLL``), BIC (``k log n_train + 2 n_train * NLL``),
-the aggregator :class:`EvalMetrics`, and numpy-array acceptance.
+McFadden's pseudo-R² (``1 - NLL/log(J)``), top-1 ECE, the aggregator
+:class:`EvalMetrics`, and numpy-array acceptance.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from src.eval.metrics import (
     aic,
     bic,
     compute_all,
+    ece,
+    mcfadden_pseudo_r2,
     mrr,
     nll,
     topk_accuracy,
@@ -135,7 +138,7 @@ def test_bic_formula() -> None:
 
 
 def test_compute_all_populates() -> None:
-    """All six metric fields are set and ``to_dict`` exposes them all."""
+    """All metric fields are set and ``to_dict`` exposes them all."""
     N, J = 32, 10
     torch.manual_seed(6)
     logits = torch.randn(N, J)
@@ -145,7 +148,10 @@ def test_compute_all_populates() -> None:
     assert isinstance(em, EvalMetrics)
 
     # Populated (non-None) and of the right Python types.
-    for field in ("top1", "top5", "mrr_val", "nll_val", "aic_val", "bic_val"):
+    for field in (
+        "top1", "top5", "mrr_val", "nll_val",
+        "aic_val", "bic_val", "pseudo_r2", "ece_val",
+    ):
         assert isinstance(getattr(em, field), float), field
     for field in ("n_params", "n_train"):
         assert isinstance(getattr(em, field), int), field
@@ -153,7 +159,8 @@ def test_compute_all_populates() -> None:
     d = em.to_dict()
     assert set(d.keys()) == {
         "top1", "top5", "mrr_val", "nll_val",
-        "aic_val", "bic_val", "n_params", "n_train",
+        "aic_val", "bic_val", "pseudo_r2", "ece_val",
+        "n_params", "n_train",
     }
 
     # Cross-check via individual functions.
@@ -167,6 +174,10 @@ def test_compute_all_populates() -> None:
     assert d["bic_val"] == pytest.approx(
         bic(d["nll_val"], k=544_779, n_train=10_000)
     )
+    assert d["pseudo_r2"] == pytest.approx(
+        mcfadden_pseudo_r2(d["nll_val"], J=J)
+    )
+    assert d["ece_val"] == pytest.approx(ece(logits, c_star))
 
 
 def test_accepts_numpy_array() -> None:
@@ -220,3 +231,175 @@ def test_k_param_propagates_to_aic_bic() -> None:
     em2 = compute_all(logits, c_star, n_params=k_default + 100, n_train=n_train)
     assert em2.aic_val - em.aic_val == pytest.approx(200.0)
     assert em2.bic_val - em.bic_val == pytest.approx(100.0 * math.log(n_train))
+
+
+# ---------------------------------------------------------------------------
+# McFadden pseudo-R²
+# ---------------------------------------------------------------------------
+
+
+def test_pseudo_r2_uniform_is_zero() -> None:
+    """NLL == log(J) (uniform prediction) → pseudo-R² == 0."""
+    for J in (2, 5, 10, 100):
+        assert mcfadden_pseudo_r2(math.log(J), J=J) == pytest.approx(0.0)
+
+
+def test_pseudo_r2_perfect_is_one() -> None:
+    """NLL == 0 (perfect prediction) → pseudo-R² == 1."""
+    for J in (2, 5, 10, 100):
+        assert mcfadden_pseudo_r2(0.0, J=J) == pytest.approx(1.0)
+
+
+def test_pseudo_r2_intermediate_hand_calc() -> None:
+    """Hand-computed intermediate value: J=10, NLL=1.5 → 1 - 1.5/ln(10)."""
+    J = 10
+    nll_v = 1.5
+    expected = 1.0 - 1.5 / math.log(10.0)
+    assert mcfadden_pseudo_r2(nll_v, J=J) == pytest.approx(expected)
+    # Spot check the magnitude: ln(10) ≈ 2.3026 → 1 - 0.6514 ≈ 0.3486.
+    assert 0.34 < mcfadden_pseudo_r2(nll_v, J=J) < 0.36
+
+
+def test_pseudo_r2_can_be_negative_when_worse_than_uniform() -> None:
+    """NLL > log(J) → pseudo-R² < 0 (model is worse than uniform)."""
+    J = 10
+    # A model producing ~2x uniform NLL.
+    assert mcfadden_pseudo_r2(2.0 * math.log(J), J=J) == pytest.approx(-1.0)
+    assert mcfadden_pseudo_r2(5.0, J=J) < 0.0
+
+
+def test_pseudo_r2_upper_bound_one() -> None:
+    """NLL is non-negative → pseudo-R² ≤ 1 always."""
+    for J in (2, 5, 10, 100):
+        for nll_v in (0.0, 0.1, math.log(J), 2.0 * math.log(J)):
+            assert mcfadden_pseudo_r2(nll_v, J=J) <= 1.0 + 1e-12
+
+
+# ---------------------------------------------------------------------------
+# ECE
+# ---------------------------------------------------------------------------
+
+
+def _logits_for_confidence(conf: float, J: int, n: int) -> torch.Tensor:
+    """Build an (n, J) logits matrix whose softmax max-prob is exactly ``conf``
+    (the non-argmax classes share the remaining mass uniformly). Used to
+    construct ECE synthetic data without having to invert softmax twice."""
+    assert 1.0 / J <= conf <= 1.0 - 1e-9
+    # softmax(a, 0, 0, ...) = [e^a, 1, 1, ...] / (e^a + J - 1).
+    # Solve for a: e^a / (e^a + J - 1) = conf
+    # → e^a (1 - conf) = conf (J - 1)
+    # → a = log(conf (J-1) / (1 - conf)).
+    a = math.log(conf * (J - 1) / (1.0 - conf))
+    row = torch.zeros(J)
+    row[0] = a
+    return row.unsqueeze(0).repeat(n, 1)
+
+
+def test_ece_perfectly_calibrated() -> None:
+    """100 events at 0.8 confidence with 80 correct → ECE == 0."""
+    J = 5
+    conf = 0.8
+    n = 100
+    logits = _logits_for_confidence(conf, J=J, n=n)
+    # Class 0 is the top-1 for every row (see helper). Mark exactly 80
+    # correct by setting c*=0 on 80 rows and c*=1 on the rest.
+    c_star = torch.zeros(n, dtype=torch.int64)
+    c_star[80:] = 1
+    # Sanity: pred is 0 for every row → 80 correct → accuracy 0.8.
+    assert ece(logits, c_star) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_ece_systematically_overconfident() -> None:
+    """100 events at 0.9 confidence but only 50 correct → ECE ≈ 0.4."""
+    J = 5
+    conf = 0.9
+    n = 100
+    logits = _logits_for_confidence(conf, J=J, n=n)
+    c_star = torch.zeros(n, dtype=torch.int64)
+    c_star[50:] = 1  # 50 correct, 50 wrong
+    # All rows land in the same bin, so ECE == |avg_conf - acc| = |0.9 - 0.5|.
+    assert ece(logits, c_star) == pytest.approx(0.4, abs=1e-5)
+
+
+def test_ece_empty_input_returns_zero() -> None:
+    """N == 0 → ECE == 0.0 (no divide-by-zero)."""
+    logits = torch.empty((0, 5))
+    c_star = torch.empty((0,), dtype=torch.int64)
+    assert ece(logits, c_star) == 0.0
+
+
+def test_ece_single_event_does_not_crash() -> None:
+    """N == 1 is a valid input; the metric is just |conf - correct|."""
+    J = 4
+    logits = _logits_for_confidence(0.7, J=J, n=1)
+    # Correct prediction → ECE == |0.7 - 1.0| = 0.3.
+    assert ece(logits, torch.tensor([0])) == pytest.approx(0.3, abs=1e-6)
+    # Wrong prediction → ECE == |0.7 - 0.0| = 0.7.
+    assert ece(logits, torch.tensor([1])) == pytest.approx(0.7, abs=1e-6)
+
+
+def test_ece_skips_empty_bins() -> None:
+    """Bins with no events must not contribute (and must not divide by 0)."""
+    # All events at confidence 0.8 → only bin 12 of 15 is populated
+    # (0.8 * 15 = 12; int() truncates; clamp to 14 is a no-op). All 14
+    # other bins are empty; ECE must still evaluate cleanly.
+    J = 5
+    n = 20
+    logits = _logits_for_confidence(0.8, J=J, n=n)
+    c_star = torch.zeros(n, dtype=torch.int64)  # all correct
+    # |0.8 - 1.0| = 0.2, single populated bin → ECE = 0.2.
+    val = ece(logits, c_star, n_bins=15)
+    assert val == pytest.approx(0.2, abs=1e-6)
+
+
+def test_ece_bounded_in_unit_interval() -> None:
+    """ECE is a weighted mean of |conf - acc| with both in [0,1] → ECE ∈ [0,1]."""
+    N, J = 64, 8
+    torch.manual_seed(9)
+    logits = torch.randn(N, J)
+    c_star = torch.randint(0, J, (N,))
+    v = ece(logits, c_star)
+    assert 0.0 <= v <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# dtype / container tolerance for the new metrics
+# ---------------------------------------------------------------------------
+
+
+def test_ece_numpy_matches_torch() -> None:
+    """np.ndarray inputs give the same ECE as torch tensors."""
+    N, J = 32, 6
+    torch.manual_seed(10)
+    logits_t = torch.randn(N, J)
+    c_star_t = torch.randint(0, J, (N,))
+
+    logits_np = logits_t.numpy().astype(np.float32)
+    c_star_np = c_star_t.numpy().astype(np.int64)
+
+    assert ece(logits_np, c_star_np) == pytest.approx(
+        ece(logits_t, c_star_t), rel=1e-5, abs=1e-6
+    )
+
+
+def test_pseudo_r2_is_pure_transform_of_nll() -> None:
+    """pseudo_r2 depends only on the scalar NLL and J — feeding the same
+    NLL as np.float32, Python float, or torch scalar gives identical output."""
+    J = 10
+    nll_v = 1.234
+    a = mcfadden_pseudo_r2(nll_v, J=J)
+    b = mcfadden_pseudo_r2(float(np.float32(nll_v)), J=J)
+    c = mcfadden_pseudo_r2(float(torch.tensor(nll_v)), J=J)
+    assert a == pytest.approx(b, rel=1e-6, abs=1e-7)
+    assert a == pytest.approx(c, rel=1e-6, abs=1e-7)
+
+
+def test_compute_all_pseudo_r2_and_ece_match_standalone() -> None:
+    """compute_all wires pseudo_r2 and ece the same as their standalone calls."""
+    N, J = 24, 7
+    torch.manual_seed(11)
+    logits = torch.randn(N, J)
+    c_star = torch.randint(0, J, (N,))
+    em = compute_all(logits, c_star, n_params=100, n_train=1000)
+    assert em.pseudo_r2 == pytest.approx(mcfadden_pseudo_r2(em.nll_val, J=J))
+    assert em.ece_val == pytest.approx(ece(logits, c_star))

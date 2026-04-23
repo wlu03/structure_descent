@@ -125,6 +125,28 @@ def subsample_customers(df, n_customers=500, n_pca_components=20,
     return selected_ids, weights
 
 
+def random_subsample_customers(df, n_customers=500, seed=42):
+    """picks a uniformly random subset of customers with ω=1 weights.
+    for dev iteration and representative held-out evaluation — unlike the
+    leverage-score path, the resulting subset is population-representative,
+    so per-event metrics like top-1 / NLL / ECE don't need re-weighting.
+    returns (selected_ids, importance_weights)."""
+
+    rng = np.random.default_rng(seed)
+    customer_ids = np.array(sorted(df["customer_id"].unique()))
+    n_total = len(customer_ids)
+    n_pick = min(int(n_customers), n_total)
+    if n_pick <= 0:
+        raise ValueError(f"n_customers must be positive; got {n_customers}.")
+
+    selected_ids = rng.choice(customer_ids, size=n_pick, replace=False)
+    selected_ids = np.array(sorted(selected_ids))
+    # ω=1: a random sample is already representative, no inverse-probability
+    # correction needed. Matches §9.1 default when subsampling is off.
+    weights = np.ones(n_pick, dtype=np.float64)
+    return selected_ids, weights
+
+
 def apply_subsample(df, selected_ids, weights):
     """Filter df to selected customers and return per-event importance weights.
 

@@ -300,13 +300,15 @@ def try_import_subsample_weights(
     train_df: Any,
     n_customers: int | None = None,
     seed: int = 42,
+    method: str = "leverage",
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Attempt Appendix-C leverage-score subsampling; fall back to ``(None, None)``.
+    """Attempt Appendix-C subsampling; fall back to ``(None, None)``.
 
     The v2.0 subsampling module lives at :mod:`src.train.subsample` and
-    exposes ``subsample_customers`` / ``apply_subsample`` (see §C.6). If
-    either the import fails or the call raises, we return
-    ``(None, None)`` and the caller should treat ``ω_t = 1`` per §9.1.
+    exposes ``subsample_customers`` (leverage-score, Appendix C) and
+    ``random_subsample_customers`` (uniform random with ω=1). If either
+    the import fails or the call raises, we return ``(None, None)`` and
+    the caller should treat ``ω_t = 1`` per §9.1.
 
     Parameters
     ----------
@@ -319,7 +321,14 @@ def try_import_subsample_weights(
         code — Appendix C §C.6 spec: "Set ``n_customers=None`` (or skip
         the call) to train on the full population with ``ω_t = 1``".
     seed:
-        RNG seed forwarded to ``subsample_customers``.
+        RNG seed forwarded to the selected method.
+    method:
+        Selection rule. ``"leverage"`` (default, Appendix C) picks a
+        diverse subset weighted by leverage scores; representative of the
+        behavior space but *not* of the population — importance weights
+        compensate at training time but not in per-event eval metrics.
+        ``"random"`` picks uniformly at random with ω=1, giving a
+        population-representative sample suitable for held-out evaluation.
 
     Returns
     -------
@@ -335,6 +344,7 @@ def try_import_subsample_weights(
     try:
         from src.train.subsample import (  # type: ignore
             apply_subsample,
+            random_subsample_customers,
             subsample_customers,
         )
     except ImportError:
@@ -345,10 +355,21 @@ def try_import_subsample_weights(
         )
         return (None, None)
 
-    try:
-        selected_ids, customer_weights = subsample_customers(
-            train_df, n_customers=n_customers, seed=seed
+    method_lc = str(method).lower()
+    if method_lc not in ("leverage", "random"):
+        raise ValueError(
+            f"subsample method must be 'leverage' or 'random'; got {method!r}."
         )
+
+    try:
+        if method_lc == "random":
+            selected_ids, customer_weights = random_subsample_customers(
+                train_df, n_customers=n_customers, seed=seed
+            )
+        else:
+            selected_ids, customer_weights = subsample_customers(
+                train_df, n_customers=n_customers, seed=seed
+            )
         _filtered, event_weights = apply_subsample(
             train_df, selected_ids, customer_weights
         )

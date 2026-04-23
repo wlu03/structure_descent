@@ -78,10 +78,11 @@ eval:
     - dominant_attribute
 
 subsample:
-  enabled: false             # Appendix C; off for synthetic smoke tests
-  n_customers: 500
-  n_pca_components: 20
-  min_per_category_cluster: 2
+  enabled: true              # Appendix C; customer subsampling
+  method: random             # 'random' (uniform, ω=1, representative) or 'leverage' (Appendix C diversity)
+  n_customers: 100
+  n_pca_components: 20       # leverage-only; ignored when method=random
+  min_per_category_cluster: 2  # leverage-only; ignored when method=random
   seed: 42
 
 paths:

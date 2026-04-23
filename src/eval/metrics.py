@@ -1,7 +1,8 @@
 """Evaluation metrics for PO-LEU (redesign.md §13).
 
-Pure, stateless functions computing the six numbers reported on the held-out
-test split: Top-1 accuracy, Top-5 accuracy, MRR, NLL, AIC, BIC. All functions
+Pure, stateless functions computing the headline numbers reported on the
+held-out test split: Top-1 accuracy, Top-5 accuracy, MRR, NLL, AIC, BIC,
+McFadden's pseudo-R², and top-1 Expected Calibration Error. All functions
 accept either a ``torch.Tensor`` or a ``numpy.ndarray`` for the logits and
 ``c*`` labels — inputs are converted with ``torch.as_tensor`` internally.
 
@@ -189,6 +190,72 @@ def bic(nll_val: float, k: int, n_train: int) -> float:
     return float(k) * math.log(float(n_train)) + 2.0 * float(n_train) * float(nll_val)
 
 
+def mcfadden_pseudo_r2(nll_val: float, J: int) -> float:
+    """McFadden's pseudo-R² from a pre-computed NLL: ``1 - nll_val / log(J)``.
+
+    ``log`` is the natural log (``math.log``), matching the NLL convention.
+    Under uniform prediction (``nll_val = log(J)``) the value is 0; under
+    perfect prediction (``nll_val = 0``) the value is 1. Values can go
+    negative when the model is worse than uniform.
+
+    Note — unlike OLS R², discrete-choice pseudo-R² does not saturate near
+    1: McFadden (1974) considers 0.2–0.4 a strong fit. Do not apply OLS
+    intuition to the magnitude.
+    """
+    return 1.0 - float(nll_val) / math.log(float(J))
+
+
+def ece(
+    logits: ArrayLike,
+    c_star: ArrayLike,
+    n_bins: int = 15,
+) -> float:
+    """Top-1 Expected Calibration Error with equal-width confidence bins.
+
+    Shape contract:
+        logits: (N, J)
+        c_star: (N,)
+        out:    Python float.
+
+    Bins events by their softmax-max probability (the model's top-1
+    confidence) into ``n_bins`` equal-width bins over ``[0, 1]``, then
+    returns ``Σ_bin (|bin| / N) * |avg_confidence_in_bin - accuracy_in_bin|``.
+    Empty bins are skipped (no divide-by-zero). ``N == 0`` returns ``0.0``.
+
+    ECE of 0 indicates perfect calibration — the model's stated confidence
+    matches its realized top-1 accuracy in every bin. See Guo et al. (2017).
+    """
+    t = _as_logits(logits)
+    N, J = t.shape
+    y = _as_labels(c_star, n=N, num_classes=J)
+
+    if N == 0:
+        return 0.0
+
+    probs = F.softmax(t, dim=-1)
+    conf, pred = probs.max(dim=-1)  # both (N,)
+    correct = (pred == y).to(torch.float64)
+    conf = conf.to(torch.float64)
+
+    # Equal-width bin edges over [0, 1]. Use the right edge to assign bins;
+    # conf == 0 lands in bin 0, conf == 1 lands in the last bin.
+    n_bins = max(1, int(n_bins))
+    bin_ids = torch.clamp(
+        (conf * n_bins).to(torch.int64), max=n_bins - 1
+    )
+
+    ece_sum = 0.0
+    for b in range(n_bins):
+        mask = bin_ids == b
+        count = int(mask.sum().item())
+        if count == 0:
+            continue
+        avg_conf = float(conf[mask].mean().item())
+        acc = float(correct[mask].mean().item())
+        ece_sum += (count / N) * abs(avg_conf - acc)
+    return float(ece_sum)
+
+
 # ---------------------------------------------------------------------------
 # Aggregator
 # ---------------------------------------------------------------------------
@@ -196,7 +263,7 @@ def bic(nll_val: float, k: int, n_train: int) -> float:
 
 @dataclass
 class EvalMetrics:
-    """All six §13 numbers plus the ``k`` / ``n_train`` used for AIC/BIC.
+    """All §13 headline numbers plus McFadden pseudo-R² and top-1 ECE.
 
     Attributes
     ----------
@@ -208,6 +275,11 @@ class EvalMetrics:
         Mean per-event NLL (natural log).
     aic_val, bic_val:
         ``2k + 2 n_train * NLL`` and ``k log n_train + 2 n_train * NLL``.
+    pseudo_r2:
+        McFadden's pseudo-R² = ``1 - nll_val / log(J)``. 0 under uniform
+        prediction, 1 under perfect; can go negative if worse than uniform.
+    ece_val:
+        Top-1 Expected Calibration Error with 15 equal-width bins.
     n_params:
         Trainable parameter count ``k`` (e.g., :meth:`POLEU.num_params`).
     n_train:
@@ -220,6 +292,8 @@ class EvalMetrics:
     nll_val: float
     aic_val: float
     bic_val: float
+    pseudo_r2: float
+    ece_val: float
     n_params: int
     n_train: int
 
@@ -235,7 +309,7 @@ def compute_all(
     n_params: int,
     n_train: int,
 ) -> EvalMetrics:
-    """Compute all six §13 numbers in one pass.
+    """Compute all §13 numbers (plus pseudo-R² and ECE) in one pass.
 
     Shape contract:
         logits:    (N, J)
@@ -245,7 +319,8 @@ def compute_all(
         n_train:   int, size of the training split.
         out:       :class:`EvalMetrics`.
 
-    Top-k list is fixed to ``[1, 5]`` per Appendix B / §13.
+    Top-k list is fixed to ``[1, 5]`` per Appendix B / §13. ECE uses the
+    default 15 equal-width bins (Guo et al. 2017).
     """
     t = _as_logits(logits)
     N, J = t.shape
@@ -257,6 +332,8 @@ def compute_all(
     nll_v = nll(t, y)
     aic_v = aic(nll_v, k=n_params, n_train=n_train)
     bic_v = bic(nll_v, k=n_params, n_train=n_train)
+    pseudo_r2_v = mcfadden_pseudo_r2(nll_v, J=J)
+    ece_v = ece(t, y)
 
     return EvalMetrics(
         top1=top1,
@@ -265,6 +342,8 @@ def compute_all(
         nll_val=nll_v,
         aic_val=aic_v,
         bic_val=bic_v,
+        pseudo_r2=pseudo_r2_v,
+        ece_val=ece_v,
         n_params=int(n_params),
         n_train=int(n_train),
     )
