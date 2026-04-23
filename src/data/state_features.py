@@ -36,6 +36,7 @@ from src.data.invariants import (
 __all__ = [
     "compute_state_features",
     "attach_train_popularity",
+    "attach_train_brand_map",
 ]
 
 
@@ -136,9 +137,6 @@ def compute_state_features(events_df: pd.DataFrame) -> pd.DataFrame:
       counts within ``(customer_id, category)`` over the preceding
       7-day / 30-day windows (inclusive of the current event; matches
       pandas ``DataFrame.rolling("7D", on=order_date)`` semantics).
-    - ``brand``: mode first-token brand per ASIN with a stopword
-      filter; ASINs whose brand appears only once across the catalog
-      (or that never produce a token) are labelled ``"unknown_brand"``.
 
     Preserves the input row count. Returns a new DataFrame (input is
     ``.copy()``-ed), re-sorted by ``(customer_id, order_date)`` on exit.
@@ -147,6 +145,15 @@ def compute_state_features(events_df: pd.DataFrame) -> pd.DataFrame:
     Popularity is *not* computed here — see
     :func:`attach_train_popularity`, which must be called after the
     temporal split to prevent val/test counts from leaking into train.
+
+    Brand is *not* computed here either — see
+    :func:`attach_train_brand_map`, which must be called after the split
+    so that the per-ASIN brand mode is derived from ``split == "train"``
+    rows only. Computing it pre-split would leak a test-customer's title
+    spelling into the brand signal visible at training (finding F4 of
+    the leakage audit). This function returns a frame *without* a
+    ``brand`` column; downstream code must call
+    :func:`attach_train_brand_map` before reading ``event_row["brand"]``.
     """
     logger.info("compute_state_features: starting on %d events.", len(events_df))
     df = events_df.copy().sort_values(["customer_id", "order_date"]).reset_index(drop=True)
@@ -184,25 +191,24 @@ def compute_state_features(events_df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop(columns=["_cat_event"])
     df = df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
 
-    logger.info("compute_state_features: brand (mode first-token per ASIN).")
-    brand_map = _build_asin_brand_map(df)
-    brand_counts = pd.Series(list(brand_map.values())).value_counts()
-    ambiguous = set(brand_counts[brand_counts < 2].index) if len(brand_counts) else set()
-    df["brand"] = df["asin"].map(brand_map).fillna("")
-    df.loc[df["brand"].isin(ambiguous) | (df["brand"] == ""), "brand"] = "unknown_brand"
+    # Brand is no longer set here — see attach_train_brand_map (post-split).
+    # Any pre-existing ``brand`` column from a caller-supplied frame is
+    # cleared so that the pre-split output is unambiguously brand-less and
+    # the downstream helper is the single source of truth.
+    if "brand" in df.columns:
+        df = df.drop(columns=["brand"])
 
     repeat_rate = float((df["routine"] > 0).mean()) if len(df) else 0.0
     logger.debug(
-        "compute_state_features: %d events, repeat_rate=%.4f, %d brands.",
+        "compute_state_features: %d events, repeat_rate=%.4f (brand attached post-split).",
         len(df),
         repeat_rate,
-        int(df["brand"].nunique()),
     )
     logger.info(
-        "compute_state_features: done (%d events, repeat_rate=%.1f%%, %d brands).",
+        "compute_state_features: done (%d events, repeat_rate=%.1f%%; "
+        "brand attached post-split via attach_train_brand_map).",
         len(df),
         100.0 * repeat_rate,
-        int(df["brand"].nunique()),
     )
 
     validate_state_features(df)
@@ -271,4 +277,83 @@ def attach_train_popularity(events_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     validate_popularity(df)
+    return df
+
+
+# --------------------------------------------------------------------------- #
+# Public: attach_train_brand_map
+# --------------------------------------------------------------------------- #
+
+
+def attach_train_brand_map(events_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute a train-only per-ASIN brand map and broadcast to every row.
+
+    Mirrors :func:`attach_train_popularity`. The per-ASIN brand is the
+    mode first-token (via :func:`_first_brand_token`) across rows with
+    ``split == "train"`` only. Every row — train, val, and test — then
+    receives that train-derived brand label for its ASIN, so val/test
+    rows see "what the model knew about this ASIN's brand at training
+    time" instead of a label that may have been inferred from their own
+    (or a fellow test-customer's) title spelling.
+
+    The ``brand`` column is attached in place. ASINs that never appear
+    in train (cold-start catalogs, val/test-only ASINs) receive the
+    empty string ``""`` as the brand sentinel — the downstream
+    :meth:`src.data.adapter.DatasetAdapter.alt_text` path already maps
+    an empty / missing brand to ``"unknown_brand"``, so no further
+    plumbing is required.
+
+    Requires the ``split`` column to already exist; the pre-check raises
+    :class:`~src.data.invariants.InvariantError` with
+    ``stage="state_features"`` if it is missing, and the error message
+    points the caller at :mod:`src.data.split`.
+
+    This helper deliberately does *not* apply v1's "ambiguous brand"
+    collapse (singleton-token brands → ``"unknown_brand"``). The goal
+    here is leakage-correctness, not v1 numeric parity: the downstream
+    ``alt_text`` sentinel already handles empty / unknown cases
+    gracefully, and preserving low-count tokens when they do appear in
+    train is useful signal rather than noise once the map is restricted
+    to the train split.
+    """
+    # Pre-condition: split must exist. Point the caller at the upstream
+    # temporal_split / cold_start_split stage.
+    assert_columns_present(
+        events_df,
+        ["split"],
+        invariant_name="split_required_for_brand_map",
+        stage="state_features",
+    )
+
+    logger.info(
+        "attach_train_brand_map: computing train-only ASIN brand mode "
+        "over %d events.",
+        len(events_df),
+    )
+    df = events_df.copy()
+
+    train_mask = df["split"] == "train"
+    train_df = df.loc[train_mask, ["asin", "title"]]
+    brand_map = _build_asin_brand_map(train_df) if len(train_df) else {}
+
+    df = df.drop(columns=["brand"], errors="ignore")
+    df["brand"] = df["asin"].map(brand_map).fillna("").astype(str)
+
+    n_mapped = int((df["brand"] != "").sum())
+    n_unmapped = int((df["brand"] == "").sum())
+    logger.debug(
+        "attach_train_brand_map: %d unique train-mapped ASINs, "
+        "%d rows mapped, %d rows with brand=''.",
+        int(len(brand_map)),
+        n_mapped,
+        n_unmapped,
+    )
+    logger.info(
+        "attach_train_brand_map: done (%d unique train-mapped ASINs, "
+        "%d rows mapped, %d rows unmapped).",
+        int(len(brand_map)),
+        n_mapped,
+        n_unmapped,
+    )
+
     return df

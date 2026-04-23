@@ -311,17 +311,48 @@ def test_v2_alt_texts_uses_adapter():
 
 
 def test_fit_on_train_assertion_fires():
-    """persons_canonical with a customer that's not in train -> AssertionError."""
+    """persons_canonical missing a customer present in events -> AssertionError.
+
+    Wave-13 loosening: the assertion used to be
+    ``persons_canonical.customer_id ⊆ train_customers`` (orphan persons
+    rows were rejected). That broke cold-start, where val/test customers
+    legitimately carry z_d rows via translate_z_d's transform path
+    without ever appearing in the train split. The weakened invariant
+    only rejects the case that would KeyError at the per-event z_d
+    lookup: an event whose customer_id has NO row in persons_canonical.
+    Here we drop one of the train customers from persons_canonical
+    and expect the assertion to fire.
+    """
     events = _make_events()
     persons = _persons_for(events)
-    # Add an orphan customer B that is NOT in the train split (or any split).
-    orphan = persons.iloc[0:1].copy()
-    orphan.loc[:, "customer_id"] = "B_NOT_IN_EVENTS"
-    persons_bad = pd.concat([persons, orphan], ignore_index=True)
+    dropped_cid = str(persons.iloc[0]["customer_id"])
+    persons_bad = persons.iloc[1:].reset_index(drop=True)
     adapter = _StubAdapter()
     with pytest.raises(AssertionError) as exc:
         build_choice_sets(events, persons_bad, adapter, seed=42)
-    assert "B_NOT_IN_EVENTS" in str(exc.value)
+    msg = str(exc.value)
+    assert dropped_cid in msg
+    assert "z_d row" in msg
+
+
+def test_fit_on_train_allows_orphan_persons_rows():
+    """Wave-13: persons rows for customers NOT in events are now allowed.
+
+    Pre-Wave-13 this was an AssertionError (old strict invariant
+    required persons_canonical ⊆ train_customers). The new invariant
+    goes in the other direction — persons_canonical must be a
+    *superset* of event_customers — so orphan persons rows are
+    irrelevant. This test pins the looser semantics.
+    """
+    events = _make_events()
+    persons = _persons_for(events)
+    # Append an orphan customer that is NOT in events at all.
+    orphan = persons.iloc[0:1].copy()
+    orphan.loc[:, "customer_id"] = "B_NOT_IN_EVENTS"
+    persons_with_orphan = pd.concat([persons, orphan], ignore_index=True)
+    adapter = _StubAdapter()
+    records = build_choice_sets(events, persons_with_orphan, adapter, seed=42)
+    assert len(records) == len(events)
 
 
 def test_fit_on_train_passes_when_persons_match_train():
@@ -330,6 +361,233 @@ def test_fit_on_train_passes_when_persons_match_train():
     adapter = _StubAdapter()
     records = build_choice_sets(events, persons, adapter, seed=42)
     assert len(records) == len(events)
+
+
+# --------------------------------------------------------------------------- #
+# Wave-13 cold-start compatibility: val/test customers in persons_canonical.
+#
+# The Wave-13 loosening flips the persons_canonical invariant from
+# "subset of train customers" to "superset of event customers". This
+# unblocks cold-start, where val/test customers have NO train rows by
+# construction yet still need z_d vectors for evaluation.
+# --------------------------------------------------------------------------- #
+
+
+def _make_cold_start_events() -> pd.DataFrame:
+    """Build a disjoint cold-start events frame.
+
+    Three customers, each wholly in one split (train / val / test).
+    Every customer has a few events so build_choice_sets has per-
+    customer history to draw from. Catalog is large enough that the
+    dedup guard does not trigger cyclic-fallback padding.
+    """
+    rows = []
+    base = pd.to_datetime("2024-01-01")
+    cid_splits = [
+        ("C_train", "train"),
+        ("C_val", "val"),
+        ("C_test", "test"),
+    ]
+    for c_idx, (cid, split) in enumerate(cid_splits):
+        for e in range(4):
+            asin_idx = c_idx * 13 + e * 5
+            rows.append(
+                dict(
+                    customer_id=cid,
+                    order_date=base + pd.Timedelta(days=c_idx * 30 + e),
+                    asin=f"A{asin_idx:04d}",
+                    category=f"CAT{asin_idx % 3}",
+                    price=5.0 + (asin_idx % 7),
+                    title=f"title A{asin_idx:04d}",
+                    routine=int(e > 0),
+                    novelty=int(e == 0),
+                    recency_days=999 if e == 0 else 7,
+                    cat_affinity=e,
+                    brand="brand_x",
+                    split=split,
+                )
+            )
+    # Seed additional train rows with a LARGE catalog so the temporal
+    # availability prefix at each event's date has many ASINs to sample
+    # from (avoids tiny-catalog dedup fallback).
+    seed_start = base - pd.Timedelta(days=100)
+    for a in range(50):
+        rows.append(
+            dict(
+                customer_id="C_train",
+                order_date=seed_start + pd.Timedelta(days=a),
+                asin=f"A_seed{a:03d}",
+                category=f"CAT{a % 3}",
+                price=5.0 + (a % 7),
+                title=f"seed title {a}",
+                routine=0,
+                novelty=1,
+                recency_days=999,
+                cat_affinity=0,
+                brand="brand_x",
+                split="train",
+            )
+        )
+    df = pd.DataFrame(rows)
+    pop = df.groupby("asin").size().rename("popularity").reset_index()
+    df = df.merge(pop, on="asin", how="left")
+    df = df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
+    return df
+
+
+def test_build_choice_sets_accepts_val_test_customers_in_persons_canonical():
+    """Wave-13 loosening: persons_canonical may carry z_d rows for
+    val/test customers who have NO train events (cold-start).
+
+    Pre-Wave-13, the fit-on-train assertion rejected any persons
+    row whose customer_id was not in the train split. Under cold-
+    start that rejected every val/test customer. After the fix, the
+    only requirement is that every event customer has a z_d row —
+    so val/test customers carrying z_d are allowed and their events
+    flow through build_choice_sets end-to-end.
+    """
+    events = _make_cold_start_events()
+    all_cids = sorted(events["customer_id"].unique().tolist())
+    # persons_canonical covers ALL customers (train + val + test).
+    persons = _persons_for_customers(all_cids)
+    adapter = _StubAdapter()
+
+    # Should NOT raise — pre-Wave-13 this raised AssertionError on the
+    # "val/test customer_id not in train" branch.
+    records = build_choice_sets(
+        events, persons, adapter, n_negatives=9, seed=42, n_resamples=1
+    )
+    assert len(records) == len(events)
+
+    # Every split contributes records.
+    record_cids = {r["customer_id"] for r in records}
+    assert "C_train" in record_cids
+    assert "C_val" in record_cids
+    assert "C_test" in record_cids
+
+
+def test_build_choice_sets_raises_when_event_customer_missing_z_d():
+    """Coverage assertion fires when an event customer has no z_d row.
+
+    Mirror of the old ``test_fit_on_train_assertion_fires`` but
+    inverted: drop one of the customers from persons_canonical while
+    keeping all their events, and expect an AssertionError whose
+    message names the missing customer_id and the phrase "z_d row".
+    """
+    events = _make_cold_start_events()
+    all_cids = sorted(events["customer_id"].unique().tolist())
+    persons = _persons_for_customers(all_cids)
+    # Drop the val customer's z_d row — their events now have nowhere
+    # to look up z_d.
+    persons_bad = persons[persons["customer_id"] != "C_val"].reset_index(
+        drop=True
+    )
+    adapter = _StubAdapter()
+    with pytest.raises(AssertionError) as exc:
+        build_choice_sets(
+            events, persons_bad, adapter, n_negatives=9, seed=42, n_resamples=1
+        )
+    msg = str(exc.value)
+    assert "C_val" in msg
+    assert "z_d row" in msg
+
+
+def test_build_choice_sets_cold_start_end_to_end_smoke():
+    """End-to-end smoke test: cold_start_split -> attach_train_popularity
+    -> attach_train_brand_map -> persons_canonical covering all splits
+    -> build_choice_sets.
+
+    Exercises the full runner wiring under cold-start: val/test
+    customers get z_d rows via an all-customers transform (the fit is
+    still train-only in real code, via ``translate_z_d(training_events=)``;
+    this test bypasses the adapter machinery and hand-rolls
+    persons_canonical so the assertion we care about — coverage of
+    event customer_ids — is exercised directly).
+    """
+    from src.data.split import cold_start_split
+    from src.data.state_features import (
+        attach_train_brand_map,
+        attach_train_popularity,
+    )
+
+    # Build an events frame with 20 customers × 5 events each, spread
+    # across time so the catalog is populated well before each event
+    # (regardless of which customers land in which cold-start bucket).
+    rows = []
+    base = pd.to_datetime("2024-01-01")
+    n_customers = 20
+    n_events_per_customer = 5
+    n_categories = 3
+    for c in range(n_customers):
+        for e in range(n_events_per_customer):
+            # Offsets interleave so ASINs are first-seen across a
+            # range of early dates regardless of the shuffle.
+            asin_idx = (c + e * n_customers) % (n_customers * n_events_per_customer)
+            rows.append(
+                dict(
+                    customer_id=f"C{c:02d}",
+                    order_date=base + pd.Timedelta(days=e * n_customers + c),
+                    asin=f"A{asin_idx:04d}",
+                    category=f"CAT{asin_idx % n_categories}",
+                    price=5.0 + (asin_idx % 7),
+                    title=f"title C{c:02d}_e{e}",
+                    routine=int(e > 0),
+                    novelty=int(e == 0),
+                    recency_days=999 if e == 0 else 7,
+                    cat_affinity=e,
+                    brand="brand_x",
+                )
+            )
+    events = pd.DataFrame(rows)
+
+    # Cold-start split: disjoint train / val / test customer sets.
+    split_df = cold_start_split(
+        events, val_customer_frac=0.2, test_customer_frac=0.2, seed=1
+    )
+    # Attach train-derived aggregates (both require the split column).
+    with_pop = attach_train_popularity(split_df)
+    with_brand = attach_train_brand_map(with_pop)
+
+    # Verify cold-start produced all three splits (partition is data-
+    # dependent; bail early with a clear message if the shuffle
+    # happened to starve one bucket — at 20 customers with 0.2/0.2
+    # fractions this should never happen).
+    splits = set(with_brand["split"].unique().tolist())
+    assert splits == {"train", "val", "test"}, (
+        f"cold_start_split produced splits={splits}; expected all three"
+    )
+
+    # persons_canonical covering every customer (train + val + test).
+    # In real code this is the output of
+    # ``adapter.translate_z_d(persons_raw_keep, training_events=train_subset)``
+    # — the fit is train-only, the transform runs on every customer.
+    all_cids = sorted(with_brand["customer_id"].astype(str).unique().tolist())
+    persons_canonical = _persons_for_customers(all_cids)
+
+    adapter = _StubAdapter()
+    records = build_choice_sets(
+        with_brand,
+        persons_canonical,
+        adapter,
+        n_negatives=9,
+        seed=42,
+        n_resamples=1,
+    )
+
+    # No exception; every split contributes at least one record.
+    assert len(records) == len(with_brand)
+    cid_to_split = dict(
+        zip(with_brand["customer_id"].astype(str), with_brand["split"].astype(str))
+    )
+    splits_seen = {cid_to_split[str(r["customer_id"])] for r in records}
+    assert splits_seen == {"train", "val", "test"}
+
+    # Every record's customer_id has a matching z_d row in
+    # persons_canonical (i.e. the coverage assertion was satisfied
+    # and the per-event lookup never raised KeyError).
+    zd_cids = set(persons_canonical["customer_id"].astype(str))
+    for r in records:
+        assert str(r["customer_id"]) in zd_cids
 
 
 # --------------------------------------------------------------------------- #
@@ -973,3 +1231,256 @@ def test_dedup_does_not_change_large_fixture():
         f"expected majority of records to be dedup-clean; "
         f"got {n_clean}/{len(records)} clean"
     )
+
+
+# --------------------------------------------------------------------------- #
+# F3 cold-start leakage fix: first_seen / asin_lookup / popularity fallback
+# must be computed from TRAIN rows only when a ``split`` column is present.
+#
+# Under a cold-start partition, ``events_df`` contains rows for customers
+# who are held out entirely (they only appear in val/test). Deriving each
+# ASIN's first-seen date or sampling-pool membership from the full frame
+# leaks "when did the test population first encounter this product" into
+# the availability prefix that gates negative sampling for train events.
+# --------------------------------------------------------------------------- #
+
+
+def _persons_for_customers(customer_ids: list[str]) -> pd.DataFrame:
+    """Persons-canonical with a row per train customer_id (leakage tests).
+
+    Rotates through the full age/income/city vocabularies so
+    ``fit_person_features`` sees the full 6+5+4 one-hot widths.
+    """
+    full_age = ["18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
+    full_income = ["<25k", "25-50k", "50-100k", "100-150k", "150k+"]
+    full_city = ["rural", "small", "medium", "large"]
+    rows = []
+    for i, cid in enumerate(customer_ids):
+        rows.append(
+            dict(
+                customer_id=cid,
+                age_bucket=full_age[i % len(full_age)],
+                income_bucket=full_income[i % len(full_income)],
+                household_size=1 + (i % 4),
+                has_kids=int(i % 2),
+                city_size=full_city[i % len(full_city)],
+                education=3,
+                health_rating=4,
+                risk_tolerance=0.0,
+                purchase_frequency=2.0,
+                novelty_rate=0.3,
+            )
+        )
+    return pd.DataFrame(rows)
+
+
+def _leaky_events_frame(include_split_column: bool = True) -> pd.DataFrame:
+    """Build a synthetic events frame exercising the cold-start leak.
+
+    Layout (every customer has at least one ``split=='train'`` event so
+    the fit-on-train customer-id assertion at the top of
+    :func:`build_choice_sets` passes):
+
+      - C_TRAIN_00 .. C_TRAIN_04: five customers with train events in
+        2019 buying A_safe00 .. A_safe04 (distinct per-customer ASINs).
+        These populate the catalog so the negative sampler has a pool at
+        the probe date.
+      - C_TRAIN_MAIN: an anchor train event on 2019-06-01 (buying
+        A_anchor) plus a train event on 2020-06-01 (buying A_safe_probe).
+        The 2020-06-01 event is the probe whose candidate negatives we
+        inspect.
+      - C_MIXED: a train event on 2019-07-01 (buying A_mixed_anchor) —
+        so C_MIXED is in ``train_customers`` — PLUS a ``split="test"``
+        event on 2020-01-01 buying A_leaky. Under a true cold-start
+        split every customer is wholly train or wholly test; here we
+        simulate "the test-row population" by flagging a single row
+        test while keeping the customer in the train cohort so the
+        fit-on-train assertion passes. The leak scenario is identical:
+        a row with ``split != "train"`` introduces A_leaky into the
+        full-frame first_seen at 2020-01-01.
+      - C_TRAIN_LATE: an anchor train event on 2019-08-01 plus a train
+        event on 2021-01-01 buying A_leaky — so A_leaky DOES appear in
+        train, but only AFTER the probe event.
+
+    Under a correct (train-only) first_seen, A_leaky's earliest train
+    date is 2021-01-01, which is > 2020-06-01, so the probe event must
+    NOT see A_leaky as a candidate negative. Under the buggy (full-frame)
+    first_seen, A_leaky's earliest date would be 2020-01-01 (from
+    C_MIXED's test-labelled row), which is < 2020-06-01, so A_leaky
+    WOULD appear in the sampling pool — exactly the leak this test
+    guards against.
+    """
+
+    def _row(cid, date, asin, split, price=5.0):
+        return dict(
+            customer_id=cid,
+            order_date=pd.to_datetime(date),
+            asin=asin,
+            category="CAT0",
+            price=price,
+            title=f"title for {asin}",
+            routine=0,
+            novelty=1,
+            recency_days=999,
+            cat_affinity=0,
+            brand="brand_x",
+            popularity=1,
+            split=split,
+        )
+
+    rows = []
+    # Five train customers priming the catalog.
+    base = pd.to_datetime("2019-06-01")
+    for i in range(5):
+        rows.append(
+            _row(
+                f"C_TRAIN_{i:02d}",
+                base + pd.Timedelta(days=i * 10),
+                f"A_safe{i:02d}",
+                "train",
+                price=5.0 + i,
+            )
+        )
+    # C_TRAIN_MAIN: anchor train row + probe train row.
+    rows.append(_row("C_TRAIN_MAIN", "2019-06-01", "A_anchor", "train"))
+    rows.append(
+        _row("C_TRAIN_MAIN", "2020-06-01", "A_safe_probe", "train", price=7.0)
+    )
+    # C_MIXED: train-anchor (keeps customer in train cohort) + non-train
+    # leaky row on 2020-01-01.
+    rows.append(_row("C_MIXED", "2019-07-01", "A_mixed_anchor", "train"))
+    rows.append(_row("C_MIXED", "2020-01-01", "A_leaky", "test", price=9.0))
+    # C_TRAIN_LATE: anchor + late train A_leaky.
+    rows.append(_row("C_TRAIN_LATE", "2019-08-01", "A_late_anchor", "train"))
+    rows.append(
+        _row("C_TRAIN_LATE", "2021-01-01", "A_leaky", "train", price=9.0)
+    )
+    df = pd.DataFrame(rows).sort_values(
+        ["customer_id", "order_date"]
+    ).reset_index(drop=True)
+    if not include_split_column:
+        df = df.drop(columns=["split"])
+    return df
+
+
+def test_first_seen_is_train_only_when_split_column_present():
+    """Under cold-start, A_leaky's ``first_seen`` must come from the
+    earliest TRAIN row (2021-01-01), not the earliest test-row
+    (2020-01-01). Proxy: a train event dated 2020-06-01 must not have
+    A_leaky as a candidate negative.
+
+    Swept across several seeds to keep the assertion sharp: under the
+    buggy path, A_leaky's popularity-weighted sampling chance of being
+    drawn in at least one seed is ~1; under the fix it is zero.
+    """
+    events = _leaky_events_frame(include_split_column=True)
+    train_cids = sorted(
+        events.loc[events["split"] == "train", "customer_id"].unique().tolist()
+    )
+    persons = _persons_for_customers(train_cids)
+
+    for seed in range(25):
+        adapter = _StubAdapter()
+        records = build_choice_sets(
+            events, persons, adapter, n_negatives=9, seed=seed, n_resamples=1
+        )
+
+        # Locate the probe event (C_TRAIN_MAIN on 2020-06-01).
+        probe = [
+            r
+            for r in records
+            if r["customer_id"] == "C_TRAIN_MAIN"
+            and pd.Timestamp(r["order_date"]) == pd.Timestamp("2020-06-01")
+        ]
+        assert len(probe) == 1, (
+            f"expected exactly one probe record; got {len(probe)}"
+        )
+        probe_record = probe[0]
+        assert "A_leaky" not in probe_record["choice_asins"], (
+            f"leak (seed={seed}): A_leaky appeared as a candidate negative "
+            f"for the probe event dated 2020-06-01, but its first train "
+            f"occurrence is 2021-01-01. "
+            f"choice_asins={probe_record['choice_asins']}"
+        )
+
+
+def test_first_seen_unchanged_when_no_split_column():
+    """Backwards-compat pin for the all-rows path.
+
+    When no ``split`` column is present (or every row is labelled
+    ``"train"``), the full-frame first_seen / asin_lookup tables are
+    used — identical to pre-fix behavior. We pin this in two ways:
+
+    1. An events frame where every row has ``split == "train"`` must
+       see A_leaky as a candidate negative at the probe date (because
+       under the all-train scenario, A_leaky's first-seen is
+       2020-01-01 which is strictly before 2020-06-01). This mirrors
+       the pre-fix full-frame semantics.
+    2. A frame with the ``split`` column dropped entirely must still
+       execute end-to-end through the all-rows fallback (duck-typed
+       ``if split_column in df.columns``). Wave-13 loosening: the
+       pre-Wave-13 coverage assertion happened to dereference the
+       split column first, so dropping it produced a ``KeyError``
+       indirectly; the new assertion no longer reads the split
+       column, so the no-split-column path now succeeds as intended.
+    """
+    events = _leaky_events_frame(include_split_column=True)
+    # (1) All-train: full-frame semantics means A_leaky IS visible at
+    # the probe date.
+    events_all_train = events.assign(split=["train"] * len(events))
+    all_cids = sorted(events_all_train["customer_id"].unique().tolist())
+    persons = _persons_for_customers(all_cids)
+    records = build_choice_sets(
+        events_all_train,
+        persons,
+        _StubAdapter(),
+        n_negatives=9,
+        seed=42,
+        n_resamples=1,
+    )
+    assert len(records) == len(events_all_train)
+    # Every event's chosen ASIN is the first entry of choice_asins (after
+    # permutation) at chosen_idx.
+    for r in records:
+        assert r["choice_asins"][r["chosen_idx"]] == r["chosen_asin"]
+
+    # (2) No-split-column: the all-rows fallback executes cleanly.
+    events_no_split = events.drop(columns=["split"])
+    records_no_split = build_choice_sets(
+        events_no_split,
+        persons,
+        _StubAdapter(),
+        n_negatives=9,
+        seed=42,
+        n_resamples=1,
+    )
+    assert len(records_no_split) == len(events_no_split)
+    for r in records_no_split:
+        assert r["choice_asins"][r["chosen_idx"]] == r["chosen_asin"]
+
+
+def test_first_seen_raises_on_split_column_with_no_train_rows():
+    """If the ``split`` column is present but contains zero train rows,
+    build_choice_sets must raise ``ValueError`` with an actionable
+    message rather than silently falling back to all-rows mode.
+
+    Wave-13 note: the coverage assertion at the top of
+    :func:`build_choice_sets` now requires that every event customer
+    has a z_d row in ``persons_canonical`` (the old invariant —
+    persons ⊆ train — was invalidated by cold-start). We therefore
+    build a persons frame covering every event customer so the
+    coverage check passes and the no-train-rows ValueError becomes
+    the first exception reached.
+    """
+    events = _leaky_events_frame(include_split_column=True)
+    # Force every row to val/test — no train rows remain.
+    events = events.assign(
+        split=["test"] * len(events)
+    )
+    all_cids = sorted(events["customer_id"].unique().tolist())
+    persons = _persons_for_customers(all_cids)
+    adapter = _StubAdapter()
+    with pytest.raises(ValueError, match="zero 'train' rows"):
+        build_choice_sets(
+            events, persons, adapter, n_negatives=9, seed=42, n_resamples=1
+        )

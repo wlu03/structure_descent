@@ -354,9 +354,17 @@ def test_alt_text_state_passthrough():
 def test_alt_text_amazon_fixture_end_to_end(tmp_path):
     """Load the Amazon fixture, run clean_events + compute_state_features,
     pull one cleaned event row, and verify all 7 alt_text keys are
-    populated with sensible values."""
+    populated with sensible values.
+
+    Post-F4 (leakage fix) the ``brand`` column is no longer produced by
+    ``compute_state_features`` — it is attached by the post-split helper
+    ``attach_train_brand_map``. This test now runs the full pre-split
+    state-features pass + a temporal split + the brand map attach to
+    mirror the runner pipelines.
+    """
     from src.data import state_features
     from src.data.clean import clean_events
+    from src.data.split import temporal_split
 
     yaml_path = _write_fixture_yaml(tmp_path)
     adapter = YamlAdapter(yaml_path)
@@ -364,10 +372,13 @@ def test_alt_text_amazon_fixture_end_to_end(tmp_path):
     events_raw = adapter.load_events()
     cleaned = clean_events(events_raw, adapter.schema)
     featured = state_features.compute_state_features(cleaned)
+    # brand is attached post-split; run a split and then attach.
+    split_df = temporal_split(featured, adapter.schema)
+    featured = state_features.attach_train_brand_map(split_df)
 
-    # Sanity: the post-state_features frame carries the 3 new source columns.
+    # Sanity: the post-attach frame carries the 3 new source columns.
     for col in ("brand", "routine", "state"):
-        assert col in featured.columns, f"state_features did not emit {col!r}"
+        assert col in featured.columns, f"pipeline did not emit {col!r}"
 
     # Pick the first event row and render alt_text.
     row = featured.iloc[0].to_dict()

@@ -23,6 +23,7 @@ from src.data.state_features import (
     _BRAND_STOPWORDS,
     _build_asin_brand_map,
     _first_brand_token,
+    attach_train_brand_map,
     attach_train_popularity,
     compute_state_features,
 )
@@ -78,9 +79,12 @@ def _make_events(rows: list[dict]) -> pd.DataFrame:
 
 def test_state_features_adds_all_columns(fixture_events):
     out = compute_state_features(fixture_events)
+    # ``brand`` is now attached by the post-split helper
+    # ``attach_train_brand_map``; it must NOT be produced by
+    # ``compute_state_features`` (leakage bug fix F4).
     required = {
         "routine", "novelty", "recency_days", "cat_affinity",
-        "cat_count_7d", "cat_count_30d", "brand",
+        "cat_count_7d", "cat_count_30d",
     }
     assert required.issubset(set(out.columns)), (
         f"missing columns: {required - set(out.columns)!r}"
@@ -195,21 +199,47 @@ def test_cat_count_7d_and_30d():
     assert (out["cat_count_7d"] <= out["cat_count_30d"]).all()
 
 
-def test_brand_fills_unknown_for_ambiguous():
-    """Single-occurrence brand tokens collapse to 'unknown_brand'."""
+def test_compute_state_features_no_longer_sets_brand():
+    """Post-F4 fix: ``compute_state_features`` does not emit ``brand``.
+
+    The ``brand`` column is now attached post-split by
+    :func:`attach_train_brand_map` (leakage bug fix F4). Pre-split, the
+    output must NOT carry a ``brand`` column, so any caller that reads
+    ``event_row["brand"]`` before the split gets a KeyError (or the
+    downstream adapter's ``unknown_brand`` fallback) rather than a
+    silently leaked value.
+    """
     events = _make_events([
         {"customer_id": "u1", "order_date": "2022-01-01", "asin": "a",
          "category": "C1", "title": "Apple AirPods Pro"},
         {"customer_id": "u1", "order_date": "2022-01-02", "asin": "b",
          "category": "C1", "title": "Sony WH1000XM4"},
-        # Ambiguous titles that yield empty tokens.
         {"customer_id": "u1", "order_date": "2022-01-03", "asin": "c",
          "category": "C1", "title": ""},
     ])
     out = compute_state_features(events)
-    # 'apple' and 'sony' each appear once across ASINs → both ambiguous.
-    # ASIN 'c' has no token at all → also 'unknown_brand'.
-    assert set(out["brand"].unique()) == {"unknown_brand"}
+    assert "brand" not in out.columns, (
+        "compute_state_features must not set the brand column pre-split; "
+        "use attach_train_brand_map after temporal_split / cold_start_split."
+    )
+
+
+def test_compute_state_features_drops_pre_existing_brand_column():
+    """A caller-supplied ``brand`` column is cleared pre-split.
+
+    ``compute_state_features`` is now the single source of truth that
+    the pre-split frame is brand-less. If a caller hands in a frame
+    that already has a ``brand`` column (e.g. from a stale run), the
+    column is dropped so the downstream ``attach_train_brand_map`` is
+    unambiguously authoritative.
+    """
+    events = _make_events([
+        {"customer_id": "u1", "order_date": "2022-01-01", "asin": "a",
+         "category": "C1", "title": "Apple AirPods"},
+    ])
+    events["brand"] = "leaked_brand"
+    out = compute_state_features(events)
+    assert "brand" not in out.columns
 
 
 # --------------------------------------------------------------------------- #
@@ -342,3 +372,99 @@ def test_build_asin_brand_map_mode():
     m = _build_asin_brand_map(df)
     assert m["a"] == "apple"
     assert m["b"] == "sony"
+
+
+# --------------------------------------------------------------------------- #
+# attach_train_brand_map (F4 leakage fix)
+# --------------------------------------------------------------------------- #
+
+
+def test_attach_train_brand_map_uses_train_only():
+    """Brand map must be derived from ``split == 'train'`` rows only.
+
+    Construct events where ASIN ``"X"`` has a train-row title spelled
+    ``"BrandA ..."`` and a test-row title spelled ``"BrandB ..."``.
+    Under the F4 fix every row — train AND test — must end up with
+    ``brand == "branda"``, because the test-customer's title spelling
+    is no longer allowed to influence the brand signal visible at
+    training.
+    """
+    events = _make_events([
+        {"customer_id": "u1", "order_date": "2022-01-01", "asin": "X",
+         "category": "C", "title": "BrandA Widget"},
+        {"customer_id": "u1", "order_date": "2022-01-02", "asin": "X",
+         "category": "C", "title": "BrandA Gadget"},
+        # Test-customer row: the title spells the brand differently.
+        {"customer_id": "u2", "order_date": "2022-02-01", "asin": "X",
+         "category": "C", "title": "BrandB Knockoff"},
+    ])
+    events["split"] = ["train", "train", "test"]
+
+    out = attach_train_brand_map(events)
+    assert (out["brand"] == "branda").all(), (
+        "every row (train + test) must carry the train-derived brand label "
+        f"for ASIN X; got: {out['brand'].unique().tolist()!r}"
+    )
+
+
+def test_attach_train_brand_map_asin_unseen_in_train_gets_empty_string():
+    """Val/test-only ASINs → brand column is empty string (not NaN).
+
+    The empty-string sentinel is the documented choice (see the
+    docstring): the adapter's ``alt_text`` path already maps an empty
+    / missing brand to ``"unknown_brand"``, so no further plumbing is
+    required and we avoid introducing a second "unknown" token that
+    would pollute the mapped-brand vocabulary.
+    """
+    events = _make_events([
+        # ASIN "a" is train-only and has a real brand token.
+        {"customer_id": "u1", "order_date": "2022-01-01", "asin": "a",
+         "category": "C", "title": "Apple Widget"},
+        # ASIN "b" only appears in val → no train-derived brand.
+        {"customer_id": "u2", "order_date": "2022-02-01", "asin": "b",
+         "category": "C", "title": "Sony Headphones"},
+    ])
+    events["split"] = ["train", "val"]
+
+    out = attach_train_brand_map(events)
+    per_asin = (
+        out.drop_duplicates("asin").set_index("asin")["brand"].to_dict()
+    )
+    assert per_asin["a"] == "apple"
+    assert per_asin["b"] == ""
+    # Explicit: empty string, not NaN, not "unknown_brand".
+    assert not out["brand"].isna().any()
+
+
+def test_attach_train_brand_map_raises_without_split_column():
+    """Missing split → clean InvariantError from the pre-check."""
+    events = _make_events([
+        {"customer_id": "u1", "order_date": "2022-01-01", "asin": "a",
+         "category": "C", "title": "Apple Widget"},
+    ])
+    # No `split` column.
+    with pytest.raises(InvariantError) as excinfo:
+        attach_train_brand_map(events)
+    err = excinfo.value
+    assert err.invariant_name == "split_required_for_brand_map"
+    assert err.stage == "state_features"
+
+
+def test_attach_train_brand_map_broadcasts_to_all_rows():
+    """Every row (train, val, test) receives the same train-derived brand."""
+    events = _make_events([
+        {"customer_id": "u1", "order_date": "2022-01-01", "asin": "a",
+         "category": "C", "title": "Apple Widget"},
+        {"customer_id": "u1", "order_date": "2022-01-02", "asin": "a",
+         "category": "C", "title": "Apple Gadget"},
+        {"customer_id": "u2", "order_date": "2022-02-01", "asin": "a",
+         "category": "C", "title": "Apple Knockoff"},
+        {"customer_id": "u3", "order_date": "2022-03-01", "asin": "a",
+         "category": "C", "title": "Apple Replica"},
+    ])
+    events["split"] = ["train", "train", "val", "test"]
+
+    out = attach_train_brand_map(events)
+    assert (out["brand"] == "apple").all()
+    # Row count preserved.
+    assert len(out) == len(events)

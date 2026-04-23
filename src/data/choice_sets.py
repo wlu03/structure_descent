@@ -148,9 +148,15 @@ def build_choice_sets(
         ``popularity``, ``split``, ``title``.
       persons_canonical: output of ``adapter.translate_z_d()``. Must
         contain ``customer_id`` plus all 10 canonical z_d columns.
-        INVARIANT: ``persons_canonical['customer_id']`` is a subset of
-        ``events_df.loc[events_df[split_column] == 'train',
-                       'customer_id'].unique()``.
+        INVARIANT: ``persons_canonical['customer_id']`` is a
+        *superset* of every ``customer_id`` that appears in
+        ``events_df`` (any split). The z_d vocabulary / standardization
+        stats were fit train-only via ``translate_z_d(training_events=)``,
+        but the TRANSFORM runs on every customer — val/test customers
+        under cold-start therefore legitimately carry z_d rows without
+        leaking train statistics. What we strictly require is
+        coverage, so the per-event ``customer_to_zd[cid]`` lookup
+        below cannot KeyError.
       adapter: supplies ``suppress_fields_for_c_d()`` and
         ``alt_text(event_row)``.
 
@@ -189,29 +195,45 @@ def build_choice_sets(
     Raises
     ------
     AssertionError:
-        If ``persons_canonical`` contains ``customer_id`` values not in
-        the training split of ``events_df`` (enforces §2.1 fit-on-train-
-        only standardization).
+        If ``persons_canonical`` is missing a ``customer_id`` that
+        appears in ``events_df`` (any split). The per-event
+        ``customer_to_zd[cid]`` lookup would otherwise KeyError mid-
+        iteration. Fit-on-train-only standardization is enforced
+        upstream via ``translate_z_d(training_events=)``; this
+        function does not re-check it.
     ValueError:
         If ``events_df[["asin", "category"]]`` contains NaN (upstream
         clean_purchases caveat preserved from v1).
     """
     # --------------------------------------------------------------- #
-    # §2.1 fit-on-train assertion: every persons_canonical customer_id
-    # must be in the training split of events_df so that the
-    # person_features standardization stats are fit on train only.
+    # Coverage assertion (cold-start-compatible; Wave-13 loosening).
+    #
+    # Every customer whose events we iterate over must have a z_d row.
+    # The z_d vocabulary was fit on train-only (see translate_z_d
+    # ``training_events=`` kwarg), but the TRANSFORM runs on all
+    # customers, so val/test customers under cold-start legitimately
+    # carry z_d rows without leaking train statistics. What we strictly
+    # require is that ``persons_canonical`` covers every customer we're
+    # about to iterate — otherwise the per-event ``customer_to_zd[cid]``
+    # lookup would KeyError mid-loop.
+    #
+    # The prior, stricter invariant (``persons_canonical.customer_id``
+    # ⊆ train-split customer_ids) broke cold-start because val/test
+    # customers have zero train rows by construction. Temporal splits
+    # remain covered: every customer has train rows there, so the new
+    # (weaker) invariant is equivalent.
     # --------------------------------------------------------------- #
-    train_mask = events_df[split_column] == "train"
-    train_customers = set(events_df.loc[train_mask, "customer_id"].unique())
-    persons_customers = set(persons_canonical["customer_id"].unique())
-    orphans = persons_customers - train_customers
-    if orphans:
-        sample = sorted(orphans)[:5]
+    event_customers = set(events_df["customer_id"].astype(str).unique())
+    pc_customers = set(persons_canonical["customer_id"].astype(str).unique())
+    missing = event_customers - pc_customers
+    if missing:
+        sample = sorted(list(missing))[:10]
         raise AssertionError(
-            f"persons_canonical contains {len(orphans)} customer_ids not "
-            f"in the training split (sample: {sample}). Refit translate_z_d "
-            f"using only the training customer subset, or drop these rows "
-            f"before calling build_choice_sets."
+            f"persons_canonical is missing z_d rows for "
+            f"{len(missing)} customer_id(s) that appear in events_df "
+            f"(sample: {sample}). Ensure translate_z_d was called with "
+            f"the full joint customer set, not a train-only slice; "
+            f"training_events= controls FIT, not TRANSFORM."
         )
 
     logger.info(
@@ -231,6 +253,51 @@ def build_choice_sets(
             "Run clean_purchases first (NaN codes would silently wrap "
             "catalog indexing)."
         )
+
+    # --------------------------------------------------------------- #
+    # Split-aware reference frame for ``first_seen`` / ``asin_lookup`` /
+    # popularity-fallback computations (F3 cold-start leakage fix).
+    #
+    # Under a cold-start split, ``events_df`` contains rows for
+    # customers who are held out entirely (they only appear in val/test),
+    # so deriving each ASIN's first-seen date or catalog lookup from the
+    # full frame leaks "when did the test population first encounter
+    # this product" into the availability prefix that gates negative
+    # sampling for TRAIN events. Restricting these tables to the train
+    # subset fixes the leak.
+    #
+    # Temporal splits (every customer contributes to both train and
+    # test) and synthetic fixtures without a ``split`` column are
+    # unaffected: the full-frame path is preserved when no ``split``
+    # column is present. This is a duck-typed check — no signature
+    # change.
+    # --------------------------------------------------------------- #
+    if split_column in df.columns:
+        train_only_mask = df[split_column] == "train"
+        n_train_rows = int(train_only_mask.sum())
+        if n_train_rows == 0:
+            raise ValueError(
+                f"build_choice_sets: '{split_column}' column is present but "
+                f"contains zero 'train' rows; cannot build first_seen / "
+                f"asin_lookup / popularity tables without any training data. "
+                f"Check the upstream split stage (e.g. temporal_split / "
+                f"cold_start_split) and verify val_frac/test_frac didn't "
+                f"drain the train partition."
+            )
+        logger.info(
+            "build_choice_sets: restricting first_seen + asin_lookup to "
+            "%d train rows (%d total).",
+            n_train_rows,
+            len(df),
+        )
+        ref_df = df.loc[train_only_mask]
+    else:
+        logger.info(
+            "build_choice_sets: no split column, using all %d rows for "
+            "first_seen + asin_lookup.",
+            len(df),
+        )
+        ref_df = df
 
     # --------------------------------------------------------------- #
     # Per-customer caches (O(n_customers), not O(n_events)).
@@ -276,10 +343,12 @@ def build_choice_sets(
     # asin_lookup: for each ASIN, grab the canonical event-row fields
     # (title, category, price, popularity) from the earliest event it
     # appears in. Using the oldest row is the causally-earliest
-    # description we have for that ASIN.
+    # description we have for that ASIN. Derived from ``ref_df`` so
+    # under cold-start splits only train-customer rows contribute (no
+    # cross-customer leakage via the negative-sampling pool).
     # --------------------------------------------------------------- #
     first_seen_rows = (
-        df.sort_values("order_date", kind="mergesort")
+        ref_df.sort_values("order_date", kind="mergesort")
         .drop_duplicates(subset=["asin"], keep="first")
     )
     asin_lookup: dict = {
@@ -340,9 +409,19 @@ def build_choice_sets(
         pd.to_datetime(df["order_date"]).to_numpy().astype("datetime64[ns]")
     )
 
-    # Per-ASIN earliest-seen date (over the full df).
+    # Per-ASIN earliest-seen date. Computed from ``ref_df`` (train-only
+    # rows under a cold-start split; full frame otherwise) so that the
+    # availability prefix which gates negative sampling does not leak
+    # cross-customer information. ASINs that appear only in non-train
+    # rows reindex to ``NaT`` and are thus never selectable as
+    # negatives — exactly the intended behavior.
+    ref_order_dates_ns = (
+        pd.to_datetime(ref_df["order_date"])
+        .to_numpy()
+        .astype("datetime64[ns]")
+    )
     first_seen = (
-        df.assign(_d=order_dates_ns)
+        ref_df.assign(_d=ref_order_dates_ns)
         .groupby("asin")["_d"].min()
     )
     first_seen_by_code = (
@@ -351,9 +430,15 @@ def build_choice_sets(
 
     # Popularity weights over the catalog. ASINs with zero train
     # popularity get a tiny epsilon so they're still sampleable.
-    if popularity_col in df.columns:
+    # Sourced from ``ref_df`` so that when the ``popularity`` column
+    # is ABSENT (synthetic fixtures, early pipeline stages) the
+    # drop-duplicates fallback pulls from train-only rows under a
+    # cold-start split. When ``popularity`` is present it is already
+    # train-only (see :func:`attach_train_popularity`), so reading
+    # from ``df`` vs. ``ref_df`` is equivalent there.
+    if popularity_col in ref_df.columns:
         pop_series = (
-            df[["asin", popularity_col]]
+            ref_df[["asin", popularity_col]]
             .drop_duplicates(subset=["asin"])
             .set_index("asin")[popularity_col]
         )
@@ -785,6 +870,22 @@ def build_choice_sets(
             recent_purchases=event_recent,
         )
 
+        # Defensive z_d lookup. The coverage assertion at the top of
+        # this function already guarantees every event customer has a
+        # z_d row, so this branch should never fire under the normal
+        # call path. We keep it in case a future caller bypasses the
+        # assertion — the original ``KeyError: <customer_id>`` surface
+        # from pandas is too terse to diagnose a pipeline-wiring bug.
+        try:
+            zd_row = customer_to_zd[cid]
+        except KeyError as exc:
+            raise KeyError(
+                f"build_choice_sets: event for customer_id={cid!r} has no "
+                f"z_d row in persons_canonical. This is a pipeline-wiring "
+                f"bug — translate_z_d should have transformed every customer "
+                f"in events_df. See choice_sets.py assertion block."
+            ) from exc
+
         record = {
             # v1 keys
             "customer_id": cid,
@@ -801,7 +902,7 @@ def build_choice_sets(
                 "dedup_fallback": dedup_fallback_field,
             },
             # v2 additions
-            "z_d": customer_to_zd[cid],
+            "z_d": zd_row,
             "c_d": event_c_d,
             "alt_texts": alt_texts,
         }
