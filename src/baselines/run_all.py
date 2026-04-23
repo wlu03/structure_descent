@@ -50,7 +50,7 @@ import importlib
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .base import BaselineEventBatch, BaselineReport
 from .evaluate import evaluate_baseline
@@ -61,26 +61,103 @@ from .evaluate import evaluate_baseline
 #
 # Popularity runs first so its ``test_nll`` is available as the reference
 # point for the ``nll_uplift_vs_popularity`` post-processing pass below.
-BASELINE_REGISTRY: List[Tuple[str, str, str]] = [
-    # Reference / frequency baseline — runs first so its test_nll can
-    # anchor the nll_uplift_vs_popularity column.
-    ("Popularity",          "src.baselines.popularity",              "PopularityBaseline"),
-    # Tabular baselines (per-alt 6-feature matrix via data_adapter).
-    ("LASSO-MNL",           "src.baselines.lasso_mnl",               "LassoMnl"),
-    ("RandomForest",        "src.baselines.classical_ml",            "RandomForestChoice"),
-    ("GradientBoosting",    "src.baselines.classical_ml",            "GradientBoostingChoice"),
-    ("MLP",                 "src.baselines.classical_ml",            "MLPChoice"),
-    ("Bayesian-ARD",        "src.baselines.bayesian_ard",            "BayesianARD"),
-    ("DUET",                "src.baselines.duet_ga",                 "DUET"),
-    # Frozen-LLM baselines — consume raw_events (c_d + alt_texts) and
-    # call a pluggable ``LLMClient``. Default to ``StubLLMClient`` when
-    # no client is passed; real runs wire in ``AnthropicLLMClient`` via
-    # ``baseline_kwargs[...]={"llm_client": ...}``. Will be marked
-    # ``unavailable`` if dependencies are missing.
-    ("ST-MLP",              "src.baselines.st_mlp_ablation",         "STMLPChoice"),
-    ("ZeroShot-Claude",     "src.baselines.zero_shot_claude_ranker", "ZeroShotClaudeRanker"),
-    ("FewShot-ICL-Claude",  "src.baselines.few_shot_icl_ranker",     "FewShotICLRanker"),
+# ----- Multi-provider LLM sweep ------------------------------------------- #
+#
+# Each entry is ``(display_suffix, module_path, class_name, client_factory)``.
+# The factory is a zero-arg callable that returns an ``LLMClient`` instance
+# at baseline-fit time. We defer instantiation so (a) missing SDKs / missing
+# API keys mark only the affected row ``unavailable`` rather than aborting
+# the whole suite, and (b) we don't pay Anthropic/Gemini/OpenAI import cost
+# unless the baseline is actually running.
+#
+# To add a model: append one entry. To drop a provider for a given run:
+# comment out the entry or pass an override via ``baseline_kwargs``.
+
+def _anthropic_factory(model_id: str) -> Callable[[], Any]:
+    """Lazy factory for an ``AnthropicLLMClient`` bound to ``model_id``."""
+    def _make() -> Any:
+        from src.outcomes.generate import AnthropicLLMClient
+        return AnthropicLLMClient(model_id=model_id)
+    return _make
+
+
+def _gemini_factory(model_id: str) -> Callable[[], Any]:
+    """Lazy factory for a ``GeminiLLMClient`` (Vertex AI + ADC)."""
+    def _make() -> Any:
+        from src.outcomes._gemini_client import GeminiLLMClient
+        return GeminiLLMClient(model_id=model_id)
+    return _make
+
+
+def _openai_factory(model_id: str) -> Callable[[], Any]:
+    """Lazy factory for an ``OpenAILLMClient``."""
+    def _make() -> Any:
+        from src.outcomes._openai_client import OpenAILLMClient
+        return OpenAILLMClient(model_id=model_id)
+    return _make
+
+
+# Each row: (display_suffix, factory).
+# display_suffix becomes the "-<model>" tail on the baseline's leaderboard
+# name, e.g. ``ZeroShot`` + ``Claude-Sonnet-4.6`` -> ``ZeroShot-Claude-Sonnet-4.6``.
+LLM_MODEL_SWEEP: List[Tuple[str, Callable[[], Any]]] = [
+    ("Claude-Sonnet-4.6",  _anthropic_factory("claude-sonnet-4-6")),
+    ("Claude-Opus-4.6",    _anthropic_factory("claude-opus-4-6")),
+    ("Gemini-2.5-Pro",     _gemini_factory("gemini-2.5-pro")),
+    ("Gemini-2.5-Flash",   _gemini_factory("gemini-2.5-flash")),
+    ("GPT-5",              _openai_factory("gpt-5")),
 ]
+
+# LLM-backed baselines in the base registry. For each entry below, the
+# expansion machinery appends one ``(<prefix>-<model>, module, class)`` row
+# per entry in :data:`LLM_MODEL_SWEEP`, and records the corresponding
+# factory in :data:`LLM_CLIENT_FACTORIES`.
+_LLM_BASELINE_BASES: List[Tuple[str, str, str]] = [
+    ("ZeroShot",    "src.baselines.zero_shot_claude_ranker", "ZeroShotClaudeRanker"),
+    ("FewShot-ICL", "src.baselines.few_shot_icl_ranker",     "FewShotICLRanker"),
+]
+
+# Populated below via :func:`_build_registry`. Maps expanded display_name
+# (e.g. ``"ZeroShot-Claude-Sonnet-4.6"``) to the zero-arg client factory
+# that :func:`run_all_baselines` calls to obtain the LLMClient instance.
+LLM_CLIENT_FACTORIES: Dict[str, Callable[[], Any]] = {}
+
+
+def _build_registry() -> List[Tuple[str, str, str]]:
+    """Build the per-run baseline registry.
+
+    Non-LLM baselines appear once. Each LLM baseline appears once per
+    entry in :data:`LLM_MODEL_SWEEP` so a single run surfaces a
+    head-to-head leaderboard across all providers.
+    """
+    registry: List[Tuple[str, str, str]] = [
+        # Reference / frequency baseline — runs first so its test_nll
+        # can anchor the nll_uplift_vs_popularity column.
+        ("Popularity",       "src.baselines.popularity",    "PopularityBaseline"),
+        # Tabular baselines (per-alt 6-feature matrix via data_adapter).
+        ("LASSO-MNL",        "src.baselines.lasso_mnl",     "LassoMnl"),
+        ("RandomForest",     "src.baselines.classical_ml",  "RandomForestChoice"),
+        ("GradientBoosting", "src.baselines.classical_ml",  "GradientBoostingChoice"),
+        ("MLP",              "src.baselines.classical_ml",  "MLPChoice"),
+        ("Bayesian-ARD",     "src.baselines.bayesian_ard",  "BayesianARD"),
+        ("DUET",             "src.baselines.duet_ga",       "DUET"),
+        # LLM-free ablation — embeds raw alt-metadata with the same
+        # sentence encoder PO-LEU uses and trains a small MLP.
+        ("ST-MLP",           "src.baselines.st_mlp_ablation", "STMLPChoice"),
+    ]
+    # Expand every LLM baseline across all models in LLM_MODEL_SWEEP.
+    # Register each expansion's factory so run_all_baselines can inject
+    # the right llm_client at construction time.
+    for prefix, module_path, class_name in _LLM_BASELINE_BASES:
+        for model_suffix, factory in LLM_MODEL_SWEEP:
+            name = f"{prefix}-{model_suffix}"
+            registry.append((name, module_path, class_name))
+            LLM_CLIENT_FACTORIES[name] = factory
+    return registry
+
+
+BASELINE_REGISTRY: List[Tuple[str, str, str]] = _build_registry()
+
 
 # Key into ``BaselineReport.extra`` under which the uplift-vs-popularity
 # nats are written by :func:`annotate_uplift_vs_popularity` and surfaced
@@ -145,10 +222,62 @@ def run_all_baselines(
                 print(f"[{display_name}] unavailable — {err}")
             continue
 
-        kwargs = baseline_kwargs.get(display_name, {})
+        # Start from caller-supplied kwargs; inject a concrete
+        # ``llm_client`` from the sweep factory if the baseline is an
+        # LLM baseline and the caller didn't already pass one. Factory
+        # failures (missing SDK / unset API key / bad ADC config) mark
+        # just this row unavailable rather than aborting the suite.
+        kwargs = dict(baseline_kwargs.get(display_name, {}))
+        if display_name in LLM_CLIENT_FACTORIES and "llm_client" not in kwargs:
+            factory = LLM_CLIENT_FACTORIES[display_name]
+            try:
+                kwargs["llm_client"] = factory()
+            except Exception as e:
+                rows.append({
+                    "name": display_name,
+                    "status": "unavailable",
+                    "error": f"LLM client factory failed: {e}",
+                })
+                if verbose:
+                    print(
+                        f"[{display_name}] unavailable — LLM client "
+                        f"factory failed: {e}"
+                    )
+                continue
 
         try:
             baseline = cls(**kwargs)
+            # Production stub-safety tripwire: an LLM baseline in the
+            # registry MUST hold a real client at this point. The
+            # factory branch above installs one; the only path to a
+            # stub here is a caller passing ``llm_client=None`` via
+            # ``baseline_kwargs`` (which falls back to StubLLMClient
+            # inside the baseline's __init__). Refuse to run under
+            # stub for any registered LLM row so paid real-LLM
+            # leaderboards never contain a silently-fake row.
+            if display_name in LLM_CLIENT_FACTORIES:
+                injected = getattr(baseline, "llm_client", None)
+                if injected is None:
+                    injected = getattr(baseline, "client", None)
+                if getattr(injected, "_is_stub", False):
+                    rows.append({
+                        "name": display_name,
+                        "status": "errored",
+                        "error": (
+                            f"PRODUCTION SAFETY: {display_name} resolved "
+                            "to a StubLLMClient. Registered LLM baselines "
+                            "must hold a real provider client — check "
+                            "that the LLM_CLIENT_FACTORIES entry fires "
+                            "and that baseline_kwargs does not override "
+                            "llm_client with a stub."
+                        ),
+                    })
+                    if verbose:
+                        print(
+                            f"[{display_name}] errored — stub client "
+                            "rejected by production safety tripwire"
+                        )
+                    continue
             t0 = time.perf_counter()
             fitted = baseline.fit(train, val)
             fit_seconds = time.perf_counter() - t0
@@ -241,8 +370,10 @@ def annotate_uplift_vs_popularity(
 
 def format_table(rows: List[Dict[str, object]]) -> str:
     """Render a comparison table as a fixed-width string."""
+    # ``name`` is wide enough for the longest expanded LLM baseline
+    # display name (e.g. "FewShot-ICL-Gemini-2.5-Flash").
     cols = [
-        ("name", 18),
+        ("name", 32),
         ("status", 11),
         ("top1", 8),
         ("top5", 8),
