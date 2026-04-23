@@ -3,6 +3,7 @@ numpy>=1.24
 scikit-learn>=1.3
 scipy>=1.11
 anthropic>=0.25
+openai>=1.0
 python-dotenv>=1.0
 jupyter
 notebook
@@ -10,3 +11,4 @@ ipykernel
 matplotlib
 seaborn
 tqdm
+google-genai>=1.51.0
