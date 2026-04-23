@@ -1,9 +1,16 @@
 """Wave 10 end-to-end orchestration driver (design doc §4).
 
 CLI-driven orchestration of the full PO-LEU pipeline. Takes an adapter
-name, a customer budget, a stub/real LLM flag, and an output dir; produces
-a fully materialized training run plus evaluation + interpretability
-reports.
+name, a customer budget, and an output dir; produces a fully materialized
+training run plus evaluation + interpretability reports.
+
+The driver always uses the real Anthropic LLM client and the real
+``sentence-transformers`` encoder. Stub clients used to live behind a
+``--stub-llm`` flag but were removed: they shared the outcomes-cache
+key schema with real calls, which meant a switch from stub to real
+could silently serve stale stub entries into real training. Stubs still
+exist in the codebase (``StubLLMClient``, ``StubEncoder``) for unit
+tests, but the production driver refuses them by construction.
 
 Usage
 -----
@@ -11,10 +18,12 @@ Usage
     python scripts/run_dataset.py \\
         --adapter amazon \\
         --n-customers 100 \\
-        --stub-llm \\
         --n-epochs 1 \\
         --batch-size 32 \\
         --output-dir reports/amazon_smoke
+
+Requires the ``ANTHROPIC_API_KEY`` environment variable and the
+``anthropic`` + ``sentence-transformers`` packages to be installed.
 
 See ``NOTES.md`` ("Wave 10 — glue modules") for the full design contract,
 especially the val/test z_d fit caveat (val/test currently reuses the
@@ -26,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -36,8 +46,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Heavy / optional imports kept lazy inside main() per the Wave-10 brief
-# (anthropic + sentence_transformers are imported only on --real-llm).
+# Heavy / optional imports kept lazy inside main() for ``anthropic`` and
+# ``sentence_transformers`` -- we want a helpful error message (not an
+# ImportError at module load) when those packages are missing.
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import torch  # noqa: E402
@@ -73,20 +84,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "subsample fails we exit with code 1.",
     )
 
-    llm_group = parser.add_mutually_exclusive_group(required=False)
-    llm_group.add_argument(
-        "--stub-llm",
-        dest="stub_llm",
-        action="store_true",
-        help="Use hermetic StubLLMClient + StubEncoder (default).",
-    )
-    llm_group.add_argument(
-        "--real-llm",
-        dest="real_llm",
-        action="store_true",
-        help="Use AnthropicLLMClient + SentenceTransformersEncoder.",
-    )
-
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--config",
@@ -120,6 +117,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Dataset YAML path. Defaults to configs/datasets/<adapter>.yaml.",
+    )
+    parser.add_argument(
+        "--split-mode",
+        choices=["temporal", "cold_start"],
+        default="temporal",
+        help=(
+            "Which split to use. 'temporal' = per-customer time split "
+            "(default; every customer appears in train+val+test). "
+            "'cold_start' = between-customer split (val/test customers "
+            "have no train events — measures generalization to unseen users)."
+        ),
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=None,
+        help="Seed for the cold-start partition. Defaults to --seed.",
     )
     return parser
 
@@ -219,37 +233,75 @@ def _p_reduction_reason(adapter: Any) -> str:
 
 
 def _build_llm_and_encoder(args: argparse.Namespace, config: dict) -> tuple[Any, Any]:
-    """Instantiate the LLM client + sentence encoder.
+    """Instantiate the real LLM client + sentence encoder.
 
-    Stub backends are the default and never import heavy deps. Real
-    backends are imported lazily inside the --real-llm branch so the
-    script can run in environments without anthropic / sentence_transformers.
+    The driver is real-only: stubs used to live behind a ``--stub-llm``
+    flag but shared the outcomes-cache key schema with real calls, which
+    silently fed stale stub entries into real training runs. We now fail
+    loudly and early if any precondition for real clients is unmet:
+
+    * ``ANTHROPIC_API_KEY`` must be set in the environment.
+    * ``anthropic`` and ``sentence_transformers`` must be installed.
+
+    Defense in depth: after instantiation we ``isinstance``-check against
+    the stub classes and raise if either slipped through. This cannot
+    fire under current code, but any future refactor that accidentally
+    routes a stub into production gets caught at driver startup.
     """
-    if args.real_llm:
-        # Lazy imports; see the Wave-10 brief "DO NOT import anthropic or
-        # sentence_transformers at module top level".
-        import os
-
-        from src.outcomes.encode import SentenceTransformersEncoder
-        from src.outcomes.generate import AnthropicLLMClient
-
-        enc_cfg = (config.get("outcomes") or {}).get("encoder") or {}
-        model_id = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-5")
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-
-        llm_client: Any = AnthropicLLMClient(model_id=model_id, api_key=api_key)
-        encoder: Any = SentenceTransformersEncoder(
-            model_id=enc_cfg.get("model_id",
-                                 "sentence-transformers/all-mpnet-base-v2"),
-            max_length=int(enc_cfg.get("max_length", 64)),
-            pooling=enc_cfg.get("pooling", "mean"),
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        sys.stderr.write(
+            "run_dataset.py: ANTHROPIC_API_KEY is not set in the environment; "
+            "refusing to start (driver is real-LLM-only).\n"
         )
-    else:
-        from src.outcomes.encode import StubEncoder
-        from src.outcomes.generate import StubLLMClient
+        sys.exit(2)
 
-        llm_client = StubLLMClient()
-        encoder = StubEncoder(d_e=768)
+    # Lazy import of the real backends so missing deps yield a helpful
+    # message rather than an ImportError at module load.
+    try:
+        import anthropic  # noqa: F401  # type: ignore[import-not-found]
+    except ImportError:
+        sys.stderr.write(
+            "run_dataset.py: the `anthropic` package is required but not "
+            "installed. Install it with `pip install anthropic` (or "
+            "`pip install -e .[llm]`).\n"
+        )
+        sys.exit(2)
+    try:
+        import sentence_transformers  # noqa: F401  # type: ignore[import-not-found]
+    except ImportError:
+        sys.stderr.write(
+            "run_dataset.py: the `sentence_transformers` package is required "
+            "but not installed. Install it with "
+            "`pip install sentence-transformers`.\n"
+        )
+        sys.exit(2)
+
+    from src.outcomes.encode import SentenceTransformersEncoder, StubEncoder
+    from src.outcomes.generate import AnthropicLLMClient, StubLLMClient
+
+    enc_cfg = (config.get("outcomes") or {}).get("encoder") or {}
+    model_id = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+    llm_client: Any = AnthropicLLMClient(model_id=model_id, api_key=api_key)
+    encoder: Any = SentenceTransformersEncoder(
+        model_id=enc_cfg.get("model_id",
+                             "sentence-transformers/all-mpnet-base-v2"),
+        max_length=int(enc_cfg.get("max_length", 64)),
+        pooling=enc_cfg.get("pooling", "mean"),
+    )
+
+    # Defense in depth: refuse stubs even if a future refactor routes one in.
+    if isinstance(llm_client, StubLLMClient):
+        raise RuntimeError(
+            "Production driver refuses StubLLMClient; run_dataset.py is "
+            "real-LLM-only by construction."
+        )
+    if isinstance(encoder, StubEncoder):
+        raise RuntimeError(
+            "Production driver refuses StubEncoder; run_dataset.py is "
+            "real-encoder-only by construction."
+        )
     return llm_client, encoder
 
 
@@ -264,11 +316,6 @@ def main(args: argparse.Namespace) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-
-    # Argparse default handling: when neither --stub-llm nor --real-llm is
-    # given, default to stub.
-    if not args.real_llm:
-        args.stub_llm = True
 
     torch.manual_seed(int(args.seed))
 
@@ -315,10 +362,11 @@ def main(args: argparse.Namespace) -> int:
 
     from src.data.clean import clean_events
     from src.data.state_features import (
+        attach_train_brand_map,
         attach_train_popularity,
         compute_state_features,
     )
-    from src.data.split import temporal_split
+    from src.data.split import cold_start_split, temporal_split
     from src.data.survey_join import join_survey
 
     logger.info("stage: clean_events")
@@ -347,22 +395,46 @@ def main(args: argparse.Namespace) -> int:
         n_events_before_filter,
     )
 
-    # ---- 5. temporal split + popularity --------------------------------
-    logger.info("stage: temporal_split")
-    events = temporal_split(events, adapter.schema)
+    # ---- 5. split + popularity ----------------------------------------
+    split_mode = str(getattr(args, "split_mode", "temporal"))
+    if split_mode == "cold_start":
+        split_seed_raw = getattr(args, "split_seed", None)
+        effective_split_seed = int(
+            split_seed_raw if split_seed_raw is not None else args.seed
+        )
+        logger.info(
+            "stage: cold_start_split (between-customer; split_seed=%d)",
+            effective_split_seed,
+        )
+        events = cold_start_split(
+            events, schema=adapter.schema, seed=effective_split_seed
+        )
+    else:
+        logger.info("stage: temporal_split (per-customer within-customer)")
+        events = temporal_split(events, adapter.schema)
     logger.info("stage: attach_train_popularity")
     events = attach_train_popularity(events)
+    logger.info("stage: attach_train_brand_map")
+    events = attach_train_brand_map(events)
 
     train_events = events[events["split"] == "train"].copy()
 
     # ---- 6. Appendix-C subsample --------------------------------------
-    logger.info("stage: subsample (n_customers=%d)", int(args.n_customers))
+    subsample_method = str(
+        (config.get("subsample") or {}).get("method", "leverage")
+    ).lower()
+    logger.info(
+        "stage: subsample (n_customers=%d, method=%s)",
+        int(args.n_customers),
+        subsample_method,
+    )
     from src.train.loop import try_import_subsample_weights
 
     selected_ids, event_weights = try_import_subsample_weights(
         train_events,
         n_customers=int(args.n_customers),
         seed=int(args.seed),
+        method=subsample_method,
     )
     if selected_ids is None:
         logger.error(
@@ -373,9 +445,28 @@ def main(args: argparse.Namespace) -> int:
 
     selected_id_set = set(selected_ids.tolist() if hasattr(selected_ids, "tolist")
                           else list(selected_ids))
-    events_subset = events[events["customer_id"].isin(selected_id_set)].reset_index(
-        drop=True
+    # Subsample is a TRAIN-customer selection (Appendix-C leverage
+    # scores are computed on train events only). Under cold-start,
+    # val/test customers are never in ``selected_ids``; a blanket
+    # ``.isin`` filter would drop every val/test event.
+    #
+    # Generalized rule: keep an event iff its customer is in
+    # ``selected_id_set`` OR its customer has no train rows at all.
+    # Under temporal split every customer has train rows, so the second
+    # clause is empty and the rule collapses to the pre-fix
+    # ``.isin(selected_id_set)`` behavior exactly. Under cold-start,
+    # val/test customers are precisely "customers with no train rows",
+    # so all their events survive.
+    train_customer_set = set(
+        events.loc[events["split"] == "train", "customer_id"].unique().tolist()
     )
+    val_test_only_customers = (
+        set(events["customer_id"].unique().tolist()) - train_customer_set
+    )
+    keep_customers = selected_id_set | val_test_only_customers
+    events_subset = events[
+        events["customer_id"].isin(keep_customers)
+    ].reset_index(drop=True)
     logger.info(
         "subsample: selected %d customers, %d events total.",
         len(selected_id_set),
@@ -413,18 +504,32 @@ def main(args: argparse.Namespace) -> int:
     surveyed_customers = set(
         persons_raw[persons_id_col].dropna().astype(str).unique().tolist()
     )
+    # Use ALL customers in the subsampled frame (train + val + test), not
+    # just the train-split customers. Under cold-start, val/test
+    # customers have no train events by construction, and filtering on
+    # ``train_customers`` alone would drop every val/test customer's
+    # events from the pipeline. The downstream ``translate_z_d`` call is
+    # already fit-on-train-only (via ``train_events_subset`` below), so
+    # widening here does not introduce leakage.
+    all_customers = set(
+        events_subset["customer_id"].astype(str).unique().tolist()
+    )
     train_customers = set(
         train_events_subset["customer_id"].astype(str).unique().tolist()
     )
-    joint_customers = train_customers & surveyed_customers
+    joint_customers = all_customers & surveyed_customers
     if not joint_customers:
         raise SystemExit(
-            "orphan filter: no customers in both train events and survey "
-            "(train=%d, survey=%d)." % (len(train_customers), len(surveyed_customers))
+            "orphan filter: no customers in both events and survey "
+            "(events=%d, survey=%d)." % (
+                len(all_customers), len(surveyed_customers),
+            )
         )
     logger.info(
-        "orphan filter: %d customers in train∩survey (train=%d, survey=%d).",
+        "orphan filter: %d customers in events∩survey "
+        "(events=%d, train=%d, survey=%d).",
         len(joint_customers),
+        len(all_customers),
         len(train_customers),
         len(surveyed_customers),
     )
@@ -885,7 +990,7 @@ def main(args: argparse.Namespace) -> int:
             "n_train_records": int(len(batch_train)),
             "n_val_records": int(len(batch_val)),
             "n_test_records": int(len(batch_test)),
-            "llm_mode": "real" if args.real_llm else "stub",
+            "llm_mode": "real",
         },
         "train_state": {
             "epoch": int(state.epoch),

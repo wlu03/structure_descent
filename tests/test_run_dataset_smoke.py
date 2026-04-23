@@ -1,9 +1,16 @@
 """Smoke tests for ``scripts/run_dataset.py`` (Wave 10).
 
-One main end-to-end test (``test_stub_llm_end_to_end_on_amazon_fixture``)
+One main end-to-end test (``test_end_to_end_with_sdk_mocks_on_amazon_fixture``)
 and a handful of argparse edge-case tests. The main test is the CI gate:
-it drives the full pipeline with ``--stub-llm`` on the 100-row Amazon
-fixture and asserts every promised artifact lands on disk.
+it drives the full pipeline on the 100-row Amazon fixture with the
+``anthropic`` and ``sentence_transformers`` packages faked at the
+``sys.modules`` level so the real-only driver stays hermetic in CI.
+
+The stub/real mutex that used to live on the driver has been removed --
+``scripts/run_dataset.py`` now *only* builds real clients, by construction.
+Stubs still exist in ``src/outcomes/{generate,encode}.py`` for unit tests
+and for the cache-reuse test at the bottom of this file, but the driver
+refuses them via an ``isinstance`` tripwire at startup.
 
 The test adapter-YAML override technique (writing a tmp copy of
 ``configs/datasets/amazon.yaml`` with ``events.path`` / ``persons.path``
@@ -17,10 +24,12 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import types
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import yaml
 
@@ -56,8 +65,6 @@ def _base_args(tmp_path: Path, dataset_yaml: Path) -> Namespace:
     return Namespace(
         adapter="amazon",
         n_customers=10,
-        stub_llm=True,
-        real_llm=False,
         seed=42,
         config=REPO_ROOT / "configs" / "default.yaml",
         n_epochs=1,
@@ -70,24 +77,157 @@ def _base_args(tmp_path: Path, dataset_yaml: Path) -> Namespace:
 
 
 # --------------------------------------------------------------------------- #
+# Fakes for the anthropic + sentence_transformers SDKs
+# --------------------------------------------------------------------------- #
+
+
+# Canned outcome text families -- copied (shortened) from
+# StubLLMClient._STUB_TEMPLATES so the test's fake LLM produces plausibly
+# varied three-line completions.
+_CANNED_OUTCOMES: tuple[str, ...] = (
+    "I save roughly twelve dollars this month and redirect the difference "
+    "toward groceries without juggling my usual weekend spending plans.",
+    "I sleep noticeably better across the week because the evening routine "
+    "gets simpler and my shoulders stop aching by bedtime.",
+    "I shave about ten minutes off the Tuesday errand loop and reach the "
+    "school pickup line before it wraps around the block.",
+    "I feel quietly proud about the decision tonight and the low hum of "
+    "decision fatigue I usually carry finally eases a little.",
+    "I earn a small round of thanks from my partner at dinner and the "
+    "household logistics feel briefly like a shared project again.",
+)
+
+
+class _FakeAnthropicContentBlock:
+    """Mimics the ``content`` block returned by Anthropic's Messages API."""
+
+    def __init__(self, text: str) -> None:
+        self.type = "text"
+        self.text = text
+
+
+class _FakeAnthropicResponse:
+    """Mimics ``anthropic.types.Message`` enough for AnthropicLLMClient."""
+
+    def __init__(self, text: str, model_id: str) -> None:
+        self.content = [_FakeAnthropicContentBlock(text)]
+        self.stop_reason = "end_turn"
+        self.model = model_id
+        self.usage = None
+
+
+class _FakeMessages:
+    def __init__(self, model_id: str, counter: dict[str, int]) -> None:
+        self._model_id = model_id
+        self._counter = counter
+
+    def create(self, **kwargs: Any) -> _FakeAnthropicResponse:
+        # Rotate through canned outcomes deterministically; three-line
+        # completion so parse_completion accepts K<=3 without padding.
+        self._counter["n"] = self._counter.get("n", 0) + 1
+        i = self._counter["n"] % len(_CANNED_OUTCOMES)
+        lines = [
+            _CANNED_OUTCOMES[i],
+            _CANNED_OUTCOMES[(i + 1) % len(_CANNED_OUTCOMES)],
+            _CANNED_OUTCOMES[(i + 2) % len(_CANNED_OUTCOMES)],
+        ]
+        return _FakeAnthropicResponse("\n".join(lines), self._model_id)
+
+
+class _FakeAnthropicClient:
+    def __init__(self, api_key: str | None = None, **_: Any) -> None:
+        self._api_key = api_key
+        self._model_id = "fake-sonnet"
+        self._counter: dict[str, int] = {"n": 0}
+        self.messages = _FakeMessages(self._model_id, self._counter)
+
+
+class _FakeBadRequestError(Exception):
+    """Minimal stand-in for ``anthropic.BadRequestError``."""
+
+
+def _build_fake_anthropic_module() -> types.ModuleType:
+    mod = types.ModuleType("anthropic")
+    mod.Anthropic = _FakeAnthropicClient  # type: ignore[attr-defined]
+    mod.BadRequestError = _FakeBadRequestError  # type: ignore[attr-defined]
+    return mod
+
+
+class _FakeSentenceTransformer:
+    """Mimics the subset of sentence_transformers.SentenceTransformer the encoder uses."""
+
+    def __init__(self, model_id: str, device: str | None = None) -> None:
+        self.model_id = model_id
+        self.device = device
+        self.max_seq_length = 64
+        self._d_e = 768
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self._d_e
+
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        batch_size: int = 64,
+        convert_to_numpy: bool = True,
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = False,
+    ) -> np.ndarray:
+        # Deterministic canned embedding: hash each text to a seed, draw
+        # gaussians, L2-normalize. Matches the real client's shape + norm
+        # contract exactly.
+        import hashlib
+
+        out = np.zeros((len(texts), self._d_e), dtype=np.float32)
+        for i, t in enumerate(texts):
+            digest = hashlib.blake2b(
+                t.encode("utf-8"), digest_size=8
+            ).digest()
+            seed = int.from_bytes(digest, "big", signed=False)
+            rng = np.random.default_rng(seed)
+            vec = rng.standard_normal(self._d_e).astype(np.float32)
+            norm = float(np.linalg.norm(vec))
+            if norm > 0.0:
+                vec /= norm
+            out[i] = vec
+        return out
+
+
+def _build_fake_sentence_transformers_module() -> types.ModuleType:
+    mod = types.ModuleType("sentence_transformers")
+    mod.SentenceTransformer = _FakeSentenceTransformer  # type: ignore[attr-defined]
+    return mod
+
+
+@pytest.fixture
+def mocked_llm_sdks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install fake ``anthropic`` + ``sentence_transformers`` into sys.modules.
+
+    Installing the fakes BEFORE the driver's lazy imports means
+    ``AnthropicLLMClient`` / ``SentenceTransformersEncoder`` resolve to
+    them transparently. The driver's ``isinstance`` tripwire against
+    ``StubLLMClient`` / ``StubEncoder`` still passes because the fakes
+    are neither.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-test-key")
+    monkeypatch.setitem(
+        sys.modules, "anthropic", _build_fake_anthropic_module()
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        _build_fake_sentence_transformers_module(),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Argparse edge cases
 # --------------------------------------------------------------------------- #
 
 
-def test_argparse_rejects_both_stub_and_real():
-    """--stub-llm and --real-llm are mutually exclusive → SystemExit."""
-    from scripts.run_dataset import _build_arg_parser
-
-    parser = _build_arg_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            ["--adapter", "amazon", "--n-customers", "10",
-             "--stub-llm", "--real-llm"]
-        )
-
-
 def test_argparse_requires_adapter():
-    """Missing --adapter → SystemExit."""
+    """Missing --adapter --> SystemExit."""
     from scripts.run_dataset import _build_arg_parser
 
     parser = _build_arg_parser()
@@ -95,20 +235,50 @@ def test_argparse_requires_adapter():
         parser.parse_args(["--n-customers", "10"])
 
 
-def test_argparse_defaults_to_stub_llm():
-    """Neither flag supplied → stub is the default at argparse layer."""
+def test_argparse_rejects_stub_llm_flag():
+    """--stub-llm is gone; argparse must reject it."""
     from scripts.run_dataset import _build_arg_parser
 
     parser = _build_arg_parser()
-    ns = parser.parse_args(["--adapter", "amazon", "--n-customers", "10"])
-    # Neither flag is set at argparse layer (both False); main() upgrades
-    # stub_llm=True when neither is explicitly truthy.
-    assert ns.stub_llm is False
-    assert ns.real_llm is False
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--adapter", "amazon", "--n-customers", "10", "--stub-llm"]
+        )
+
+
+def test_argparse_rejects_real_llm_flag():
+    """--real-llm is gone too; argparse must reject it."""
+    from scripts.run_dataset import _build_arg_parser
+
+    parser = _build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--adapter", "amazon", "--n-customers", "10", "--real-llm"]
+        )
+
+
+def test_help_output_does_not_mention_stub_or_real():
+    """--help text mentions neither --stub-llm nor --real-llm."""
+    from scripts.run_dataset import _build_arg_parser
+
+    parser = _build_arg_parser()
+    help_text = parser.format_help()
+    assert "--stub-llm" not in help_text
+    assert "--real-llm" not in help_text
+
+
+def test_missing_api_key_exits_early(monkeypatch: pytest.MonkeyPatch):
+    """Running the driver without ANTHROPIC_API_KEY exits with code 2."""
+    from scripts.run_dataset import _build_llm_and_encoder
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        _build_llm_and_encoder(Namespace(), {})
+    assert excinfo.value.code == 2
 
 
 # --------------------------------------------------------------------------- #
-# Main end-to-end smoke (stub LLM)
+# Main end-to-end smoke (SDK-mocked)
 # --------------------------------------------------------------------------- #
 
 
@@ -118,12 +288,22 @@ def test_argparse_defaults_to_stub_llm():
     or not AMAZON_YAML.exists(),
     reason="Amazon fixtures / config not available",
 )
-def test_stub_llm_end_to_end_on_amazon_fixture(tmp_path: Path, caplog):
-    """End-to-end stub-LLM run on the 100-row Amazon fixture.
+def test_end_to_end_with_sdk_mocks_on_amazon_fixture(
+    tmp_path: Path, caplog, mocked_llm_sdks
+):
+    """End-to-end run on the 100-row Amazon fixture with mocked SDKs.
+
+    The ``anthropic`` and ``sentence_transformers`` packages are replaced
+    at ``sys.modules`` level by fakes that return canned outcomes / canned
+    embeddings. The driver still builds the REAL ``AnthropicLLMClient`` +
+    ``SentenceTransformersEncoder`` -- its ``isinstance`` tripwire passes
+    because the fakes are neither stub classes. The test stays hermetic:
+    no network calls, no real model downloads.
 
     Asserts exit code 0, the full set of written reports, finite NLL in
     ``metrics.json``, finite ``train_loss``/``val_nll`` in
-    ``smoke_summary.json``, and at least one INFO log line.
+    ``smoke_summary.json``, ``llm_mode == "real"``, and at least one INFO
+    log line.
     """
     from scripts.run_dataset import main
 
@@ -154,7 +334,6 @@ def test_stub_llm_end_to_end_on_amazon_fixture(tmp_path: Path, caplog):
     for field in ("top1", "top5", "mrr_val", "nll_val",
                   "aic_val", "bic_val"):
         assert field in metrics, f"metrics.json missing {field!r}"
-        # NLL / AIC / BIC must be finite.
     assert _isfinite(metrics["nll_val"]), "nll_val must be finite"
 
     # Wave-11 diagnostics: effective_p + regularizers_active in metrics.json.
@@ -195,6 +374,9 @@ def test_stub_llm_end_to_end_on_amazon_fixture(tmp_path: Path, caplog):
     assert ts["val_nll"] is not None and _isfinite(ts["val_nll"]), (
         "train_state.val_nll must be a finite number"
     )
+
+    # llm_mode is now a hard-coded constant.
+    assert summary["config"]["llm_mode"] == "real"
 
     # Wave-11 diagnostics mirrored in smoke_summary.json.
     for field in ("effective_p", "canonical_p", "p_is_dataset_dependent",
@@ -237,20 +419,17 @@ def test_stub_llm_end_to_end_uses_cache_on_second_run(
 ):
     """Outcomes / embeddings caches persist; second assemble_batch hits cache only.
 
-    The brief-spec "run main twice" path is hostile to the Appendix-C
-    subsample's residual sklearn.KMeans non-determinism — two runs under
-    the same seed can pick slightly different customer subsets when BLAS
-    threading has been warmed up by an earlier import, so cache keys
-    diverge and the second run still makes LLM calls. This test
-    therefore directly exercises the cache wiring that ``main()`` threads
-    into :func:`src.data.batching.assemble_batch`: same records, shared
+    Directly exercises the cache wiring that ``main()`` threads into
+    :func:`src.data.batching.assemble_batch`: same records, shared
     :class:`OutcomesCache` / :class:`EmbeddingsCache`, counting-wrapped
     stub LLM. The second assemble must produce zero additional LLM
     ``generate()`` calls because all ``(customer_id, asin, seed,
     prompt_version)`` keys already sit in the outcomes cache.
-    """
-    import numpy as np
 
+    This test imports :class:`StubLLMClient` directly from
+    :mod:`src.outcomes.generate`; it does NOT go through the driver,
+    which is real-only.
+    """
     from src.data.batching import assemble_batch
     from src.outcomes.cache import EmbeddingsCache, OutcomesCache
     from src.outcomes.encode import StubEncoder

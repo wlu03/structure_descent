@@ -44,12 +44,20 @@ def _build_records_from_dataset(
     n_customers: int,
     seed: int,
     min_events_per_customer: int,
+    split_mode: str = "temporal",
+    split_seed: int | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Load + clean + split + subsample + build_choice_sets.
 
     Mirrors the Wave-10 driver (``scripts/run_dataset.py``) up to the
     point where per-event records are emitted, then splits those
-    records into (train, val, test) by the temporal ``split`` column.
+    records into (train, val, test) by the ``split`` column.
+
+    ``split_mode`` selects between the per-customer temporal split (the
+    default; every customer appears in train+val+test) and the
+    between-customer cold-start split (val/test customers have no
+    training events). Under cold-start, ``split_seed`` seeds the
+    customer-level partition; when ``None`` it falls back to ``seed``.
     """
     import pandas as pd
 
@@ -57,8 +65,12 @@ def _build_records_from_dataset(
     from src.data.choice_sets import build_choice_sets
     from src.data.clean import clean_events
     from src.data.context_string import extract_extra_fields_from_row
-    from src.data.split import temporal_split
-    from src.data.state_features import attach_train_popularity, compute_state_features
+    from src.data.split import cold_start_split, temporal_split
+    from src.data.state_features import (
+        attach_train_brand_map,
+        attach_train_popularity,
+        compute_state_features,
+    )
     from src.data.survey_join import join_survey
     from src.train.loop import try_import_subsample_weights
 
@@ -75,8 +87,22 @@ def _build_records_from_dataset(
     keep = set(counts[counts >= int(min_events_per_customer)].index)
     events = events[events["customer_id"].isin(keep)].reset_index(drop=True)
 
-    events = temporal_split(events, adapter.schema)
+    if split_mode == "cold_start":
+        effective_split_seed = int(
+            split_seed if split_seed is not None else seed
+        )
+        logger.info(
+            "split_mode=cold_start (between-customer; split_seed=%d)",
+            effective_split_seed,
+        )
+        events = cold_start_split(
+            events, schema=adapter.schema, seed=effective_split_seed
+        )
+    else:
+        logger.info("split_mode=temporal (per-customer within-customer)")
+        events = temporal_split(events, adapter.schema)
     events = attach_train_popularity(events)
+    events = attach_train_brand_map(events)
 
     train_events = events[events["split"] == "train"].copy()
 
@@ -84,12 +110,43 @@ def _build_records_from_dataset(
         train_events, n_customers=int(n_customers), seed=int(seed)
     )
     if selected_ids is not None:
-        events = events[events["customer_id"].isin(set(selected_ids))].reset_index(
-            drop=True
+        # Subsample is a TRAIN-customer selection (Appendix-C leverage
+        # scores are computed on train events only). Under cold-start,
+        # val/test customers never appear in ``selected_ids``; a blanket
+        # ``.isin`` filter would therefore drop every val/test event.
+        #
+        # Generalized rule: keep an event iff its customer is in
+        # ``selected_set`` OR its customer has no train rows at all.
+        # Under temporal split every customer has train rows, so the
+        # second clause is empty and the rule collapses to the pre-fix
+        # ``.isin(selected_set)`` behavior exactly. Under cold-start,
+        # val/test customers are precisely "customers with no train
+        # rows", so all their events survive.
+        selected_set = set(
+            selected_ids.tolist() if hasattr(selected_ids, "tolist")
+            else list(selected_ids)
         )
+        train_customer_set = set(
+            events.loc[events["split"] == "train", "customer_id"]
+            .unique()
+            .tolist()
+        )
+        val_test_only_customers = (
+            set(events["customer_id"].unique().tolist()) - train_customer_set
+        )
+        keep_customers = selected_set | val_test_only_customers
+        events = events[
+            events["customer_id"].isin(keep_customers)
+        ].reset_index(drop=True)
 
-    # Orphan filter: keep only customers that appear in BOTH train events
-    # and the survey (mirrors run_dataset.py stage 8).
+    # Orphan filter: keep only customers that appear in the survey
+    # (mirrors run_dataset.py stage 8). ``joint_customers`` must span ALL
+    # customers in ``events`` (not just train-split customers) — under
+    # cold-start, train_customers is a STRICT SUBSET of all customers,
+    # and restricting the filter to that subset would drop every val/test
+    # customer's events. The downstream ``translate_z_d`` call already
+    # fits on a train-only subset (see ``train_events_subset`` below),
+    # so widening here does not introduce leakage.
     persons_id_col = adapter.schema.persons_id_column
     if persons_id_col not in persons_raw.columns:
         raise SystemExit(
@@ -99,17 +156,14 @@ def _build_records_from_dataset(
     surveyed_customers = set(
         persons_raw[persons_id_col].dropna().astype(str).unique().tolist()
     )
-    train_customers = set(
-        events.loc[events["split"] == "train", "customer_id"]
-        .astype(str)
-        .unique()
-        .tolist()
+    all_customers = set(
+        events["customer_id"].astype(str).unique().tolist()
     )
-    joint_customers = train_customers & surveyed_customers
+    joint_customers = all_customers & surveyed_customers
     if not joint_customers:
         raise SystemExit(
-            "orphan filter: no customers in both train events and survey "
-            f"(train={len(train_customers)}, survey={len(surveyed_customers)})."
+            "orphan filter: no customers in both events and survey "
+            f"(events={len(all_customers)}, survey={len(surveyed_customers)})."
         )
     events = events[
         events["customer_id"].astype(str).isin(joint_customers)
@@ -253,6 +307,32 @@ def main() -> int:
         default=None,
         help="Path to a .npz carrying PO-LEU's test-set logits / c_star / n_params.",
     )
+    parser.add_argument(
+        "--split-mode",
+        choices=["temporal", "cold_start"],
+        default="temporal",
+        help=(
+            "Which split to use. 'temporal' = per-customer time split "
+            "(default; every customer appears in train+val+test). "
+            "'cold_start' = between-customer split (val/test customers "
+            "have no train events — measures generalization to unseen users)."
+        ),
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=None,
+        help="Seed for the cold-start partition. Defaults to --seed.",
+    )
+    parser.add_argument(
+        "--allow-empty-val-fallback",
+        action="store_true",
+        help=(
+            "Legacy paranoid-safe behavior: if the val split is empty, "
+            "fill it with a slice of the train records instead of "
+            "failing. Default: disabled (fail loud)."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -280,6 +360,10 @@ def main() -> int:
             n_customers=int(args.n_customers),
             seed=int(args.seed),
             min_events_per_customer=int(args.min_events_per_customer),
+            split_mode=str(args.split_mode),
+            split_seed=(
+                int(args.split_seed) if args.split_seed is not None else None
+            ),
         )
         logger.info(
             "records: %d train / %d val / %d test",
@@ -293,11 +377,25 @@ def main() -> int:
             return 2
 
         train = records_to_baseline_batch(train_recs)
-        val = (
-            records_to_baseline_batch(val_recs)
-            if val_recs
-            else records_to_baseline_batch(train_recs[: max(1, len(train_recs) // 5)])
-        )
+        if val_recs:
+            val = records_to_baseline_batch(val_recs)
+        elif args.allow_empty_val_fallback:
+            logger.warning(
+                "val records empty; --allow-empty-val-fallback is set, "
+                "filling val with a slice of train (legacy behavior)."
+            )
+            val = records_to_baseline_batch(
+                train_recs[: max(1, len(train_recs) // 5)]
+            )
+        else:
+            logger.error(
+                "val set empty — check dataset has enough per-customer "
+                "events (split_mode=%s, train=%d, test=%d). Pass "
+                "--allow-empty-val-fallback to restore the legacy "
+                "fill-from-train behavior.",
+                args.split_mode, len(train_recs), len(test_recs),
+            )
+            raise SystemExit(2)
         test = records_to_baseline_batch(test_recs)
 
     rows: List[dict[str, object]] = run_all_baselines(
