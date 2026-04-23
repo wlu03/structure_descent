@@ -25,6 +25,7 @@ transformers).
 from __future__ import annotations
 
 import logging
+from bisect import bisect_left
 from typing import TYPE_CHECKING, List
 
 import numpy as np
@@ -35,6 +36,78 @@ from src.data.person_features import (
     fit_person_features,
     transform_person_features,
 )
+
+# Max characters retained per recent-purchase title when building the
+# per-event ``recent_purchases`` list (see ``build_choice_sets``). Amazon
+# titles routinely run 200+ characters; truncating keeps c_d readable
+# and within a sensible prompt budget.
+_RECENT_PURCHASE_TITLE_MAX_CHARS = 80
+
+# Raw bucket codes / raw column names that must not appear anywhere in
+# the rendered ``c_d``. ``paraphrase_rules_check`` in
+# ``context_string.py`` scans the whole rendered string for these
+# substrings, so Amazon titles that happen to contain "65+" (e.g.
+# "(165+ pcs)"), "25-34", or the word "education" (e.g. "Research
+# methods in education") would trip it.
+#
+# We scrub them out of recent-purchase titles before handing the list
+# to ``build_context_string``. The paraphrase check is case-sensitive
+# (it does plain ``in`` substring matching), so we only scrub the
+# lowercase form for raw column names (which are always lowercase
+# identifiers). Ordering matters — longer codes are replaced before
+# shorter ones so e.g. ``"150k+"`` is handled before ``"65+"``.
+_RAW_BUCKET_SUBSTRINGS_TO_SCRUB: tuple[str, ...] = (
+    "100-150k",
+    "150k+",
+    "25-50k",
+    "50-100k",
+    "<25k",
+    "18-24",
+    "25-34",
+    "35-44",
+    "45-54",
+    "55-64",
+    "65+",
+    # Raw canonical column names flagged by paraphrase_rules_check.
+    "age_bucket",
+    "income_bucket",
+    "household_size",
+    "has_kids",
+    "city_size",
+    "education",
+    "health_rating",
+    "risk_tolerance",
+    "purchase_frequency",
+    "novelty_rate",
+)
+
+
+def _scrub_title_for_c_d(title: str) -> str:
+    """Truncate and scrub a raw event title for safe inclusion in ``c_d``.
+
+    Two guarantees:
+
+    1. Length is capped at ``_RECENT_PURCHASE_TITLE_MAX_CHARS``.
+    2. None of the ``_RAW_BUCKET_SUBSTRINGS_TO_SCRUB`` codes appear
+       in the result (the renderer's paraphrase check would raise
+       ``AssertionError`` otherwise; Amazon titles routinely include
+       fragments like "(165+ pcs)" that contain "65+" as a substring).
+
+    The scrub replaces each hit with a single space; collapsed whitespace
+    is not re-flowed (callers comma-join the returned strings).
+    """
+    if title is None:
+        return ""
+    s = str(title)
+    if len(s) > _RECENT_PURCHASE_TITLE_MAX_CHARS:
+        s = s[:_RECENT_PURCHASE_TITLE_MAX_CHARS]
+    for code in _RAW_BUCKET_SUBSTRINGS_TO_SCRUB:
+        if code in s:
+            s = s.replace(code, " ")
+    # Collapse any runs of whitespace the scrub may have introduced.
+    if "  " in s:
+        s = " ".join(s.split())
+    return s.strip()
 
 if TYPE_CHECKING:
     # Wave-9 sibling module; forward-referenced here so the import stays
@@ -61,6 +134,8 @@ def build_choice_sets(
     popularity_col: str = "popularity",
     split_column: str = "split",
     customer_to_extras: dict | None = None,
+    recent_purchases_window_days: int = 30,
+    max_recent_purchases: int = 5,
 ) -> list[dict]:
     """Return per-event choice-set records with ``z_d`` and ``c_d`` attached.
 
@@ -92,6 +167,24 @@ def build_choice_sets(
     For ``n_resamples > 1``, ``choice_asins`` / ``chosen_idx`` /
     ``alt_texts`` are length-K *lists of lists* (matching the v1
     ``choice_asins`` shape dichotomy).
+
+    Parameters (selected)
+    ---------------------
+    recent_purchases_window_days : int, default 30
+        Width of the lookback window used to populate the per-event
+        ``recent_purchases`` clause in ``c_d``. For each event at date
+        ``d_t`` the customer's events with order_date in
+        ``[d_t - window_days, d_t)`` (strict ``<`` on both ends) are
+        considered. Matches the §2.2 example ("last 30 days").
+    max_recent_purchases : int, default 5
+        Cap on how many prior-event titles feed into the
+        ``recent_purchases`` clause. Keeps c_d compact; 3-5 is the
+        empirical sweet spot. Most-recent-first ordering — when there
+        are more than ``max_recent_purchases`` eligible prior events
+        we take the last ``max_recent_purchases`` of them and pass
+        them in chronological order (oldest of the kept slice first,
+        most-recent last) so the rendered sentence reads like a short
+        timeline.
 
     Raises
     ------
@@ -166,21 +259,18 @@ def build_choice_sets(
         cid: z_d_matrix[i] for i, cid in enumerate(customer_ids_zd)
     }
 
-    # c_d: render once per customer via build_context_string with the
-    # adapter-declared suppress_fields. When the caller supplies
-    # ``customer_to_extras`` (Wave-11 enrichment), pass that customer's
-    # extras through as the ``extra_fields`` kwarg — keys
-    # ``{gender, life_event, amazon_frequency}`` ride alongside c_d but
-    # never touch z_d.
+    # c_d: Wave-12 per-event render. Previously cached as a single
+    # string per customer; now built INSIDE the per-event loop so each
+    # event's ``recent_purchases`` clause can reflect that customer's
+    # prior events in the ``recent_purchases_window_days`` window (no
+    # future leakage; see the per-event loop below for the binary-
+    # search cutoff). We still cache the per-customer persons row +
+    # extras here to avoid re-looking-up those dicts on every event.
     extras_by_cid = customer_to_extras or {}
-    customer_to_cd: dict[object, str] = {}
-    for _, row in persons_canonical.iterrows():
-        cid = row["customer_id"]
-        customer_to_cd[cid] = build_context_string(
-            row.to_dict(),
-            suppress_fields=suppress,
-            extra_fields=extras_by_cid.get(cid),
-        )
+    customer_to_row: dict[object, dict] = {
+        row["customer_id"]: row.to_dict()
+        for _, row in persons_canonical.iterrows()
+    }
 
     # --------------------------------------------------------------- #
     # asin_lookup: for each ASIN, grab the canonical event-row fields
@@ -434,6 +524,45 @@ def build_choice_sets(
         else np.array([""] * n_events, dtype=object)
     )
 
+    # --------------------------------------------------------------- #
+    # Per-customer sorted event index for the per-event
+    # ``recent_purchases`` lookup in c_d (Wave-12 per-event c_d).
+    #
+    # For each customer we keep two parallel lists sorted by
+    # (order_date, asin): the numpy datetime64[ns] dates (for bisect)
+    # and the event titles. The asin tiebreaker ensures deterministic
+    # ordering when multiple prior purchases land on the same day.
+    #
+    # Index shape: dict[customer_id, tuple[list[np.datetime64[ns]],
+    #                                      list[str]]] keyed in
+    # chronological order.
+    # --------------------------------------------------------------- #
+    asin_arr_for_history = df["asin"].to_numpy()
+    sort_triplets: List[tuple] = []
+    for idx in range(n_events):
+        # Keep (customer_id, order_date, asin, title-scrubbed) and
+        # sort downstream on (order_date, asin) within each customer
+        # to get deterministic same-day ordering.
+        title_str = _scrub_title_for_c_d(titles_arr[idx])
+        sort_triplets.append(
+            (
+                customer_ids[idx],
+                order_dates_ns[idx],
+                asin_arr_for_history[idx],
+                title_str,
+            )
+        )
+    # Stable sort by (customer_id, order_date, asin) so per-customer
+    # slices come out in chronological, tie-broken order.
+    sort_triplets.sort(key=lambda t: (t[0], t[1], t[2]))
+    customer_history: dict[object, tuple[list, list]] = {}
+    for cid, d_ns, _asin, title in sort_triplets:
+        dates, titles = customer_history.setdefault(cid, ([], []))
+        dates.append(d_ns)
+        titles.append(title if title else "unknown item")
+    # Freeze window width as a numpy timedelta for the bisect cutoff.
+    _window_td = np.timedelta64(int(recent_purchases_window_days), "D")
+
     def _render_alt_texts(asins: list, chosen_asin, event_row_alt: dict) -> list[dict]:
         out: list[dict] = []
         for a in asins:
@@ -612,6 +741,37 @@ def build_choice_sets(
             dedup_fallback_field = list(dedup_fallback_per_k)
 
         cid = customer_ids[i]
+
+        # --- Per-event recent_purchases slice (Wave-12 per-event c_d) #
+        # Find the customer's events with order_date in
+        # [ev_date - window, ev_date) — strict < on both ends so the
+        # current event and any future events are excluded. Within the
+        # slice we take the last ``max_recent_purchases`` (most-recent
+        # chronologically), keeping them in order so the rendered
+        # "Recent purchases" reads as oldest-to-newest.
+        event_recent: list[str] | None = None
+        hist = customer_history.get(cid)
+        if hist is not None:
+            hist_dates, hist_titles = hist
+            # hi = first index with order_date >= ev_date; the current
+            # event itself sits at hi by strict-less semantics.
+            hi = bisect_left(hist_dates, ev_date)
+            # lo = first index with order_date >= ev_date - window.
+            lo = bisect_left(hist_dates, ev_date - _window_td)
+            if hi > lo:
+                slice_titles = hist_titles[lo:hi]
+                if max_recent_purchases > 0 and len(slice_titles) > max_recent_purchases:
+                    slice_titles = slice_titles[-max_recent_purchases:]
+                if slice_titles:
+                    event_recent = list(slice_titles)
+
+        event_c_d = build_context_string(
+            customer_to_row[cid],
+            suppress_fields=suppress,
+            extra_fields=extras_by_cid.get(cid),
+            recent_purchases=event_recent,
+        )
+
         record = {
             # v1 keys
             "customer_id": cid,
@@ -629,7 +789,7 @@ def build_choice_sets(
             },
             # v2 additions
             "z_d": customer_to_zd[cid],
-            "c_d": customer_to_cd[cid],
+            "c_d": event_c_d,
             "alt_texts": alt_texts,
         }
         records.append(record)

@@ -53,7 +53,7 @@ USER_BLOCK_TEMPLATE: str = (
     "Generate K={K} outcome sentences."
 )
 
-PROMPT_VERSION: str = "v1"
+PROMPT_VERSION: str = "v2"
 
 # Required keys for the ``alt`` mapping passed to :func:`build_user_block`.
 _REQUIRED_ALT_FIELDS: tuple[str, ...] = (
@@ -132,13 +132,23 @@ def build_user_block(
             + f"; required keys are {list(_REQUIRED_ALT_FIELDS)}"
         )
 
+    # Any keys in ``alt`` beyond the required four (e.g. ``brand``,
+    # ``is_repeat``, ``state`` added by the Wave-11 richer alt_text)
+    # are merged into ``optional_fields`` so they render as
+    # "- key: value" lines after the canonical four. An explicit
+    # ``optional_fields`` kwarg wins on key collision.
+    extras_from_alt = {
+        k: alt[k] for k in alt.keys() if k not in _REQUIRED_ALT_FIELDS
+    }
+    if optional_fields:
+        extras_from_alt.update(dict(optional_fields))
     return USER_BLOCK_TEMPLATE.format(
         c_d=c_d,
         title=alt["title"],
         category=alt["category"],
         price=alt["price"],
         popularity_rank=alt["popularity_rank"],
-        optional_fields=_render_optional_fields(optional_fields),
+        optional_fields=_render_optional_fields(extras_from_alt),
         K=K,
     )
 

@@ -542,3 +542,162 @@ def test_amazon_fixture_small_end_to_end():
     assert tuple(batch.c_star.shape) == (N,)
     assert torch.isfinite(batch.z_d).all().item()
     assert not torch.isnan(batch.E).any().item()
+
+
+# --------------------------------------------------------------------------- #
+# Parallelization of the per-alternative LLM loop
+# --------------------------------------------------------------------------- #
+
+
+def test_parallel_assemble_produces_identical_output():
+    """Serial (max_concurrent=1) vs parallel (max_concurrent=8) must
+    yield bit-identical AssembledBatch tensors for the same inputs."""
+    records = _make_records(N=6, J=4, p=26)
+
+    # Fresh encoder + client instances for each run so there's no shared
+    # mutable state that could leak between calls.
+    batch_serial = assemble_batch(
+        records,
+        adapter=None,
+        llm_client=StubLLMClient(),
+        encoder=StubEncoder(d_e=64),
+        outcomes_cache=None,
+        embeddings_cache=None,
+        K=3,
+        seed=7,
+        max_concurrent_llm_calls=1,
+    )
+    batch_parallel = assemble_batch(
+        records,
+        adapter=None,
+        llm_client=StubLLMClient(),
+        encoder=StubEncoder(d_e=64),
+        outcomes_cache=None,
+        embeddings_cache=None,
+        K=3,
+        seed=7,
+        max_concurrent_llm_calls=8,
+    )
+
+    # Tensors: bit-identical.
+    assert torch.equal(batch_serial.z_d, batch_parallel.z_d)
+    assert torch.equal(batch_serial.E, batch_parallel.E)
+    assert torch.equal(batch_serial.c_star, batch_parallel.c_star)
+    assert torch.equal(batch_serial.omega, batch_parallel.omega)
+    assert torch.equal(batch_serial.prices, batch_parallel.prices)
+
+    # Diagnostics: outcome strings also equal, in the same (i, j, k) order.
+    assert batch_serial.customer_ids == batch_parallel.customer_ids
+    assert batch_serial.chosen_asins == batch_parallel.chosen_asins
+    assert batch_serial.outcomes_nested == batch_parallel.outcomes_nested
+
+
+class _ThreadSafeCountingLLMClient:
+    """Thread-safe tally-counting wrapper around StubLLMClient."""
+
+    def __init__(self) -> None:
+        self._inner = StubLLMClient()
+        self._lock = __import__("threading").Lock()
+        self.n_calls = 0
+
+    def generate(self, *args: Any, **kwargs: Any) -> GenerationResult:
+        with self._lock:
+            self.n_calls += 1
+        return self._inner.generate(*args, **kwargs)
+
+
+def test_parallel_assemble_calls_count():
+    """With 32 records x J=10 and K=3, the total number of LLM-client
+    ``generate`` calls must equal N*J = 320 regardless of parallelism."""
+    N, J = 32, 10
+    records = _make_records(N=N, J=J, p=26)
+
+    llm = _ThreadSafeCountingLLMClient()
+    assemble_batch(
+        records,
+        adapter=None,
+        llm_client=llm,
+        encoder=StubEncoder(d_e=64),
+        outcomes_cache=None,
+        embeddings_cache=None,
+        K=3,
+        seed=0,
+        max_concurrent_llm_calls=16,
+    )
+    assert llm.n_calls == N * J
+
+
+def test_parallel_cache_threadsafe(tmp_path: Path):
+    """Submit many concurrent writes to an OutcomesCache from 8 threads
+    through the _LockedOutcomesCache shim and assert every write lands
+    in the cache and the SQLite file stays coherent."""
+    import concurrent.futures
+
+    from src.data.batching import _LockedOutcomesCache
+    from src.outcomes.cache import OutcomesCache
+
+    cache = OutcomesCache(tmp_path / "out.sqlite")
+    locked = _LockedOutcomesCache(cache)
+
+    n_writes = 50
+
+    def _writer(idx: int) -> None:
+        locked.put_outcomes(
+            f"C{idx:03d}",
+            f"A{idx:03d}",
+            0,
+            "v1-K3",
+            [f"outcome-{idx}-0", f"outcome-{idx}-1", f"outcome-{idx}-2"],
+            {"seed": 0, "model_id": "stub-v1"},
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(_writer, i) for i in range(n_writes)]
+        for f in concurrent.futures.as_completed(futs):
+            f.result()  # propagate any exception
+
+    # All 50 entries must have landed.
+    for i in range(n_writes):
+        got = locked.get_outcomes(f"C{i:03d}", f"A{i:03d}", 0, "v1-K3")
+        assert got is not None, f"entry {i} missing"
+        assert got["outcomes"] == [
+            f"outcome-{i}-0",
+            f"outcome-{i}-1",
+            f"outcome-{i}-2",
+        ]
+    cache.close()
+
+
+def test_parallel_error_propagates():
+    """A RuntimeError raised inside a worker must surface from
+    assemble_batch (no silent swallow)."""
+    import threading
+
+    records = _make_records(N=4, J=5, p=26)  # N*J = 20 calls
+
+    class _FailingClient:
+        def __init__(self) -> None:
+            self._inner = StubLLMClient()
+            self._lock = threading.Lock()
+            self._count = 0
+
+        def generate(self, *args: Any, **kwargs: Any) -> GenerationResult:
+            with self._lock:
+                self._count += 1
+                which = self._count
+            if which == 5:
+                raise RuntimeError("synthetic failure on 5th call")
+            return self._inner.generate(*args, **kwargs)
+
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        assemble_batch(
+            records,
+            adapter=None,
+            llm_client=_FailingClient(),
+            encoder=StubEncoder(d_e=64),
+            outcomes_cache=None,
+            embeddings_cache=None,
+            K=3,
+            seed=0,
+            max_concurrent_llm_calls=4,
+        )

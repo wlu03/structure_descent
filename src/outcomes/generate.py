@@ -292,6 +292,11 @@ class AnthropicLLMClient:
         self._api_key = resolved_key
         self._client = anthropic.Anthropic(api_key=resolved_key)
 
+    # Split marker used to cleave the user message into a cacheable prefix
+    # (CONTEXT + c_d) and a per-alternative suffix. Kept as a class-level
+    # constant so tests can assert against the exact string.
+    _USER_SPLIT_MARKER: str = "\n\nALTERNATIVE:"
+
     def generate(
         self,
         messages: list[dict],
@@ -312,11 +317,21 @@ class AnthropicLLMClient:
         currently expose a seed parameter; callers upstream still see seed
         effects because the outcomes cache keys on ``seed`` directly
         (§3.4).
+
+        Prompt caching (Anthropic Messages API, 2025): we mark the frozen
+        system prompt and the ``CONTEXT`` + ``c_d`` prefix of the user
+        message with ``cache_control={"type": "ephemeral"}`` so Anthropic
+        caches them server-side for the 5-minute TTL. The per-alternative
+        suffix (``ALTERNATIVE:`` + trailing metadata + ``Generate K=``)
+        is left uncached since it churns on every call. If a server
+        rejects ``cache_control`` (older model / new error message), we
+        fall back to the plain-string shape transparently — see the
+        ``anthropic.BadRequestError`` branch below.
         """
         # Import defensively in case the constructor path was bypassed
         # (e.g. subclassing with a custom client factory).
         try:
-            import anthropic  # type: ignore[import-not-found]  # noqa: F401
+            import anthropic  # type: ignore[import-not-found]
         except ImportError as exc:  # pragma: no cover
             raise ImportError(
                 "AnthropicLLMClient requires the `anthropic` package. "
@@ -324,28 +339,76 @@ class AnthropicLLMClient:
             ) from exc
 
         system_text: str | None = None
-        user_messages: list[dict] = []
+        user_messages_plain: list[dict] = []
         for msg in messages:
             if msg.get("role") == "system":
                 system_text = msg.get("content", "")
             else:
-                user_messages.append({"role": msg["role"], "content": msg["content"]})
+                user_messages_plain.append(
+                    {"role": msg["role"], "content": msg["content"]}
+                )
 
         # Anthropic's newer models reject simultaneously-specified
         # ``temperature`` and ``top_p``; we forward only ``temperature``
         # (§3.3 sets both but the API now disallows the combo). The
         # ``top_p`` value is silently dropped for Anthropic calls;
         # stub / other clients still receive both parameters.
-        create_kwargs: dict[str, Any] = {
+        base_kwargs: dict[str, Any] = {
             "model": self.model_id,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "messages": user_messages,
         }
-        if system_text is not None:
-            create_kwargs["system"] = system_text
 
-        response = self._client.messages.create(**create_kwargs)
+        # Build a cached-shape request: typed content blocks with
+        # cache_control on the system prompt and on the c_d prefix.
+        cached_kwargs: dict[str, Any] = dict(base_kwargs)
+        cached_kwargs["messages"] = [
+            {
+                "role": msg["role"],
+                "content": self._split_user_content(msg["content"]),
+            }
+            for msg in user_messages_plain
+        ]
+        if system_text is not None:
+            cached_kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": system_text,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+
+        try:
+            response = self._client.messages.create(**cached_kwargs)
+        except anthropic.BadRequestError as exc:
+            # Fallback for servers / models that don't support the
+            # cache_control field. Retry once with the plain-string shape
+            # so the caller still gets a completion; cost is unchanged
+            # versus the pre-caching behaviour.
+            logger.warning(
+                "AnthropicLLMClient cache_control rejected (%s); "
+                "retrying without cache breakpoints.",
+                exc,
+            )
+            plain_kwargs: dict[str, Any] = dict(base_kwargs)
+            plain_kwargs["messages"] = user_messages_plain
+            if system_text is not None:
+                plain_kwargs["system"] = system_text
+            response = self._client.messages.create(**plain_kwargs)
+
+        # Emit cache-usage stats once per call so operators can observe
+        # cache hit / miss rates without parsing the Anthropic dashboard.
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            created = getattr(usage, "cache_creation_input_tokens", None)
+            read = getattr(usage, "cache_read_input_tokens", None)
+            if created is not None or read is not None:
+                logger.debug(
+                    "anthropic cache usage: cache_creation_input_tokens=%s "
+                    "cache_read_input_tokens=%s",
+                    created,
+                    read,
+                )
 
         # The SDK returns a list of content blocks; concatenate all text
         # blocks for the parser. Unknown block types are skipped.
@@ -360,6 +423,31 @@ class AnthropicLLMClient:
         model_id = getattr(response, "model", self.model_id) or self.model_id
 
         return GenerationResult(text=text, finish_reason=finish_reason, model_id=model_id)
+
+    @classmethod
+    def _split_user_content(cls, content: str) -> list[dict]:
+        """Split a user message into cached prefix + uncached suffix blocks.
+
+        The split point is ``"\\n\\nALTERNATIVE:"`` so everything up to
+        (but not including) the ``ALTERNATIVE:`` line — i.e. ``CONTEXT:``
+        plus the ``c_d`` block — ends up in the cacheable prefix, while
+        the per-alternative metadata and the trailing ``Generate K=``
+        line stay uncached. Messages lacking the marker fall back to a
+        single uncached block (defensive: keeps the client working if
+        ``USER_BLOCK_TEMPLATE`` ever changes shape).
+        """
+        marker = cls._USER_SPLIT_MARKER
+        if marker in content:
+            prefix, suffix = content.split(marker, 1)
+            return [
+                {
+                    "type": "text",
+                    "text": prefix,
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": marker + suffix},
+            ]
+        return [{"type": "text", "text": content}]
 
 
 # ---------------------------------------------------------------------------

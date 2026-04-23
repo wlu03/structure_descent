@@ -223,7 +223,7 @@ dataset:
 
   training:
     choice_set_size: 10
-    n_resamples: 1
+    n_resamples: 1   # TODO: downstream batching + loop need list-of-lists wiring before bumping (see NOTES.md)
     val_frac: 0.1
     test_frac: 0.1
     subsample:

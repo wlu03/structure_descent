@@ -33,7 +33,9 @@ is asserted to match across records; the same is true of ``J``.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, List, Sequence
 
@@ -53,6 +55,93 @@ __all__ = [
     "assemble_batch",
     "iter_to_torch_batches",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Thread-safety wrapper for SQLite-backed OutcomesCache
+# --------------------------------------------------------------------------- #
+
+
+class _LockedOutcomesCache:
+    """Thread-safe shim around an :class:`OutcomesCache` instance.
+
+    ``generate_outcomes`` only touches the cache via ``get_outcomes`` /
+    ``put_outcomes`` so we override just those two methods. We wrap *only*
+    SQLite I/O, leaving the slow network-bound LLM call fully parallel
+    across workers.
+
+    Lock-granularity choice
+    -----------------------
+    The brief recommended option (a): a single ``threading.Lock`` around
+    ``get_outcomes``/``put_outcomes`` delegating to the caller-supplied
+    cache. That is correct in principle for a WAL-mode SQLite backend,
+    but Python's ``sqlite3`` module enforces ``check_same_thread=True``
+    by default — a connection opened on thread T raises
+    ``ProgrammingError`` when touched from any other thread, *even
+    under a lock*. Since ``cache.py`` owns that constructor and the
+    brief forbids modifying it, a plain lock is insufficient.
+
+    The minimal hybrid fix: lazily open a fresh :class:`OutcomesCache`
+    bound to the same DB file per worker thread (tracked in
+    ``threading.local``), and still keep a single ``threading.Lock``
+    around the actual read/write so writers serialise the same way
+    they would under option (a). Read/write of the caller's cache is
+    avoided from any non-owning thread. This keeps option (a)'s
+    lock-around-I/O semantics while satisfying ``check_same_thread``
+    without patching ``cache.py``.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._path = getattr(inner, "path", None)
+        self._table = getattr(inner, "table", "kv")
+        self._lock = threading.Lock()
+        self._tls = threading.local()
+        # Track every per-thread connection we open so we can close them
+        # when the batch finishes; worker threads are pooled and may
+        # outlive a single assemble_batch call.
+        self._opened: list[Any] = []
+        self._opened_lock = threading.Lock()
+
+    def _thread_local_cache(self) -> Any:
+        c = getattr(self._tls, "cache", None)
+        if c is not None:
+            return c
+        if self._path is None:
+            # No path metadata; fall back to the inner instance. This is
+            # only safe when the caller happens to be on the same thread
+            # that constructed it — SQLite will raise otherwise, which
+            # is the correct (loud) failure mode.
+            c = self._inner
+        else:
+            # Local import to keep the cache.py import lazy.
+            from src.outcomes.cache import OutcomesCache
+
+            c = OutcomesCache(self._path, table=self._table, create=False)
+            with self._opened_lock:
+                self._opened.append(c)
+        self._tls.cache = c
+        return c
+
+    def get_outcomes(self, *args: Any, **kwargs: Any) -> Any:
+        local = self._thread_local_cache()
+        with self._lock:
+            return local.get_outcomes(*args, **kwargs)
+
+    def put_outcomes(self, *args: Any, **kwargs: Any) -> Any:
+        local = self._thread_local_cache()
+        with self._lock:
+            return local.put_outcomes(*args, **kwargs)
+
+    def close(self) -> None:
+        with self._opened_lock:
+            opened = list(self._opened)
+            self._opened.clear()
+        for c in opened:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +204,7 @@ def assemble_batch(
     diversity_filter: Callable[[list[str]], tuple[list[str], bool]] | None = None,
     omega: np.ndarray | None = None,
     progress: bool = False,
+    max_concurrent_llm_calls: int = 8,
 ) -> AssembledBatch:
     """Materialize training tensors from choice-set records.
 
@@ -256,50 +346,103 @@ def assemble_batch(
             # "price" key (see DatasetAdapter.alt_text docstring).
             prices_np[i, j] = float(alt.get("price", 0.0) or 0.0)
 
-    # ----- outcome generation + flat encode --------------------------------
-    # Collect outcome strings in row-major (i, j, k) order so the reshape
-    # at the end preserves the (N, J, K) layout without an explicit
-    # index-by-index fill.
-    flat_texts: list[str] = []
+    # ----- outcome generation (parallel) + flat encode ---------------------
+    # Dispatch every (i, j) LLM / cache call to a ThreadPoolExecutor so the
+    # N*J network-bound calls overlap. Results are written back into a
+    # pre-allocated (N, J) slot grid by index, so wall-time order of
+    # completion doesn't affect the final flat_texts ordering.
     total_calls = N * J
     progress_mark = max(1, total_calls // 10) if progress else None
 
+    # Wrap the outcomes_cache so SQLite I/O is serialized across threads.
+    # The (slow) LLM call inside generate_outcomes runs outside the lock.
+    if outcomes_cache is not None:
+        thread_safe_cache: Any = _LockedOutcomesCache(outcomes_cache)
+    else:
+        thread_safe_cache = None
+
+    # Separate lock for the progress counter; int increments aren't atomic
+    # under the GIL in the general case, and we want predictable logging.
+    progress_lock = threading.Lock()
     calls_done = 0
-    for i, rec in enumerate(records):
-        per_alt_k_lists: list[list[str]] = []
-        cid = str(rec["customer_id"])
-        c_d = rec["c_d"]
-        alt_texts_list = rec["alt_texts"]
-        choice_asins = rec["choice_asins"]
-        for j in range(J):
-            payload = generate_outcomes(
-                customer_id=cid,
-                asin=str(choice_asins[j]),
-                c_d=c_d,
-                alt=alt_texts_list[j],
-                K=K,
-                seed=seed,
-                prompt_version=prompt_version,
-                client=llm_client,
-                cache=outcomes_cache,
-                diversity_filter=diversity_filter,
+
+    def _generate_one(i: int, j: int) -> tuple[int, int, list[str]]:
+        rec = records[i]
+        payload = generate_outcomes(
+            customer_id=str(rec["customer_id"]),
+            asin=str(rec["choice_asins"][j]),
+            c_d=rec["c_d"],
+            alt=rec["alt_texts"][j],
+            K=K,
+            seed=seed,
+            prompt_version=prompt_version,
+            client=llm_client,
+            cache=thread_safe_cache,
+            diversity_filter=diversity_filter,
+        )
+        outcome_strs = list(payload.outcomes)
+        if len(outcome_strs) != K:
+            raise AssertionError(
+                f"outcomes_length: records[{i}] alt[{j}] returned "
+                f"{len(outcome_strs)} outcomes, expected K={K}"
             )
-            outcome_strs = list(payload.outcomes)
-            if len(outcome_strs) != K:
-                raise AssertionError(
-                    f"outcomes_length: records[{i}] alt[{j}] returned "
-                    f"{len(outcome_strs)} outcomes, expected K={K}"
-                )
-            per_alt_k_lists.append(outcome_strs)
-            flat_texts.extend(outcome_strs)
-            calls_done += 1
-            if progress_mark is not None and calls_done % progress_mark == 0:
+        # Progress logging: increment under lock, log on 10% milestones.
+        nonlocal calls_done
+        if progress_mark is not None:
+            with progress_lock:
+                calls_done += 1
+                done_now = calls_done
+            if done_now % progress_mark == 0:
                 logger.debug(
                     "assemble_batch: %d / %d outcome calls done (%.0f%%)",
-                    calls_done,
+                    done_now,
                     total_calls,
-                    100.0 * calls_done / total_calls,
+                    100.0 * done_now / total_calls,
                 )
+        return (i, j, outcome_strs)
+
+    # Pre-allocate the (N, J) grid so workers can fill by index.
+    outcomes_grid: list[list[list[str] | None]] = [
+        [None for _ in range(J)] for _ in range(N)
+    ]
+
+    # max_workers must be at least 1. If the caller passes <=0, clamp to 1.
+    workers = max(1, int(max_concurrent_llm_calls))
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(_generate_one, i, j)
+                for i in range(N)
+                for j in range(J)
+            ]
+            # as_completed surfaces errors from any worker via .result();
+            # we deliberately do NOT catch them — silent failures in
+            # outcome generation would corrupt the training batch.
+            for future in concurrent.futures.as_completed(futures):
+                i, j, outcome_strs = future.result()
+                outcomes_grid[i][j] = outcome_strs
+    finally:
+        # Shut down the single-thread cache I/O executor (if any); the
+        # caller still owns the underlying outcomes_cache connection.
+        if isinstance(thread_safe_cache, _LockedOutcomesCache):
+            thread_safe_cache.close()
+
+    # Flatten in deterministic row-major (i, j, k) order so the downstream
+    # encode_batch reshape to (N, J, K, d_e) is correct regardless of the
+    # order in which workers finished.
+    flat_texts: list[str] = []
+    for i in range(N):
+        per_alt_k_lists: list[list[str]] = []
+        for j in range(J):
+            outcome_strs = outcomes_grid[i][j]
+            # _generate_one always writes a list; None here would indicate
+            # a bug above (missed future).
+            assert outcome_strs is not None, (
+                f"internal: outcomes_grid[{i}][{j}] was never filled"
+            )
+            per_alt_k_lists.append(outcome_strs)
+            flat_texts.extend(outcome_strs)
         outcomes_nested.append(per_alt_k_lists)
 
     # One encoder pass per batch (Wave-10 design invariant).

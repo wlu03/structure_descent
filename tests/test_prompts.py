@@ -52,8 +52,12 @@ def test_system_prompt_frozen():
     assert SYSTEM_PROMPT.strip() == SYSTEM_PROMPT_GOLDEN.strip()
 
 
-def test_prompt_version_is_v1():
-    assert PROMPT_VERSION == "v1"
+def test_prompt_version_is_v2():
+    """Bumped v1 -> v2 alongside the Wave-11 improvements: per-event
+    recent_purchases in c_d and richer alt_text (brand/is_repeat/state).
+    Distinct version so cached outcomes from the v1 prompt layout don't
+    collide with v2 calls."""
+    assert PROMPT_VERSION == "v2"
 
 
 def test_user_block_substitutes():

@@ -639,6 +639,281 @@ def test_dedup_determinism():
         assert x["metadata"]["dedup_fallback"] == y["metadata"]["dedup_fallback"]
 
 
+# --------------------------------------------------------------------------- #
+# Wave 12 per-event ``recent_purchases`` in c_d.
+#
+# Each event gets a per-event render of ``c_d`` that includes the titles
+# of the customer's purchases in the window immediately BEFORE the event
+# (strict <, no leakage). Six tests below pin the behavior:
+#  - a middle event gets its prior-events' titles,
+#  - the FIRST event for a customer has no "Recent purchases" line,
+#  - events outside the window are not included,
+#  - the list is capped at ``max_recent_purchases``,
+#  - very long titles are truncated to ≤80 chars in the output,
+#  - same-day prior events render reproducibly across runs.
+# --------------------------------------------------------------------------- #
+
+
+def _make_customer_events(
+    customer_id: str,
+    n_events: int,
+    *,
+    offsets_days: list[int],
+    titles: list[str],
+    start_date: str = "2024-01-01",
+) -> pd.DataFrame:
+    """Build a single-customer events frame with explicit per-event offsets.
+
+    ``offsets_days[i]`` is the number of days (from ``start_date``) of the
+    i-th event for this customer. ``titles[i]`` is the title. ASINs are
+    generated deterministically so duplicate titles at different offsets
+    still render as distinct catalog entries.
+    """
+    assert len(offsets_days) == n_events == len(titles)
+    rows = []
+    base = pd.to_datetime(start_date)
+    for e in range(n_events):
+        d = base + pd.Timedelta(days=offsets_days[e])
+        rows.append(
+            dict(
+                customer_id=customer_id,
+                order_date=d,
+                asin=f"A{e:04d}",
+                category="CAT0",
+                price=5.0 + e,
+                title=titles[e],
+                routine=int(e > 0),
+                novelty=int(e == 0),
+                recency_days=999 if e == 0 else 7,
+                cat_affinity=e,
+                brand="brand_x",
+            )
+        )
+    df = pd.DataFrame(rows)
+    pop = df.groupby("asin").size().rename("popularity").reset_index()
+    df = df.merge(pop, on="asin", how="left")
+    df = df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
+    # All events train so a single-customer persons_canonical is valid.
+    df["split"] = ["train"] * len(df)
+    return df
+
+
+def _persons_for_single(customer_id: str) -> pd.DataFrame:
+    """Persons-canonical with exactly one training customer."""
+    return pd.DataFrame(
+        [
+            dict(
+                customer_id=customer_id,
+                age_bucket="45-54",
+                income_bucket="50-100k",
+                household_size=2,
+                has_kids=0,
+                city_size="medium",
+                education=3,
+                health_rating=4,
+                risk_tolerance=0.0,
+                purchase_frequency=2.0,
+                novelty_rate=0.3,
+            )
+        ]
+    )
+
+
+def test_recent_purchases_populated_for_middle_event():
+    """Customer with 4 events in 20 days: the 3rd event's c_d contains
+    title fragments of the first two (NOT the 4th, which is after)."""
+    events = _make_customer_events(
+        "C_MID",
+        n_events=4,
+        offsets_days=[0, 5, 10, 15],
+        titles=[
+            "Kitchen Spatula Set",
+            "Coffee Filter Pack",
+            "Laundry Detergent",
+            "Dish Soap",
+        ],
+    )
+    persons = _persons_for_single("C_MID")
+    adapter = _StubAdapter()
+    records = build_choice_sets(events, persons, adapter, seed=42)
+    # Records come back in event-order (sorted above); the 3rd event is
+    # index 2.
+    c_d = records[2]["c_d"]
+    assert "Recent purchases" in c_d
+    assert "Kitchen Spatula Set" in c_d
+    assert "Coffee Filter Pack" in c_d
+    # The 4th event's title must NOT have leaked into the 3rd event's c_d.
+    assert "Dish Soap" not in c_d
+    # The 3rd event's own title must not be in its recent_purchases block
+    # either (strict < on the current event).
+    # Split by the recent-purchases marker so we only inspect that line.
+    tail = c_d.split("Recent purchases", 1)[1]
+    assert "Laundry Detergent" not in tail
+
+
+def test_recent_purchases_empty_for_first_event():
+    """The FIRST event for a customer has no prior purchases, so c_d
+    must not contain the "Recent purchases" clause."""
+    events = _make_customer_events(
+        "C_FIRST",
+        n_events=3,
+        offsets_days=[0, 5, 10],
+        titles=["First Title", "Second Title", "Third Title"],
+    )
+    persons = _persons_for_single("C_FIRST")
+    adapter = _StubAdapter()
+    records = build_choice_sets(events, persons, adapter, seed=42)
+    assert "Recent purchases" not in records[0]["c_d"]
+    # Later events should have the clause.
+    assert "Recent purchases" in records[1]["c_d"]
+
+
+def test_recent_purchases_window_respected():
+    """With window_days=7, events separated by > 7 days must NOT show
+    up in c_d. Build events at offsets [0, 3, 10, 20, 60] and check the
+    last event sees none of the first three (all > 7 days away)."""
+    events = _make_customer_events(
+        "C_WIN",
+        n_events=5,
+        offsets_days=[0, 3, 10, 20, 60],
+        titles=[
+            "Way Old Title",
+            "Old Title",
+            "Medium Age Title",
+            "Nearly New Title",
+            "Current Title",
+        ],
+    )
+    persons = _persons_for_single("C_WIN")
+    adapter = _StubAdapter()
+    records = build_choice_sets(
+        events, persons, adapter, seed=42, recent_purchases_window_days=7
+    )
+    # event[1] (offset=3): only event[0] at offset=0 is in the 7-day
+    # window (3 - 0 = 3 < 7). event[0]'s title should appear.
+    c_d_1 = records[1]["c_d"]
+    assert "Recent purchases" in c_d_1
+    assert "Way Old Title" in c_d_1
+
+    # event[4] (offset=60): all prior events are > 7 days ago. No clause.
+    c_d_last = records[4]["c_d"]
+    assert "Recent purchases" not in c_d_last
+
+
+def test_recent_purchases_max_cap_respected():
+    """Customer with 20 consecutive daily events; on event 19 (the last),
+    max_recent_purchases=3 caps the rendered list at 3 titles."""
+    n = 20
+    events = _make_customer_events(
+        "C_CAP",
+        n_events=n,
+        offsets_days=list(range(n)),
+        titles=[f"Title number {i:02d}" for i in range(n)],
+    )
+    persons = _persons_for_single("C_CAP")
+    adapter = _StubAdapter()
+    records = build_choice_sets(
+        events,
+        persons,
+        adapter,
+        seed=42,
+        recent_purchases_window_days=30,
+        max_recent_purchases=3,
+    )
+    c_d_last = records[n - 1]["c_d"]
+    recent_line = [
+        ln for ln in c_d_last.split("\n") if ln.startswith("Recent purchases")
+    ]
+    assert len(recent_line) == 1, (
+        f"expected exactly one 'Recent purchases' line; got: {recent_line}"
+    )
+    line = recent_line[0]
+    # Inside the clause, titles are comma-separated — count how many
+    # recent titles appear. Most-recent-slice is events 16, 17, 18 (the
+    # last 3 prior to event 19 since event 19 is excluded by strict <).
+    assert "Title number 18" in line
+    assert "Title number 17" in line
+    assert "Title number 16" in line
+    # A title outside the cap must NOT appear.
+    assert "Title number 15" not in line
+    assert "Title number 00" not in line
+
+
+def test_titles_truncated():
+    """A 300-char title is truncated to <=80 chars in the rendered output.
+
+    Construct a customer with 2 events; the first has a 300-char title.
+    The second event's c_d must contain the first title truncated.
+    """
+    long_title = "X" * 300
+    events = _make_customer_events(
+        "C_LONG",
+        n_events=2,
+        offsets_days=[0, 5],
+        titles=[long_title, "Ordinary Title"],
+    )
+    persons = _persons_for_single("C_LONG")
+    adapter = _StubAdapter()
+    records = build_choice_sets(events, persons, adapter, seed=42)
+    c_d = records[1]["c_d"]
+    # The full 300-char title should NOT appear.
+    assert long_title not in c_d
+    # The first 80 chars should (truncation keeps a prefix).
+    assert ("X" * 80) in c_d
+    # And there should be no run of 81 X's (the cap is respected).
+    assert ("X" * 81) not in c_d
+
+
+def test_determinism_with_tied_dates():
+    """Two events on the same day with different asins render identical
+    c_d across two runs with the same seed — no Python hash nondetermism."""
+    # Two same-day events at offset=0; a third event 5 days later.
+    events = _make_customer_events(
+        "C_TIES",
+        n_events=3,
+        offsets_days=[0, 0, 5],
+        titles=["First Tied", "Second Tied", "Later One"],
+    )
+    persons = _persons_for_single("C_TIES")
+
+    r1 = build_choice_sets(events, persons, _StubAdapter(), seed=42)
+    r2 = build_choice_sets(events, persons, _StubAdapter(), seed=42)
+    assert len(r1) == len(r2)
+    for x, y in zip(r1, r2):
+        assert x["c_d"] == y["c_d"]
+    # The 5-day-later event must see both tied titles (both are strictly
+    # earlier) and in a deterministic order. With asin tiebreaker A0000
+    # < A0001, "First Tied" (asin A0000) renders before "Second Tied".
+    c_d_last = r1[2]["c_d"]
+    assert "First Tied" in c_d_last
+    assert "Second Tied" in c_d_last
+    # Order: "First Tied" appears before "Second Tied".
+    assert c_d_last.index("First Tied") < c_d_last.index("Second Tied")
+
+
+def test_per_event_c_d_differs_across_events():
+    """c_d is now per-EVENT, not per-customer. Two events of the same
+    customer at different times must have different c_d strings."""
+    events = _make_customer_events(
+        "C_DIFF",
+        n_events=4,
+        offsets_days=[0, 5, 10, 15],
+        titles=[
+            "Title Alpha",
+            "Title Beta",
+            "Title Gamma",
+            "Title Delta",
+        ],
+    )
+    persons = _persons_for_single("C_DIFF")
+    adapter = _StubAdapter()
+    records = build_choice_sets(events, persons, adapter, seed=42)
+    cds = {r["c_d"] for r in records}
+    # At least 3 of the 4 events have a distinct c_d (first is alone,
+    # the other three each add a new title to the recent_purchases line).
+    assert len(cds) >= 3, f"expected distinct per-event c_d; got {len(cds)} unique"
+
+
 def test_dedup_does_not_change_large_fixture():
     """100-customer Amazon fixture: most records are dedup_fallback==False.
 

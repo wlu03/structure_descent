@@ -123,8 +123,18 @@ class DatasetAdapter(Protocol):
 # --------------------------------------------------------------------------- #
 
 
-# Canonical alt-text keys the LLM prompt expects (§3.2).
-_ALT_KEYS: tuple[str, ...] = ("title", "category", "price", "popularity_rank")
+# Canonical alt-text keys the LLM prompt expects (§3.2). The first four
+# map directly into USER_BLOCK_TEMPLATE's named slots; the remaining three
+# ride in via ``optional_fields`` (see :func:`src.outcomes.prompts.build_user_block`).
+_ALT_KEYS: tuple[str, ...] = (
+    "title",
+    "category",
+    "price",
+    "popularity_rank",
+    "brand",
+    "is_repeat",
+    "state",
+)
 
 
 class YamlAdapter:
@@ -256,12 +266,39 @@ class YamlAdapter:
     def alt_text(self, event_row: Mapping[str, Any]) -> dict[str, Any]:
         """Render the LLM-generator-visible alternative metadata.
 
-        Returns a dict with keys ``title``, ``category``, ``price``, and
-        ``popularity_rank``. ``popularity_rank`` uses
+        Returns a dict with seven keys: the four canonical §3.2 fields
+        (``title``, ``category``, ``price``, ``popularity_rank``) plus
+        three purchase-context signals (``brand``, ``is_repeat``,
+        ``state``). ``popularity_rank`` uses
         ``self._popularity_percentile_fn(popularity)`` when that callable
         has been wired by Wave 10; until then it is a stub
         ``"popularity score N"`` string (a DEBUG log records the
         fallback).
+
+        Extra-field semantics
+        ---------------------
+        * ``brand`` — read from ``event_row["brand"]`` (populated by
+          :mod:`src.data.state_features` as the mode first-token per
+          ASIN). Missing / empty / falsy values fall back to the literal
+          string ``"unknown_brand"``.
+        * ``is_repeat`` — True iff this purchase is a repeat for *this*
+          customer. Resolution order: if ``event_row`` carries an
+          explicit ``is_repeat`` key it wins (callers that already know
+          whether the alternative is the customer-chosen one can set
+          ``is_repeat=True`` directly and ``False`` for negatives); else
+          derive from ``event_row["routine"] > 0``. If neither is
+          present, default to ``False``. Callers that pass a negative's
+          ``asin_lookup`` row into :meth:`alt_text` get ``False`` (the
+          ASIN lookup does not carry per-customer routine information),
+          which is semantically correct for negatives.
+        * ``state`` — read from ``event_row["state"]`` (cleaned US state
+          code like ``"CA"`` / ``"NY"``). Missing values default to the
+          empty string.
+
+        All three extras are graceful: a synthetic or minimal event_row
+        that only carries the four canonical fields still returns a
+        seven-key dict — no ``KeyError`` is ever raised from this
+        method.
         """
         title = event_row.get("title", "")
         category = event_row.get("category", "")
@@ -279,11 +316,34 @@ class YamlAdapter:
             )
             popularity_rank = f"popularity score {popularity}"
 
+        # --- brand: default "unknown_brand" on missing / empty values. ----- #
+        raw_brand = event_row.get("brand", "")
+        brand = str(raw_brand).strip() if raw_brand else ""
+        if not brand:
+            brand = "unknown_brand"
+
+        # --- is_repeat: explicit key wins, else derive from routine. ------- #
+        if "is_repeat" in event_row:
+            is_repeat = bool(event_row["is_repeat"])
+        else:
+            try:
+                routine_val = int(event_row.get("routine", 0) or 0)
+            except (TypeError, ValueError):
+                routine_val = 0
+            is_repeat = routine_val > 0
+
+        # --- state: pass-through, default "". ------------------------------ #
+        raw_state = event_row.get("state", "")
+        state = str(raw_state) if raw_state else ""
+
         return {
             "title": title,
             "category": category,
             "price": price,
             "popularity_rank": popularity_rank,
+            "brand": brand,
+            "is_repeat": is_repeat,
+            "state": state,
         }
 
     # ------------------------------------------------------------------ #

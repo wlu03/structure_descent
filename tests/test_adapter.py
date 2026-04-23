@@ -239,6 +239,160 @@ def test_alt_text_with_percentile_fn():
 
 
 # --------------------------------------------------------------------------- #
+# alt_text — 7-key extended schema (brand / is_repeat / state)
+# --------------------------------------------------------------------------- #
+
+
+_SEVEN_KEYS = {
+    "title",
+    "category",
+    "price",
+    "popularity_rank",
+    "brand",
+    "is_repeat",
+    "state",
+}
+
+
+def test_alt_text_returns_seven_keys():
+    """Full event-row (post-state_features) produces all 7 keys with the
+    caller-supplied values flowing through untouched."""
+    adapter = AmazonAdapter()
+    row = {
+        "title": "Widget Deluxe",
+        "category": "Home",
+        "price": 19.99,
+        "popularity": 42,
+        "brand": "Acme",
+        "routine": 2,
+        "state": "CA",
+    }
+    out = adapter.alt_text(row)
+    assert set(out.keys()) == _SEVEN_KEYS
+    assert out["title"] == "Widget Deluxe"
+    assert out["category"] == "Home"
+    assert out["price"] == 19.99
+    assert out["popularity_rank"] == "popularity score 42"
+    assert out["brand"] == "Acme"
+    assert out["is_repeat"] is True
+    assert out["state"] == "CA"
+
+
+def test_alt_text_handles_missing_fields():
+    """A minimal row with only the 4 canonical fields still returns 7 keys
+    — the 3 extras fall back to documented defaults rather than raising."""
+    adapter = AmazonAdapter()
+    row = {
+        "title": "X",
+        "category": "Y",
+        "price": 5.0,
+        "popularity": 99,
+    }
+    out = adapter.alt_text(row)
+    assert set(out.keys()) == _SEVEN_KEYS
+    assert out["brand"] == "unknown_brand"
+    assert out["is_repeat"] is False
+    assert out["state"] == ""
+
+
+def test_alt_text_brand_fallback():
+    """Empty-string or missing brand -> 'unknown_brand' sentinel."""
+    adapter = AmazonAdapter()
+    base = {"title": "t", "category": "c", "price": 1.0, "popularity": 0}
+
+    # Missing entirely.
+    assert adapter.alt_text(base)["brand"] == "unknown_brand"
+
+    # Present but empty.
+    assert adapter.alt_text({**base, "brand": ""})["brand"] == "unknown_brand"
+
+    # Whitespace-only also collapses to the sentinel.
+    assert adapter.alt_text({**base, "brand": "   "})["brand"] == "unknown_brand"
+
+    # A real brand passes through.
+    assert adapter.alt_text({**base, "brand": "Acme"})["brand"] == "Acme"
+
+
+def test_alt_text_is_repeat_from_routine():
+    """``routine`` > 0 ⇒ is_repeat=True; 0 or missing ⇒ False. An explicit
+    ``is_repeat`` key (if the caller wants to override for negatives) wins."""
+    adapter = AmazonAdapter()
+    base = {"title": "t", "category": "c", "price": 1.0, "popularity": 0}
+
+    # routine semantics (the pathway exercised by the CHOSEN alternative).
+    assert adapter.alt_text({**base, "routine": 0})["is_repeat"] is False
+    assert adapter.alt_text({**base, "routine": 1})["is_repeat"] is True
+    assert adapter.alt_text({**base, "routine": 7})["is_repeat"] is True
+    # Missing routine defaults to False.
+    assert adapter.alt_text(base)["is_repeat"] is False
+
+    # Explicit ``is_repeat`` overrides routine (pathway for upstream callers
+    # that want negatives to always show is_repeat=False regardless of the
+    # row they happened to pull from the asin_lookup).
+    assert (
+        adapter.alt_text({**base, "routine": 5, "is_repeat": False})["is_repeat"]
+        is False
+    )
+    assert (
+        adapter.alt_text({**base, "routine": 0, "is_repeat": True})["is_repeat"]
+        is True
+    )
+
+
+def test_alt_text_state_passthrough():
+    """Non-empty state code passes through; missing / empty -> ''."""
+    adapter = AmazonAdapter()
+    base = {"title": "t", "category": "c", "price": 1.0, "popularity": 0}
+
+    assert adapter.alt_text({**base, "state": "CA"})["state"] == "CA"
+    assert adapter.alt_text({**base, "state": "NY"})["state"] == "NY"
+    # Missing and empty both collapse to the empty-string default.
+    assert adapter.alt_text(base)["state"] == ""
+    assert adapter.alt_text({**base, "state": ""})["state"] == ""
+
+
+def test_alt_text_amazon_fixture_end_to_end(tmp_path):
+    """Load the Amazon fixture, run clean_events + compute_state_features,
+    pull one cleaned event row, and verify all 7 alt_text keys are
+    populated with sensible values."""
+    from src.data import state_features
+    from src.data.clean import clean_events
+
+    yaml_path = _write_fixture_yaml(tmp_path)
+    adapter = YamlAdapter(yaml_path)
+
+    events_raw = adapter.load_events()
+    cleaned = clean_events(events_raw, adapter.schema)
+    featured = state_features.compute_state_features(cleaned)
+
+    # Sanity: the post-state_features frame carries the 3 new source columns.
+    for col in ("brand", "routine", "state"):
+        assert col in featured.columns, f"state_features did not emit {col!r}"
+
+    # Pick the first event row and render alt_text.
+    row = featured.iloc[0].to_dict()
+    out = adapter.alt_text(row)
+    assert set(out.keys()) == _SEVEN_KEYS
+
+    # The canonical four still match what the row carries.
+    assert out["title"] == row["title"]
+    assert out["category"] == row["category"]
+    assert out["price"] == row["price"]
+
+    # brand: either the real cleaned brand, or the documented fallback.
+    assert isinstance(out["brand"], str)
+    assert out["brand"] != ""  # the adapter promises a non-empty string
+
+    # is_repeat: boolean.
+    assert isinstance(out["is_repeat"], bool)
+    # First row per (customer, asin) after sort has routine == 0 => False.
+    assert out["is_repeat"] == (int(row.get("routine", 0) or 0) > 0)
+
+    # state: whatever the row carries (US state code) as a string.
+    assert isinstance(out["state"], str)
+
+
+# --------------------------------------------------------------------------- #
 # suppress_fields_for_c_d
 # --------------------------------------------------------------------------- #
 

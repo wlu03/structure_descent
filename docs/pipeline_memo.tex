@@ -1,0 +1,207 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{fancyvrb}
+\usepackage{xcolor}
+\usepackage{longtable}
+
+\setlength{\parskip}{6pt}
+\setlength{\parindent}{0pt}
+
+\title{}
+\author{}
+\date{}
+
+\begin{document}
+
+\textbf{MEMO} \hfill 21 April 2026
+
+\textbf{TO:}\quad PO-LEU project advisors, co-PIs, collaborators \\
+\textbf{FROM:}\quad Wesley Lu \\
+\textbf{RE:}\quad PO-LEU pipeline status, Wave 11 / Wave 12 plan, and decisions requested
+
+\vspace{4pt}
+\hrule
+\vspace{6pt}
+
+\section*{1. Summary}
+
+PO-LEU (\textit{Perceived-Outcome, LLM-generated, Embedding-based Utility}) is an attribute-decomposed discrete-choice model: the LLM imagines short first-person outcomes for each alternative, a frozen sentence encoder embeds them, and three small neural nets score attributes, allocate a person's attention across attributes, and allocate mental salience across outcomes. The pipeline is now end-to-end implemented, unit-tested, and has completed one real-Claude dry run on a single Amazon customer, with all artifacts green. The remaining milestones are \textbf{Wave 11} (100-customer real-LLM validation on Amazon) and \textbf{Wave 12} (a sampling-sensitivity experiment, 30 customers $\times$ 3 seeds $\times$ 3 negative-sampling arms). Wave 11 at our originally approved model (Opus) now projects to $\sim$\$240, \textbf{over} the \$150 approved budget; a Sonnet 4.6 swap brings it to $\sim$\$50 with qualitatively comparable dry-run outputs. \textbf{Bottom-line asks:} sign-off on the Sonnet swap and a \$250 stop-report cap for Wave 11, confirmation of the Wave 12 third arm, and acknowledgement of three open methodological items flagged in Section~7.
+
+\section*{2. What's Built}
+
+A five-layer architecture, each layer isolated behind a stable interface:
+
+\begin{longtable}{l p{0.66\textwidth}}
+\toprule
+Layer & Responsibility \\
+\midrule
+Schema translation & Dataset-specific YAML $\to$ canonical $z_d$ / $c_d$ contract. \\
+Data pipeline & Cleaning, survey join, temporal split, choice-set construction, leverage-score subsampling. \\
+Adapter & Per-dataset glue: Amazon and a synthetic adapter ship. \\
+Model & Attribute heads, weight net, salience net, PO-LEU forward pass; A0 default plus A7/A8 ablations wired. \\
+Outcomes & LLM generator + sentence-encoder with SQLite caches. Stub and real (Anthropic, sentence-transformers) backends behind one interface. \\
+\bottomrule
+\end{longtable}
+
+Code-level numbers: \textbf{32 Python modules} under \texttt{src/}, \textbf{38 test files} in \texttt{tests/}, \textbf{465 unit tests} currently green. Rough LOC: $\sim$8k Python in \texttt{src/}, $\sim$5k in \texttt{tests/}, plus configs and scripts.
+
+A single CLI driver, \texttt{scripts/run\_dataset.py}, runs the entire pipeline end-to-end. The relevant contract:
+
+\begin{Verbatim}[fontsize=\small,frame=single]
+python scripts/run_dataset.py \
+    --adapter amazon \
+    --n-customers 100 \
+    --real-llm \              # or --stub-llm for CI-safe runs
+    --n-epochs 1 \
+    --batch-size 32 \
+    --output-dir reports/amazon_wave11
+\end{Verbatim}
+
+\texttt{--stub-llm} is hermetic and hits no network; it is what CI runs. \texttt{--real-llm} swaps in \texttt{AnthropicLLMClient} and \texttt{SentenceTransformersEncoder}. Adding a second dataset (demonstrated with a synthetic YAML smoke test) takes zero Python code --- only a new \texttt{configs/datasets/<name>.yaml}.
+
+\section*{3. Architectural Decisions That Matter for the Paper}
+
+Three decisions are dataset-specific and must be disclosed rather than buried:
+
+\textbf{(a) Dataset-dependent $p$.} The redesign spec freezes the effective person-feature dimension at $p=26$. On Amazon the effective dimension is $p=23$: \texttt{city\_size} is defined via an \texttt{external\_lookup} CSV of state-to-urbanization, that CSV ships empty, every row falls through to \texttt{fallback="medium"}, and the one-hot collapses to a single always-on slot. Rather than silently padding, we report $p=23$ in every metrics artifact and derive parameter counts from the actual effective dimension.
+
+\textbf{(b) Sentinel-only $z_d$ fields on Amazon.} The Prolific survey does not ask the questions PO-LEU was designed around. Four of ten canonical $z_d$ fields are sentinel or composite-only on this dataset:
+
+\begin{longtable}{l p{0.7\textwidth}}
+\toprule
+Field & How it is populated on Amazon \\
+\midrule
+\texttt{has\_kids} & constant 0; no survey question exists; proxies (life-event $=$ ``had a child'', household $\geq 3$) are biased. \\
+\texttt{city\_size} & empty lookup CSV; every row $\to$ \texttt{medium}. \\
+\texttt{health\_rating} & composite from two binary health columns; clamped to $\{3,4,5\}$. \\
+\texttt{risk\_tolerance} & substance-use count $\in \{0,1,2,3\}$; proxy, not direct measure. \\
+\bottomrule
+\end{longtable}
+
+The Wave-11 dry run added a \texttt{c\_d\_extra\_fields} block so the \textbf{context string} to the LLM carries gender, life-event, and self-reported Amazon frequency. Those ride alongside $c_d$ without changing the $z_d$ shape, partly compensating for the sentinel fields where it matters most (the prompt).
+
+\textbf{(c) Parameter-count table.} For Amazon $p=23$:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+Component & Canonical ($p=26$) & Amazon ($p=23$) \\
+\midrule
+Attribute heads (M $=$ 5)              & 492{,}805 & 492{,}805 \\
+Weight net ($p \to 32 \to M$)          &       1{,}029 &          933 \\
+Salience net ($d_e + p \to 64 \to 1$)  &      50{,}945 &       50{,}753 \\
+\midrule
+\textbf{Total $k$} & \textbf{544{,}779} & \textbf{544{,}491} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The $k$ shift (288 params) is what propagates into AIC / BIC. Numbers use the corrected per-head counts from the Wave-4 reconciliation (the spec formula dropped a bias term).
+
+\section*{4. The Wave 11 Dry-Run (1 customer, real LLM)}
+
+\textbf{Subject.} Customer \texttt{R\_1lztobDYoYyZWKF}: 9 Amazon events, self-reports income $< \$25\text{k}$, Ohio, single-person household, infrequent Amazon shopper (``less than 5 times per month'').
+
+\textbf{Cost.} \$0.07 for the full run, 9 unique LLM calls (one per customer-ASIN pair after cache dedup).
+
+\textbf{Outputs.} 7 artifact JSONs produced in the run directory: config snapshot, metrics, per-event interpretability report, trained weights, embedding-cache stats, generation-cache stats, data-prep diagnostics. Validation NLL was \textbf{$\approx 2.25$}, i.e. just below the $\log J = 2.30$ uniform-prior floor --- expected with $n_\text{val} = 1$ event and one epoch; the run's purpose was wiring, not convergence.
+
+\textbf{Qualitative check.} The generated outcomes are income-aware and frame-diverse. One example, verbatim (category: grocery):
+
+\begin{Verbatim}[fontsize=\small,frame=single,xleftmargin=1em]
+This purchase eats nearly a full day's grocery budget, forcing
+tighter cuts on next week's shopping list.
+I save a 45-minute round trip to the store, freeing the
+evening for the single thing I actually wanted to do.
+Eating it alone in a quiet apartment underscores how few
+small treats I allow myself these days.
+\end{Verbatim}
+
+Financial, convenience, and emotional frames are all present; nothing is descriptive of the product.
+
+\textbf{Bugs surfaced and fixed.} The dry run caught four latent bugs, all now regression-tested:
+
+\begin{enumerate}
+\item Cache-key $K$ collision --- generations at $K=3$ and $K=5$ hashed identically because $K$ was omitted from the outcomes cache key.
+\item Anthropic API rejected simultaneous \texttt{temperature} and \texttt{top\_p} in the request body (a platform change); the client now sends one or the other.
+\item $c_d$ enrichment (\texttt{c\_d\_extra\_fields}) was defined in the YAML but not threaded into the driver; fixed in the context-string builder wiring.
+\item \texttt{purchase\_frequency} was a raw event count but was being rendered into $c_d$ as a rate (``twice per week'') without per-customer time normalization. Both the $z_d$ (log1p-count, standardized) and $c_d$ (paraphrased cadence buckets) paths are now explicit.
+\end{enumerate}
+
+\section*{5. Budget for Wave 11 (100 customers, \texttt{--real-llm}, $K=1$)}
+
+Dry-run extrapolation. One customer with 9 events $\to$ 9 unique LLM calls $\to$ \$0.07. A 100-customer subsample with $\sim$200 median events per customer and $J=10$ alternatives, after cache dedup across repeated ASINs, lands around \textbf{$\sim$30{,}000 unique calls}. At current Opus 4.6 pricing (input \$15 / output \$75 per M tok), a call of our median length comes to $\sim$\$0.008, giving:
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Wave 11 estimate at Opus 4.6 & $\sim$\$240 \\
+Originally approved budget & \$150 \\
+\textbf{Gap} & \textbf{\$90 over} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three mitigation options:
+
+\textbf{(a) Swap to Claude Sonnet 4.6.} Approximately 5$\times$ cheaper; Wave 11 projects to $\sim$\$50. The dry-run outputs we inspected are qualitatively similar between Sonnet and Opus on the same $(c_d, x_j)$; PO-LEU's training loss does not consume LLM reasoning, only sentence embeddings of the generated text. \textbf{Recommended.}
+
+\textbf{(b) Cap events per customer.} Add \texttt{--max-events-per-customer} (currently absent). A cap of 100 halves total cost while preserving customer-level diversity, which is what the Appendix-C subsampling is optimising for. Retain Opus.
+
+\textbf{(c) Reduce scope to 50 customers on Opus.} Simplest, but the val/test splits become borderline at $n\approx 5$ rows each.
+
+Recommendation: \textbf{option (a), Sonnet 4.6}, with a \$250 stop-and-report rule.
+
+\section*{6. Wave 12 Plan (sampling-sensitivity experiment)}
+
+Purpose: quantify how much the choice of negative-sampling scheme moves PO-LEU's headline numbers. Three arms:
+
+\begin{enumerate}
+\item \textbf{Uniform} --- the default choice-set construction.
+\item \textbf{Popularity-weighted, uncorrected} --- draw negatives in proportion to training-split popularity.
+\item \textbf{Popularity-weighted with McFadden log-$q$ correction} --- the same draw, with the standard logit offset $-\log q_j$ applied per alternative inside $V(a_j)$.
+\end{enumerate}
+
+Design: 30 customers $\times$ 3 seeds $\times$ 3 arms $=$ 9 runs, plus a per-arm pooled model. Per-customer cost scales from Wave 11, so estimated total is \textbf{$\sim$\$350} on Sonnet. A null band is pre-declared at $2\times$ within-scheme seed variance: differences between arms smaller than that null band are not interpreted.
+
+\section*{7. Open Methodological Items}
+
+Three items the paper must address honestly:
+
+\textbf{(a) Sparse $c_d$ signal on Amazon.} The Prolific survey simply does not ask what PO-LEU was built to exploit: the demographic/lifestyle signals that separate people's attention budgets across financial/health/convenience/emotional/social consequences. The $c_d$ enrichment in Wave 11 helps, but the long-term lever is \textbf{data choice}. Future datasets with richer survey instruments (health-purchasing panels, longitudinal consumer panels, the LISS datasets) will exercise the method more fully and should be scoped in the paper's Future Work.
+
+\textbf{(b) No theoretical PO-LEU paper exists.} We are the empirical first pass. Wave 12's \texttt{methods.md} will be the first written treatment of negative-sampling bias under this method; that document becomes an appendix rather than a body section, and the main text frames the experiment as calibration rather than theory.
+
+\textbf{(c) Ablation A5 is config-only.} A5 (\textit{person-dependent attribute heads}, $u_m(e_k, z_d)$) currently has a config entry but no runtime implementation. Before A5 can be reported, \texttt{src/model/attribute\_heads.py} needs a \texttt{person\_dependent=True} branch that concatenates $z_d$ at the head input; roughly 30 LOC plus a unit test. Not on the Wave 11 critical path; flagging so the paper draft does not assume A5 numbers exist.
+
+\section*{8. Risks}
+
+\textbf{(i) Real-LLM cost overrun.} Mitigated by the Section 5 options plus a hard stop-and-report at \$250 (Wave 11) and \$400 (Wave 12). Caches are persistent, so an interrupted run resumes cleanly.
+
+\textbf{(ii) Small-$n$ val/test variance.} At 100 customers and a 10\% val fraction the validation set is $\sim$100 events. That is borderline for stable early-stopping; seed variance is what the Wave 12 null band is calibrated against, and Wave 11 reports mean $\pm$ std over 3 seeds for every headline number.
+
+\textbf{(iii) LLM API drift.} The dry run already caught one API-level change (temperature/top-p rejection). Future Anthropic API changes can break the \texttt{--real-llm} path without warning; \texttt{--stub-llm} stays green regardless, so CI detects code-side regressions and real-LLM regressions are caught at the driver boundary.
+
+\section*{9. What We Need From You}
+
+\begin{enumerate}
+\item \textbf{Model choice for Wave 11.} Sign-off on Sonnet 4.6 (recommended) versus Opus 4.6.
+\item \textbf{Wave 11 budget cap.} Confirmation of \$250 stop-and-report.
+\item \textbf{Wave 12 third arm.} Confirmation that the McFadden log-$q$ correction is the right third arm (versus, e.g., inverse-propensity weighting).
+\item \textbf{Methodological items.} Acknowledgement of the three items in Section 7: sparse $c_d$ on Amazon, no prior theoretical paper, A5 config-only.
+\end{enumerate}
+
+\section*{10. Reference / Appendix Pointers}
+
+\begin{itemize}
+\item[--] Deep technical reference: \texttt{docs/implementation\_report.tex} (1{,}800+ lines; component-by-component, with per-module line-number pointers).
+\item[--] Wave-by-wave build log with every decision: \texttt{NOTES.md} at repo root.
+\item[--] Worked example of one customer through every stage: \texttt{docs/worked\_example.tex}.
+\end{itemize}
+
+\end{document}

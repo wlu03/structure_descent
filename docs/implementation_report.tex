@@ -1,0 +1,1837 @@
+\documentclass[11pt,a4paper]{article}
+
+% ---------- packages ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  citecolor=green!50!black,
+  urlcolor=blue!60!black
+}
+
+\lstdefinestyle{mono}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!5},
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!50!black},
+  columns=fullflexible,
+  showstringspaces=false,
+  xleftmargin=1em,
+  xrightmargin=1em,
+}
+\lstset{style=mono}
+
+\algrenewcommand\algorithmicrequire{\textbf{Input:}}
+\algrenewcommand\algorithmicensure{\textbf{Output:}}
+
+\title{The PO-LEU Framework: Technical Reference \\
+\large Architecture, data flow, interfaces, algorithms, invariants}
+\author{PO-LEU project}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document is a technical specification of the PO-LEU framework as
+implemented. It treats the codebase as a layered system of protocols,
+data structures, and algorithms, and documents each layer formally with
+shape contracts, pseudocode, and complexity notes. The document is
+organized by \emph{component} rather than by \emph{build history}, and
+assumes a reader who wants to understand, extend, or replace any one of
+the pieces.
+
+PO-LEU is a narrative choice model. A frozen language model produces
+$K$ first-person outcome narratives for each of $J$ alternatives
+conditioned on a person's context. A frozen sentence encoder embeds
+each narrative to $\mathbb{R}^{d_e}$. Three small trainable networks
+(attribute heads, a weight net, and a salience net) decompose those
+embeddings into an attribute-weighted, salience-weighted value
+function $V(a_j)$, and choice probability is a softmax over the $J$
+alternatives. Training minimizes cross-entropy against the observed
+choice, regularized by four small terms.
+
+The framework has five layers: (1) a \textbf{schema-translation}
+layer that maps raw CSV columns into a canonical tidy representation
+under a strict invariant contract; (2) a \textbf{data-pipeline} layer
+that runs the standard sequence load $\to$ clean $\to$ join $\to$
+state-features $\to$ split $\to$ popularity $\to$ subsample $\to$
+translate-$z_d$ $\to$ build-choice-sets; (3) an \textbf{adapter} layer
+that exposes a dataset-agnostic Protocol implemented by a YAML reader;
+(4) a \textbf{model} layer with the three trainable submodules plus
+their composition \texttt{POLEU}; and (5) an \textbf{outcomes} layer
+that mediates between the data pipeline and the frozen LLM / encoder
+through cached, pluggable clients. A runtime driver ties all five
+layers together behind a CLI. The document ends with a step-by-step
+trace of a single Amazon customer through every layer, and with an
+extension guide for a second dataset.
+\end{abstract}
+
+\tableofcontents
+
+\newpage
+
+% =========================================================================
+\section{Framework Vocabulary}
+\label{sec:vocab}
+% =========================================================================
+
+The framework's surface vocabulary maps to the following objects.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+Symbol / name & Meaning \\
+\midrule
+$d$               & Decision-maker (customer) index. \\
+$t$               & Choice-event index (e.g. one Amazon purchase). \\
+$j \in \{0,\dots,J{-}1\}$ & Alternative index within a choice set. $J = 10$. \\
+$k \in \{0,\dots,K{-}1\}$ & Outcome index within an alternative. $K \in \{1,3\}$. \\
+$m \in \{1,\dots,M\}$ & Attribute index. $M = 5$. \\
+$z_d \in \mathbb{R}^p$ & Person feature vector. $p = 26$ canonical, $p = 23$ for Amazon. \\
+$c_d$             & Person context string (LLM-readable paraphrase of $z_d$). \\
+$x_j$             & Alternative metadata dict (\texttt{title}, \texttt{category}, \texttt{price}, \texttt{popularity\_rank}). \\
+$o_k^{(j)}$       & Generated first-person outcome narrative. \\
+$e_k^{(j)} \in \mathbb{R}^{d_e}$ & Frozen-encoder embedding of $o_k^{(j)}$, L2-normalized. $d_e = 768$. \\
+$u_m(\cdot)$      & Attribute head $m$: $\mathbb{R}^{d_e} \to \mathbb{R}$. \\
+$w_m(z_d)$        & Attribute weight: softmax output, $\sum_m w_m = 1$. \\
+$s_k^{(j)}$       & Outcome salience: softmax over $K$ within each $(d, t, j)$. \\
+$U_k^{(j)}$       & Outcome utility (scalar). \\
+$V(a_j)$          & Alternative value (scalar). \\
+$c^*_t$           & Index of the chosen alternative for event $t$. \\
+$\tau$            & Softmax temperature. Frozen at 1.0. \\
+$\omega_t$        & Importance weight for event $t$ (Appendix-C subsample). \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Batch dimension $B$ is prepended to all tensors in the training code.
+Unless otherwise stated, trainable linears use Xavier-uniform weights
+and zero biases.
+
+% =========================================================================
+\section{Mathematical Foundation}
+\label{sec:math}
+% =========================================================================
+
+\subsection{The choice event}
+
+A single training instance is a tuple
+\begin{equation}
+  \bigl(z_d,\ c_d,\ \{x_j\}_{j=0}^{J-1},\ \{e_k^{(j)}\}_{j,k},\ c^*_t\bigr).
+  \label{eq:tuple}
+\end{equation}
+The first four components are produced by the data pipeline
+(\S\ref{sec:pipeline}); $c^*_t$ is the ground-truth chosen index. The
+\textbf{training code consumes only $z_d$ and the embedding tensor}
+$E \in \mathbb{R}^{B \times J \times K \times d_e}$: $c_d$ is an
+input to the LLM generator only, and $x_j$ is an input to the prompt's
+user block only. Both $c_d$ and $x_j$ are out-of-band for the model
+itself.
+
+\subsection{The value function}
+
+PO-LEU's alternative-value composition is multilinear in two trainable
+axes $(w_m, u_m)$ but not in either alone:
+\begin{align}
+  U_k^{(j)} &= \sum_{m=1}^{M} w_m(z_d) \cdot u_m(e_k^{(j)}),
+  \label{eq:outcome-utility} \\
+  V(a_j)  &= \sum_{k=1}^{K} s_k^{(j)}\bigl(e_k^{(j)}, z_d\bigr)
+                \cdot U_k^{(j)}.
+  \label{eq:alt-value}
+\end{align}
+Equation~\eqref{eq:outcome-utility} is the person-weighted combination
+of attribute scores for one outcome. Equation~\eqref{eq:alt-value} is
+the salience-weighted combination across outcomes. Because both
+$w_m$ and $s_k^{(j)}$ are softmaxes (sum to 1 over $m$ and $k$
+respectively), $V(a_j)$ is a convex combination of
+$\{u_m(e_k^{(j)})\}$ — the model cannot produce values outside the
+range of the raw attribute scores.
+
+\subsection{Choice probability and loss}
+
+Choice probability is a softmax over alternatives with frozen
+temperature $\tau$:
+\begin{equation}
+  P(a_j \mid \text{context}) = \frac{\exp(V(a_j) / \tau)}{\sum_{j'=0}^{J-1} \exp(V(a_{j'}) / \tau)}.
+  \label{eq:softmax}
+\end{equation}
+The per-event loss is the negative log-likelihood of the observed
+choice:
+\begin{equation}
+  \ell_t = -\log P(a_{c^*_t} \mid \text{context}_t).
+  \label{eq:nll}
+\end{equation}
+A batch's data loss is importance-weighted by subsample weights
+$\omega_t$ (Appendix-C leverage sampling; $\omega_t = 1$ if
+subsampling is off):
+\begin{equation}
+  \mathcal{L}_{\text{data}}
+    = \frac{\sum_{t \in B} \omega_t \cdot \ell_t}{\sum_{t \in B} \omega_t}.
+  \label{eq:weighted-loss}
+\end{equation}
+
+\subsection{Regularization}
+
+Four regularizers are composed into the total loss
+$\mathcal{L} = \mathcal{L}_{\text{data}} + R$:
+\begin{equation}
+\begin{aligned}
+  R = \ & \lambda_{\mathrm{wL2}} \sum_{W \in \Phi_w} \|W\|_2^2
+      && \text{(weight-net L2)} \\
+      & - \lambda_H \cdot \mathbb{E}_{b,j}\!\left[
+          -\sum_k s_k^{(j)} \log s_k^{(j)}
+        \right]
+      && \text{(salience entropy, sign flipped)} \\
+      & + \lambda_{\mathrm{mono}} \cdot \mathbb{E}_{b,j,j'\;:\;p_j < p_{j'}}
+          \left[\bigl(\max(0, \Delta \bar{u}_{\text{fin}} / \Delta p)\bigr)^2\right]
+      && \text{(price monotonicity, alt-level)} \\
+      & + \lambda_{\mathrm{div}} \cdot \mathbb{E}_{b,j}\!\left[
+          \max_{k \ne k'} \cos(e_k, e_{k'})
+        \right]
+      && \text{(outcome diversity)}.
+\end{aligned}
+\label{eq:regs}
+\end{equation}
+Default $\lambda$s: $10^{-4}$, $10^{-3}$, $10^{-3}$, $10^{-4}$. The
+weight-net L2 runs over the set $\Phi_w$ of
+\texttt{nn.Linear.weight} tensors in \texttt{WeightNet} (biases
+excluded, since the spec's $\|\phi_w\|$ is the weight parameters).
+The salience-entropy term's sign is flipped inside
+\texttt{combined\_regularizer}: $H(S) \ge 0$ is returned positive, and
+the loss subtracts $\lambda_H \cdot H(S)$ so \emph{higher} entropy
+\emph{lowers} loss (encouraging attention spread). The monotonicity
+surrogate operates per batch on pairs of alternatives ordered by price
+within the batch, taking the positive part of $\Delta u_{\text{fin}} /
+\Delta p$ — penalizing increases in the financial head as price
+rises.
+
+\subsection{Gradient flow}
+
+Only the three trainable networks receive gradients. The LLM is
+frozen, and so is the sentence encoder. Given a loss
+$\mathcal{L}$, the chain of partial derivatives stops at $E$ (the
+encoder's output is a constant for the purpose of training):
+
+\begin{equation}
+\frac{\partial \mathcal{L}}{\partial \theta_w}, \quad
+\frac{\partial \mathcal{L}}{\partial \theta_u}, \quad
+\frac{\partial \mathcal{L}}{\partial \theta_s}
+\qquad \text{are the only populated gradients.}
+\label{eq:grad-flow}
+\end{equation}
+Here $\theta_w, \theta_u, \theta_s$ are the parameters of the
+weight-net, attribute-heads, and salience-net, respectively.
+
+% =========================================================================
+\section{Type System and Core Data Structures}
+\label{sec:types}
+% =========================================================================
+
+The framework is built around eight core dataclasses / Protocols, each
+frozen when possible. Every module's I/O is typed against one of them.
+
+\subsection{Schema dataclasses}
+
+\begin{lstlisting}[language=Python]
+@dataclass(frozen=True)
+class DatasetSchema:
+    name: str
+    description: str
+    events_path: Path
+    events_parse_dates: tuple[str, ...]
+    events_column_map: dict[str, str]        # raw -> canonical
+    events_dropna_subset: tuple[str, ...]
+    events_category_null_fill: str
+    events_dtype_coerce: dict[str, str]
+    persons_path: Path
+    persons_id_column: str
+    z_d_mapping: tuple[ZDFieldSpec, ...]
+    choice_set_size: int
+    n_resamples: int
+    val_frac: float
+    test_frac: float
+    subsample_enabled: bool
+    subsample_n_customers: int
+    subsample_seed: int
+
+@dataclass(frozen=True)
+class ZDFieldSpec:
+    canonical_column: str
+    kind: Literal["categorical_map", "categorical_map_with_collapse",
+                  "categorical_to_int", "ordinal_map", "constant",
+                  "composite", "external_lookup", "derived_from_events",
+                  "passthrough"]
+    source: str | None
+    values: dict[Any, Any] | None
+    drop_on_unknown: tuple[str, ...] = ()
+    value: Any | None = None
+    formula: str | None = None
+    clamp: tuple[float, float] | None = None
+    fallback: Any | None = None
+    lookup_path: Path | None = None
+    aggregator: str | None = None
+    aggregator_column: str | None = None
+    group_by: str | None = None
+    note: str = ""
+\end{lstlisting}
+
+\subsection{Model and training dataclasses}
+
+\begin{lstlisting}[language=Python]
+@dataclass(frozen=True)
+class CategoricalVocabularies:
+    age_bucket: tuple[str, ...]
+    income_bucket: tuple[str, ...]
+    city_size: tuple[str, ...]
+    household_size_categories: tuple[str, ...] = ("1","2","3","4","5+")
+
+@dataclass(frozen=True)
+class PersonFeatureStats:
+    means: np.ndarray                       # (n_standardized,)
+    stds: np.ndarray
+    age_categories: list[str]
+    income_categories: list[str]
+    household_size_categories: list[str]
+    city_size_categories: list[str]
+    feature_columns: list[str]              # length p; fixes output order
+
+@dataclass
+class POLEUIntermediates:
+    A: torch.Tensor   # (B, J, K, M)
+    w: torch.Tensor   # (B, M), sums to 1 over M
+    U: torch.Tensor   # (B, J, K)
+    S: torch.Tensor   # (B, J, K), sums to 1 over K
+    V: torch.Tensor   # (B, J)
+
+@dataclass
+class AssembledBatch:
+    z_d: torch.Tensor            # (N, p) float32
+    E: torch.Tensor              # (N, J, K, d_e) float32, row-L2-normalized
+    c_star: torch.Tensor         # (N,) int64
+    omega: torch.Tensor          # (N,) float32
+    prices: torch.Tensor         # (N, J) float32
+    customer_ids: list[str]
+    chosen_asins: list[str]
+    outcomes_nested: list[list[list[str]]]   # [N][J][K]
+
+@dataclass
+class TrainConfig:
+    batch_size: int = 128
+    lr: float = 1e-3
+    lr_min: float = 1e-4
+    optimizer: str = "adam"
+    beta1: float = 0.9
+    beta2: float = 0.999
+    max_epochs: int = 30
+    early_stopping_patience: int = 5
+    grad_clip: float = 1.0
+
+@dataclass
+class RegularizerConfig:
+    weight_l2: float
+    salience_entropy: float
+    monotonicity_enabled: bool
+    monotonicity: float
+    diversity: float
+\end{lstlisting}
+
+\subsection{Tensor shape catalog}
+
+Every module's tensors are annotated with shapes in code. The
+canonical table:
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l l@{}}
+\toprule
+Tensor & Shape & Produced by \\
+\midrule
+\texttt{z\_d}              & $(B, p)$              & person\_features.transform\_person\_features \\
+\texttt{E}                 & $(B, J, K, d_e)$      & encode.encode\_outcomes\_tensor \\
+\texttt{c\_star}           & $(B,)$ int64          & choice\_sets.build\_choice\_sets \\
+\texttt{omega}             & $(B,)$ float32        & subsample.apply\_subsample \\
+\texttt{prices}            & $(B, J)$ float32      & batching.assemble\_batch (from alt\_texts) \\
+\texttt{A}  (attribute scores)      & $(B, J, K, M)$    & model.attribute\_heads.AttributeHeadStack \\
+\texttt{w}  (weights)               & $(B, M)$          & model.weight\_net.WeightNet \\
+\texttt{U}  (outcome utilities)     & $(B, J, K)$       & $A \cdot w_{\text{broadcast}}$ summed over $M$ \\
+\texttt{S}  (salience)              & $(B, J, K)$       & model.salience\_net.SalienceNet \\
+\texttt{V}  (alt values)            & $(B, J)$          & $(S \cdot U)$ summed over $K$ \\
+\texttt{logits}                     & $(B, J)$          & $V / \tau$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =========================================================================
+\section{Data Pipeline: The Canonical Path}
+\label{sec:pipeline}
+% =========================================================================
+
+The data pipeline is eight stateless stages. Every stage takes a
+pandas DataFrame plus a \texttt{DatasetSchema} and emits a DataFrame
+plus a validator that fires on the next stage's preconditions.
+
+\subsection{Stage graph}
+
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+        YAML
+         v
+   load_schema -> DatasetSchema (frozen)
+         v
+load.load  ---[validate_loaded]--->  (raw events, raw persons)
+         v
+clean.clean_events                   canonical rename + dropna + dtype + sort
+         v
+            [validate_cleaned]
+         v
+survey_join.join_survey              left-join raw persons onto cleaned events
+         v
+            [validate_joined]
+         v
+state_features.compute_state_features  routine / novelty / recency / brand / ...
+         v
+            [validate_state_features]
+         v
+split.temporal_split                 per-customer earliest -> latest
+         v
+            [validate_split]
+         v
+state_features.attach_train_popularity    train-only popularity broadcast
+         v
+            [validate_popularity]
+         v
+(optional) subsample.subsample_customers   PCA + KMeans + leverage scores
+         v
+adapter.translate_z_d                   canonical 10-column z_d, fit-on-train
+         v
+(driver) purchase_frequency count -> events/week normalization
+         v
+(driver) c_d_extra_fields extraction (Wave-11 enrichment)
+         v
+choice_sets.build_choice_sets           per-event records with z_d, c_d, alt_texts
+         v
+batching.assemble_batch                 tensors: z_d, E, c_star, omega, prices
+         v
+model / train / eval
+\end{lstlisting}
+
+\subsection{Stage I/O contracts}
+
+\subsubsection*{\texttt{load.load(schema)}}
+
+\begin{itemize}
+\item[$\triangleright$] \textbf{Input:} \texttt{DatasetSchema}; optional override paths.
+\item[$\triangleright$] \textbf{Output:} \texttt{(events\_raw, persons\_raw)} — raw
+DataFrames, unmodified column names. Datetime columns parsed per
+\texttt{schema.events\_parse\_dates}. Missing columns in
+\texttt{parse\_dates} are defensively pruned (so the invariant
+layer, not pandas, owns the error).
+\item[$\triangleright$] \textbf{Invariant:} for each canonical destination in
+\texttt{schema.events\_column\_map}, at least one of its source
+keys is present in the loaded DataFrame. Alias raw keys are
+supported (Amazon maps both ``ASIN/ISBN (Product Code)'' and
+``ASIN/ISBN'' to \texttt{asin}).
+\end{itemize}
+
+\subsubsection*{\texttt{clean.clean\_events(events\_raw, schema)}}
+
+\begin{itemize}
+\item[$\triangleright$] Delegates the rename + dropna + dtype coerce to
+\texttt{schema\_map.translate\_events}.
+\item[$\triangleright$] Sorts by \texttt{(customer\_id, order\_date)} with stable
+mergesort, then \texttt{reset\_index(drop=True)}.
+\item[$\triangleright$] Logs drop fraction at INFO; WARNING if $>5\%$.
+\item[$\triangleright$] \textbf{Invariants (post):} \texttt{customer\_id} non-null and
+string; \texttt{order\_date} datetime64 with no NaT; \texttt{price}
+non-negative float; \texttt{asin} and \texttt{category} non-null.
+\end{itemize}
+
+\subsubsection*{\texttt{survey\_join.join\_survey(events, persons\_raw, schema)}}
+
+\begin{itemize}
+\item[$\triangleright$] Renames \texttt{schema.persons\_id\_column} to
+\texttt{customer\_id} on the persons side.
+\item[$\triangleright$] Drops all-NaN columns and duplicate \texttt{customer\_id}
+rows (keep first).
+\item[$\triangleright$] Snake-cases remaining columns with regex
+\texttt{[\^{}0-9a-z]+ $\to$ \_}, dropping leading/trailing
+underscores.
+\item[$\triangleright$] Left-join on \texttt{customer\_id}, preserving events row
+count.
+\item[$\triangleright$] \textbf{Orphan policy:} events referring to customers
+absent from persons stay in the events table (they contribute to
+popularity counts); WARNING logs an orphan count.
+\end{itemize}
+
+\subsubsection*{\texttt{state\_features.compute\_state\_features(events)}}
+
+Adds seven columns derived from each customer's prior event history.
+Each column is strict-prior (no future leakage):
+\begin{itemize}
+\item[$\triangleright$] \texttt{routine}: cumcount of
+\texttt{(customer\_id, asin)}.
+\item[$\triangleright$] \texttt{novelty}: \texttt{(routine == 0)}.
+\item[$\triangleright$] \texttt{recency\_days}: days since previous purchase of
+the same asin; 999 sentinel for first-time.
+\item[$\triangleright$] \texttt{cat\_affinity}: cumcount of
+\texttt{(customer\_id, category)}.
+\item[$\triangleright$] \texttt{cat\_count\_7d, cat\_count\_30d}: rolling
+counts with a time-indexed 7-day / 30-day window.
+\item[$\triangleright$] \texttt{brand}: mode first-token of \texttt{title} per
+asin, filtered through a stopword list; low-frequency brands
+(count $<2$) collapse to \texttt{"unknown\_brand"}.
+\end{itemize}
+
+\subsubsection*{\texttt{split.temporal\_split(events, schema)}}
+
+Per customer, allocate rows in time order (oldest $\to$ newest):
+\[
+n_{\text{test}} = \max\!\bigl(1, \lfloor n \cdot f_{\text{test}} \rfloor\bigr),
+\quad
+n_{\text{val}} = \max\!\bigl(1, \lfloor n \cdot f_{\text{val}} \rfloor\bigr),
+\quad
+n_{\text{train}} = n - n_{\text{val}} - n_{\text{test}}.
+\]
+Collapse: if $n_{\text{train}} \le 0$, set $n_{\text{val}} = 0$ and
+$n_{\text{test}} = 1$.
+
+\subsubsection*{\texttt{state\_features.attach\_train\_popularity(events)}}
+
+Requires \texttt{split} column. Computes
+$\text{pop}(\text{asin}) = \sum_{t \in \text{train}} \mathbb{1}[\text{asin}_t = \text{asin}]$,
+broadcasts to all rows. Unseen ASINs (val/test-only) get
+\texttt{popularity = 0}; a WARNING logs the count.
+
+\subsubsection*{\texttt{subsample.subsample\_customers(train\_df, n)}}
+
+Appendix-C leverage subsample. Algorithm:
+
+\begin{algorithm}[H]
+\caption{Leverage-score customer subsample}
+\begin{algorithmic}[1]
+\Require Training event DataFrame, budget $n_c$, seed
+\Ensure Selected customer ids $S$; per-event importance weights $\omega$
+\State Build per-customer profile matrix $X \in \mathbb{R}^{n_{\text{cust}} \times d}$:
+PCA of category-fraction pivot + 5 scalar features
+(\texttt{repeat\_rate, mean\_recency, novelty\_rate, purchase\_freq, cat\_entropy}).
+\State Standardize columns of $X$ (fit $\mu, \sigma$).
+\State SVD: $X = U \Sigma V^\top$; leverage scores $h_i = \|U_i\|^2$ with $\sigma > 10^{-6}$ kept.
+\State $n_{\text{clusters}} \gets \max(n_c / 5,\ 2)$.
+\State Run KMeans with \texttt{n\_init=10}, seeded.
+\State For each cluster, add its top-$2$-by-leverage members to $S$.
+\State Fill remaining budget by \texttt{np.random.choice} weighted by leverage (no replacement).
+\State Customer-level weights: $\tilde{\omega}_i = 1 / (n_c \cdot q_i)$ where $q_i = h_i / \sum h$; rescale so $\sum \omega = n_{\text{total}}$.
+\State Broadcast customer weights to per-event $\omega_t$.
+\State \Return $S, \omega$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection*{\texttt{adapter.translate\_z\_d(persons\_raw, training\_events)}}
+
+Thin wrapper over \texttt{schema\_map.translate\_persons}. For each
+\texttt{ZDFieldSpec} in the schema, applies the kind's handler to the
+raw persons frame; for \texttt{kind == "derived\_from\_events"},
+aggregates over \texttt{training\_events}. Output columns are in
+canonical order: \texttt{[age\_bucket, income\_bucket,
+household\_size, has\_kids, city\_size, education,
+health\_rating, risk\_tolerance, purchase\_frequency,
+novelty\_rate]} + \texttt{customer\_id}.
+
+\subsubsection*{\texttt{choice\_sets.build\_choice\_sets(...)}}
+
+The most involved stage. Per event it builds the set of $J = 10$
+alternatives and attaches per-event \texttt{z\_d, c\_d, alt\_texts}.
+Pseudocode in Algorithm~\ref{alg:choice-sets}.
+
+\begin{algorithm}[H]
+\caption{Per-event choice-set construction}
+\label{alg:choice-sets}
+\begin{algorithmic}[1]
+\Require events (with \texttt{split, popularity, category, asin, order\_date, price}), persons\_canonical, adapter, $n_{\text{neg}} = 9$, seed
+\Ensure List of per-event records with keys \{customer\_id, order\_date, category, chosen\_asin, choice\_asins, chosen\_idx, chosen\_features, metadata, z\_d, c\_d, alt\_texts\}
+\State Fit-on-train assert: $\mathrm{persons\_canonical}.\mathrm{customer\_id} \subseteq \mathrm{events}[\mathrm{split}=\text{train}].\mathrm{customer\_id}$.
+\State Build per-customer caches:
+\State \quad \texttt{stats $\gets$ fit\_person\_features(persons\_canonical, vocabs=adapter.categorical\_vocabularies())}
+\State \quad \texttt{z\_d\_matrix $\gets$ transform\_person\_features(...)}
+\State \quad \texttt{customer\_to\_zd[cid] = z\_d\_matrix[i]}
+\State \quad \texttt{customer\_to\_cd[cid] = build\_context\_string(row, suppress=adapter.suppress\_fields\_for\_c\_d(), extras=...)}
+\State Build global ASIN caches: \texttt{sort\_by\_first\_seen}, \texttt{sorted\_pop}, \texttt{sorted\_cat}, per-category prefix arrays.
+\For{each event $t$}
+  \State $\text{avail}_t \gets$ ASINs with \texttt{first\_seen < order\_date[t]}.
+  \State $\text{rng}_t \gets \mathrm{np.random.default\_rng}(\mathrm{seed} + 1{,}000{,}003 \cdot k_{\text{rep}} + t)$.
+  \If{$\text{category}_t$ is \texttt{Unknown}}
+    \State $\text{negs} \gets$ sample $n_{\text{neg}}$ from $\text{avail}_t$, weighted by \texttt{sorted\_pop}.
+  \Else
+    \State $\text{cat\_negs} \gets$ sample $\lfloor n_{\text{neg}}/2 \rfloor$ from same-category prefix.
+    \State $\text{rand\_negs} \gets$ sample $n_{\text{neg}} - \lfloor n_{\text{neg}}/2 \rfloor$ from $\text{avail}_t$.
+    \State $\text{negs} \gets \text{cat\_negs} \mathbin\Vert \text{rand\_negs}$.
+  \EndIf
+  \State If $\text{chosen} \in \text{negs}$: bump offending index by 1 in the sorted array.
+  \State \textbf{Deduplicate} (Wave-11 guard): reject negatives already in $\{\text{chosen}\} \cup \text{kept}$; resample up to 5 rounds; pad cyclically on exhaustion (metadata.dedup\_fallback = True).
+  \State $\text{alt\_codes} \gets \text{rng}_t.\mathrm{permutation}([\text{chosen}] \mathbin\Vert \text{negs})$.
+  \State $\text{chosen\_idx}_t \gets$ position of \texttt{chosen} in \texttt{alt\_codes}.
+  \State \textbf{alt\_texts} $\gets$ \texttt{adapter.alt\_text(asin\_lookup[asin])} for each alt asin.
+  \State Emit record with \texttt{z\_d = customer\_to\_zd[cid]}, \texttt{c\_d = customer\_to\_cd[cid]}.
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+Per-event RNG seed $\mathrm{seed} + 1{,}000{,}003 \cdot k_{\text{rep}} + t$
+gives reproducibility under \texttt{n\_resamples} $\ge 1$ without
+cross-event state leakage.
+
+\subsubsection*{\texttt{batching.assemble\_batch(records, ...)}}
+
+Converts choice-set records to tensors and runs outcome generation +
+encoding through caches.
+
+\begin{algorithm}[H]
+\caption{Tensor assembly}
+\begin{algorithmic}[1]
+\Require records, adapter, llm\_client, encoder, outcomes\_cache, embeddings\_cache, $K$, seed, prompt\_version, diversity\_filter
+\Ensure AssembledBatch
+\State $N, J \gets$ derived from records.
+\State $\text{flat\_texts} \gets [\,]$; $\text{outcomes\_nested} \gets [\,]$.
+\For{$i = 0 \dots N-1$}
+  \For{$j = 0 \dots J-1$}
+    \State payload $\gets$ generate\_outcomes(cid, asin, c\_d, alt\_texts[i][j], $K$, seed, prompt\_version, client, cache, diversity\_filter).
+    \State assert \texttt{len(payload.outcomes) == K}.
+    \State append \texttt{payload.outcomes} to \texttt{outcomes\_nested[i][j]}.
+    \State extend \texttt{flat\_texts} with \texttt{payload.outcomes}.
+  \EndFor
+\EndFor
+\State $E_{\text{flat}} \gets$ encode\_batch(flat\_texts, encoder, embeddings\_cache). \Comment{One call; batches inside.}
+\State $E \gets E_{\text{flat}}.\mathrm{reshape}(N, J, K, d_e)$.
+\State $z_d \gets$ \texttt{torch.from\_numpy(np.stack([r["z\_d"] for r in records]))}.
+\State $c^* \gets$ \texttt{torch.tensor([r["chosen\_idx"] for r in records], dtype=int64)}.
+\State $\text{prices} \gets \texttt{torch.tensor}(N, J)$ from \texttt{r["alt\_texts"][j]["price"]}.
+\State $\omega \gets$ ones$(N)$ if not supplied.
+\State \textbf{Invariants:} z\_d shape $(N, p)$ with consistent $p$; $E$ shape + unit-norm; $c^* \in [0, J)$; prices $\ge 0$; no NaN in $E$ or $z\_d$.
+\State \Return \texttt{AssembledBatch(...)}.
+\end{algorithmic}
+\end{algorithm}
+
+% =========================================================================
+\section{Schema Translation: Nine Kinds}
+\label{sec:schema}
+% =========================================================================
+
+\texttt{schema\_map.py} implements the raw $\to$ canonical mapping as a
+dispatcher over nine \texttt{kind} values. All handlers share an
+invariant: an unknown raw value raises
+\texttt{UnknownCategoryError} at translate time, with the offending
+row's index visible in the message. Rows whose source value is in
+\texttt{drop\_on\_unknown} are removed before dispatch.
+
+\subsection{\texttt{categorical\_map}}
+$\text{output}_i = \text{values}[\text{raw}_i]$. Exact 1:1 rename.
+
+\subsection{\texttt{categorical\_map\_with\_collapse}}
+Same handler as \texttt{categorical\_map}; many-to-one collisions in
+\texttt{values} are expected. Used by Option-B income collapse:
+\begin{lstlisting}
+values:
+  "$50,000 - $74,999":  "50-100k"
+  "$75,000 - $99,999":  "50-100k"   # collapse
+\end{lstlisting}
+
+\subsection{\texttt{categorical\_to\_int}}
+Same as \texttt{categorical\_map} with whitespace stripping, then
+coerces the mapped value to \texttt{int}.
+
+\subsection{\texttt{ordinal\_map}}
+Semantic alias for \texttt{categorical\_to\_int}. Exists so schema
+authors can signal intent.
+
+\subsection{\texttt{constant}}
+$\text{output}_i = \text{spec.value}$ for all $i$. Source must be None;
+enforced at load time.
+
+\subsection{\texttt{composite}}
+
+Evaluates a user-supplied formula over the raw columns per row. No
+\texttt{eval()}. Parser algorithm:
+
+\begin{algorithm}[H]
+\caption{Restricted composite-formula evaluator}
+\begin{algorithmic}[1]
+\Require Formula string (with backtick-quoted hyphenated names), persons DataFrame, clamp range, fallback
+\Ensure Per-row scalar
+\State Preprocess: convert backtick-names to valid Python identifiers, record mapping.
+\State \texttt{tree $\gets$ ast.parse(formula, mode='eval')}.
+\State Traverse tree; for every node $n$:
+\State \quad if $n$ is \texttt{BinOp} with op $\in$ \{Add, Sub, Mult, Div, Pow, USub\}: OK.
+\State \quad elif $n$ is \texttt{Compare} with single op == Eq: OK.
+\State \quad elif $n$ is \texttt{Constant} (num or str) or \texttt{Name} (in column map): OK.
+\State \quad elif $n$ is \texttt{Call} with func.id $\in$ \{min, max, abs\}: OK.
+\State \quad else: raise \texttt{CompositeFormulaError}.
+\State At parse time, verify every referenced \texttt{Name} is a real column.
+\State For each row: evaluate the AST recursively; boolean comparison results coerce to 0/1.
+\State Clamp and fallback on NaN.
+\end{algorithmic}
+\end{algorithm}
+
+Example Amazon formula:
+\begin{lstlisting}
+formula: "5 - (`Q-personal-diabetes` == 'Yes') - (`Q-personal-wheelchair` == 'Yes')"
+clamp: [1, 5]
+fallback: 3
+\end{lstlisting}
+
+\subsection{\texttt{external\_lookup}}
+
+Loads a CSV with columns \texttt{(key, value)}, maps
+\texttt{raw[source]} via the CSV; missing keys get
+\texttt{spec.fallback}. If the CSV is empty or missing, every row
+falls through to the fallback.
+
+\subsection{\texttt{derived\_from\_events}}
+
+Runs \emph{after} \texttt{state\_features} has populated event-level
+derived columns. Aggregator is one of:
+
+\begin{itemize}
+\item \texttt{count}: group events by \texttt{group\_by}
+(typically \texttt{customer\_id}) and take size.
+\item \texttt{mean}: group events by \texttt{group\_by}; take the
+mean of \texttt{aggregator\_column} (e.g.
+\texttt{mean(novelty)}).
+\end{itemize}
+
+The output is joined back to the persons DataFrame on \texttt{customer\_id}.
+
+\subsection{\texttt{passthrough}}
+
+$\text{output}_i = \text{raw}_i$; zero translation.
+
+% =========================================================================
+\section{Invariant System}
+\label{sec:invariants}
+% =========================================================================
+
+\texttt{src/data/invariants.py} defines one \texttt{InvariantError}
+exception plus one validator per pipeline stage. Each validator raises
+unconditionally on failure; there is no \texttt{strict=False} escape.
+
+\subsection{\texttt{InvariantError} carrier}
+
+\begin{lstlisting}[language=Python]
+class InvariantError(AssertionError):
+    invariant_name: str
+    stage: str
+    message: str
+    column: str | None
+    offending: pd.DataFrame | None   # up to 5 rows
+\end{lstlisting}
+
+\subsection{Invariant catalog}
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l l@{}}
+\toprule
+Stage & Invariant name & Condition \\
+\midrule
+load                 & events\_column\_map\_canonical\_satisfied & Each canonical destination has $\ge 1$ raw source key present. \\
+load                 & persons\_id\_column\_present              & Persons DataFrame contains \texttt{schema.persons\_id\_column}. \\
+cleaned              & canonical\_columns\_present              & $\{$customer\_id, order\_date, price, asin, category$\}$ all present. \\
+cleaned              & customer\_id\_dtype                      & String / object. \\
+cleaned              & customer\_id\_non\_null                   & No NaN. \\
+cleaned              & order\_date\_datetime64                   & dtype \texttt{datetime64[ns]}. \\
+cleaned              & order\_date\_no\_nat                      & No NaT. \\
+cleaned              & price\_non\_negative                     & $\ge 0$ for all rows. \\
+cleaned              & price\_float                             & \texttt{float32} or \texttt{float64}. \\
+cleaned              & asin\_non\_null                          & \\
+cleaned              & category\_non\_null                      & (After \texttt{category\_null\_fill} applied.) \\
+joined               & customer\_id\_non\_null                   & \\
+joined               & join\_miss\_rate                         & Logged WARN if $> 5\%$; raises at $> 50\%$. \\
+state\_features      & state\_columns\_present                   & routine, novelty, cat\_affinity, cat\_count\_7d, cat\_count\_30d, recency\_days, brand. \\
+state\_features      & state\_non\_negative                     & routine, novelty, cat\_affinity, cat\_count\_*. \\
+state\_features      & recency\_days\_valid                      & Real $\ge 0$ or sentinel $999$. \\
+split                & split\_column\_present                   & \\
+split                & split\_values\_subset                    & $\subseteq \{$train, val, test$\}$. \\
+split                & every\_customer\_has\_train               & At least 1 train row per customer. \\
+popularity           & popularity\_int64                        & \\
+popularity           & popularity\_non\_negative                & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Debugging contract}
+
+Every failure prints the invariant name, the stage, the column
+(if applicable), and up to 5 offending rows as a
+pandas DataFrame:
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize]
+InvariantError: [invariant=order_date_no_nat] [stage=cleaned]
+  column='order_date': found 3 NaT rows. Offending (head 5):
+       customer_id order_date   asin  price category
+  14   R_1QkZE...       NaT   B01MG  19.99   HOME
+  ...
+\end{lstlisting}
+
+The 5-row sample is a copy, never a reference; it doesn't pin the
+parent DataFrame in memory during long debug sessions.
+
+% =========================================================================
+\section{Adapter Protocol}
+\label{sec:adapter}
+% =========================================================================
+
+\subsection{Design goal}
+
+The \texttt{DatasetAdapter} Protocol is a dataset-agnostic facade over
+the data pipeline. It was designed to answer, in exactly 8 method
+signatures, the question ``what do I have to implement to add a second
+dataset?''
+
+\subsection{Protocol surface}
+
+\begin{lstlisting}[language=Python]
+@runtime_checkable
+class DatasetAdapter(Protocol):
+    name: str
+    schema: DatasetSchema
+
+    # Raw data
+    def load_events(self) -> pd.DataFrame: ...
+    def load_persons(self) -> pd.DataFrame: ...
+
+    # Canonicalization
+    def event_column_map(self) -> dict[str, str]: ...
+    def person_id_column(self) -> str: ...
+    def translate_z_d(self, persons_raw, *, training_events=None) -> pd.DataFrame: ...
+    def derived_z_d_columns(self) -> tuple[str, ...]: ...
+    def categorical_vocabularies(self) -> CategoricalVocabularies: ...
+
+    # LLM surface
+    def alt_text(self, event_row: Mapping) -> dict[str, Any]: ...
+    def suppress_fields_for_c_d(self) -> tuple[str, ...]: ...
+\end{lstlisting}
+
+\subsection{\texttt{YamlAdapter}: the default implementation}
+
+\texttt{YamlAdapter} reads a dataset YAML and implements every
+Protocol method by delegation:
+
+\begin{lstlisting}[language=Python]
+class YamlAdapter:
+    def __init__(self, yaml_path):
+        self.yaml_path = Path(yaml_path)
+        self.schema = load_schema(self.yaml_path)
+        self.name = self.schema.name
+        self._events_cache = None
+        self._persons_cache = None
+        self._popularity_percentile_fn = None
+        self._vocab_cache = None
+        self._suppress_fields_cache = self._compute_suppress_fields()
+
+    def load_events(self):
+        if self._events_cache is None:
+            self._events_cache, self._persons_cache = load(self.schema)
+        return self._events_cache
+
+    def translate_z_d(self, persons_raw, *, training_events=None):
+        return translate_persons(persons_raw, self.schema,
+                                 training_events=training_events)
+
+    def alt_text(self, event_row):
+        pop_rank = (self._popularity_percentile_fn(int(event_row.get("popularity", 0)))
+                    if self._popularity_percentile_fn is not None
+                    else f"popularity score {int(event_row.get('popularity', 0))}")
+        return {"title": str(event_row.get("title", "")),
+                "category": str(event_row.get("category", "")),
+                "price": float(event_row.get("price", 0.0)),
+                "popularity_rank": pop_rank}
+    # ... etc.
+\end{lstlisting}
+
+\subsection{Derivation of \texttt{suppress\_fields\_for\_c\_d}}
+
+The adapter computes the suppression list at \texttt{\_\_init\_\_} time
+by walking \texttt{schema.z\_d\_mapping}:
+
+\begin{algorithm}[H]
+\caption{\texttt{\_compute\_suppress\_fields}}
+\begin{algorithmic}[1]
+\Ensure Tuple of canonical column names to suppress in $c_d$
+\State $L \gets [\,]$
+\For{spec in \texttt{schema.z\_d\_mapping}}
+  \If{spec.kind == "constant"}
+    \State append spec.canonical\_column to $L$.
+  \ElsIf{spec.kind == "external\_lookup" and spec.lookup\_path is empty or missing}
+    \State append spec.canonical\_column to $L$.
+  \EndIf
+\EndFor
+\State \Return \texttt{tuple(L)}
+\end{algorithmic}
+\end{algorithm}
+
+For Amazon: \texttt{has\_kids} (constant 0) and \texttt{city\_size}
+(empty external lookup) are suppressed; \texttt{health\_rating} and
+\texttt{risk\_tolerance} are composites that vary across customers,
+so they render.
+
+\subsection{Derivation of \texttt{categorical\_vocabularies}}
+
+Closed-set vocabularies for the four one-hot columns, derived from the
+YAML:
+
+\begin{itemize}
+\item \texttt{categorical\_map} / \texttt{categorical\_map\_with\_collapse}:
+vocabulary is \texttt{sorted(set(spec.values.values()))}.
+\item \texttt{constant}: vocabulary is \texttt{(str(spec.value),)}.
+\item \texttt{external\_lookup}: vocabulary is the CSV's \texttt{value}
+column if non-empty, else \texttt{(str(spec.fallback),)}.
+\end{itemize}
+
+The adapter passes this object to \texttt{fit\_person\_features}; the
+fit then uses schema-declared labels rather than learning from data,
+which stabilizes $p$ across training-slice compositions.
+
+\subsection{Symmetric enrichment}
+
+\texttt{c\_d\_extra\_fields} is a sibling YAML block with the same
+9-kind schema; the driver reads it, calls
+\texttt{extract\_extra\_fields\_from\_row} per raw persons row, and
+passes the result to \texttt{build\_context\_string}'s
+\texttt{extra\_fields} kwarg. This adds signal to $c_d$ without
+enlarging $z_d$ — preserving the $p$ contract while exposing more of
+the underlying survey to the LLM.
+
+% =========================================================================
+\section{Model Architecture}
+\label{sec:model}
+% =========================================================================
+
+Three trainable networks compose \texttt{POLEU}. Each is a standard
+two-layer MLP with Xavier-uniform weights and zero biases, no dropout,
+no layer norm, no residuals — the architectural minimum that admits
+the decomposition into interpretable pieces.
+
+\subsection{AttributeHead}
+
+\begin{equation}
+\begin{aligned}
+  h &= \mathrm{ReLU}(W_1 e + b_1), \quad W_1 \in \mathbb{R}^{128 \times 768},\ b_1 \in \mathbb{R}^{128} \\
+  u &= W_2 h + b_2, \quad W_2 \in \mathbb{R}^{1 \times 128},\ b_2 \in \mathbb{R}
+\end{aligned}
+\label{eq:attr-head}
+\end{equation}
+
+Parameter count per head: $768 \cdot 128 + 128 + 128 + 1 = 98{,}561$.
+At $M = 5$, \texttt{AttributeHeadStack} has $M \cdot 98{,}561 =
+492{,}805$ parameters total, held in an \texttt{nn.ModuleList}. Forward
+is a per-head application over the last dim of $E$.
+
+\subsection{WeightNet}
+
+\begin{equation}
+\begin{aligned}
+  h &= \mathrm{ReLU}(W_1 z_d + b_1), \quad W_1 \in \mathbb{R}^{32 \times p},\ b_1 \in \mathbb{R}^{32} \\
+  r &= W_2 h + b_2, \quad W_2 \in \mathbb{R}^{M \times 32},\ b_2 \in \mathbb{R}^M \\
+  w &= \mathrm{normalize}(r) \quad \in \Delta^{M-1}
+\end{aligned}
+\label{eq:weight-net}
+\end{equation}
+
+where $\mathrm{normalize}$ is \texttt{softmax(dim=-1)} by default or
+the softplus-then-divide form
+$\mathrm{softplus}(r) / \sum_m \mathrm{softplus}(r_m)$ for ablation
+A4. Parameter count: $32(p+1) + 5(33)$. At $p = 26$: $1{,}029$. At
+$p = 23$: $963$.
+
+\subsection{SalienceNet}
+
+\begin{equation}
+\begin{aligned}
+  \tilde{z} &= z_d[:, \text{None}, \text{None}, :].\mathrm{expand}(B, J, K, p) \\
+  x &= \mathrm{concat}(E, \tilde{z}), \quad x \in \mathbb{R}^{B \times J \times K \times (d_e + p)} \\
+  h &= \mathrm{ReLU}(W_1 x + b_1) \\
+  \sigma &= (W_2 h + b_2).\mathrm{squeeze}(-1) \\
+  S &= \mathrm{softmax}(\sigma,\ \mathrm{dim}=\mathrm{K})
+\end{aligned}
+\label{eq:salience}
+\end{equation}
+
+Parameter count: $(d_e + p)\cdot 64 + 64 + 64 + 1$. At $p = 26$:
+$50{,}945$. At $p = 23$: $50{,}689$. The softmax over $K$ is applied
+\emph{after} the MLP scalar, not before. Because $z_d$ is broadcast
+identically across $K$, any constant contribution to $\sigma$ cancels
+exactly under the softmax (constant-column invariance).
+
+\texttt{UniformSalience} is the A6 ablation: zero trainable params,
+returns $1/K$ for every $(B, J, K)$ slice.
+
+\subsection{\texttt{POLEU} composition}
+
+\begin{algorithm}[H]
+\caption{\texttt{POLEU.forward}}
+\begin{algorithmic}[1]
+\Require $z_d \in \mathbb{R}^{B \times p}$, $E \in \mathbb{R}^{B \times J \times K \times d_e}$
+\Ensure $\text{logits} \in \mathbb{R}^{B \times J}$, \texttt{POLEUIntermediates}
+\State $A \gets \text{heads}(E)$ \Comment{$(B, J, K, M)$}
+\State $w \gets \text{weight\_net}(z_d)$ \Comment{$(B, M)$}
+\State $U \gets (A \cdot w[:, \text{None}, \text{None}, :]).\mathrm{sum}(\mathrm{dim}=-1)$ \Comment{$(B, J, K)$}
+\State $S \gets \text{salience}(E, z_d)$ \Comment{$(B, J, K)$, softmax over $K$}
+\State $V \gets (S \cdot U).\mathrm{sum}(\mathrm{dim}=-1)$ \Comment{$(B, J)$}
+\State $\text{logits} \gets V / \tau$
+\State \Return $\text{logits},\ \text{POLEUIntermediates}(A, w, U, S, V)$
+\end{algorithmic}
+\end{algorithm}
+
+Temperature $\tau$ is a plain Python float, not an
+\texttt{nn.Parameter}. Total trainable parameters at canonical $p = 26$:
+$544{,}779$. At Amazon's $p = 23$: $544{,}491$.
+
+\subsection{Ablations A7 and A8}
+
+\texttt{ConcatUtility} (A7) replaces the attribute decomposition with
+a single MLP $h_\psi([e_k; z_d]) \to U_k$:
+\[
+U_k = W_2 \cdot \mathrm{ReLU}\bigl(W_1 [e_k; z_d] + b_1\bigr) + b_2.
+\]
+Salience, $V$, and the softmax-over-$J$ remain.
+
+\texttt{FiLMUtility} (A8) uses FiLM-style affine conditioning:
+\[
+(\gamma, \beta) = \mathrm{modulator}(z_d), \qquad
+h = \mathrm{ReLU}(W_1 e_k + b_1), \qquad
+h' = (\gamma + 1) \cdot h + \beta, \qquad
+U_k = W_2 h' + b_2.
+\]
+The $+1$ offset on $\gamma$ starts training at near-identity
+conditioning. Both modules expose their own
+\texttt{Intermediates} dataclass; A7 has no $A$ or $w$ (the
+decomposition it drops); A8 adds $\theta_d = (\gamma, \beta)$ for
+interpretability.
+
+% =========================================================================
+\section{Training Subsystem}
+\label{sec:train}
+% =========================================================================
+
+\subsection{Optimizer and schedule}
+
+Adam with $(\beta_1, \beta_2) = (0.9, 0.999)$ and initial learning
+rate $10^{-3}$. Cosine-annealing schedule to $\text{lr}_{\min} =
+10^{-4}$ over \texttt{total\_steps}:
+\begin{equation}
+  \text{lr}(t) = \text{lr}_{\min} + \frac{1}{2}(\text{lr}_0 - \text{lr}_{\min})
+                 \left(1 + \cos\!\left(\pi \cdot \frac{t}{T_{\max}}\right)\right).
+\end{equation}
+Scheduler steps per batch (not per epoch). Gradient clipping at
+$\|\cdot\|_2 \le 1$ is applied \emph{before} \texttt{optimizer.step()}.
+
+\subsection{Batch iterator}
+
+\texttt{iter\_batches(z\_d, E, c\_star, omega, batch\_size, shuffle,
+generator, prices=None)} yields dicts with keys
+\texttt{\{z\_d, E, c\_star, omega\}} always, and
+\texttt{"prices"} when supplied. Shape-checks every input.
+
+\subsection{Per-batch loss}
+
+\begin{algorithm}[H]
+\caption{\texttt{\_compute\_batch\_loss}}
+\begin{algorithmic}[1]
+\Require model, batch dict, reg\_cfg
+\Ensure scalar loss with autograd graph
+\State $(\text{logits}, \text{inter}) \gets \text{model}(\text{batch.z\_d}, \text{batch.E})$
+\State $\ell \gets -\log \mathrm{softmax}(\text{logits})[\text{batch.c\_star}]$ per row
+\State $\mathcal{L}_{\text{data}} \gets \sum_t \omega_t \ell_t / \sum_t \omega_t$
+\If{reg\_cfg is not None}
+  \State prices $\gets$ batch.get("prices")    \Comment{None disables monotonicity}
+  \State $R \gets \mathrm{combined\_regularizer}(\text{model}, \text{inter}, \text{batch.E}, \text{prices}, \text{reg\_cfg})$
+  \State $\mathcal{L} \gets \mathcal{L}_{\text{data}} + R$
+\Else
+  \State $\mathcal{L} \gets \mathcal{L}_{\text{data}}$
+\EndIf
+\State \Return $\mathcal{L}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Early stopping}
+
+\texttt{fit(model, train\_batches\_fn, val\_batches\_fn, train\_cfg,
+reg\_cfg, total\_steps, seed, on\_epoch\_end)} runs epochs until:
+\begin{itemize}
+\item $\text{epoch} \ge \text{max\_epochs}$, or
+\item $\text{patience\_counter} \ge \text{early\_stopping\_patience}$
+with patience counter reset on val NLL improvement.
+\end{itemize}
+Each improvement caches the model's \texttt{state\_dict} in memory
+(\texttt{best\_state}); on exit the best state is restored.
+
+\subsection{Subsample integration}
+
+\texttt{try\_import\_subsample\_weights(train\_df, n\_customers,
+seed)} dispatches to \texttt{src.train.subsample} with graceful
+failure:
+\begin{itemize}
+\item Returns \texttt{(None, None)} if \texttt{n\_customers is None}
+(intended pass-through).
+\item Returns \texttt{(None, None)} with a WARNING naming
+\texttt{ImportError} if the module is not importable.
+\item Returns \texttt{(None, None)} with a WARNING naming the runtime
+exception if \texttt{subsample\_customers} raises (typically
+because upstream state\_features hasn't run).
+\end{itemize}
+
+% =========================================================================
+\section{Evaluation and Interpretability}
+\label{sec:eval}
+% =========================================================================
+
+\subsection{Six metrics}
+
+All metrics accept either \texttt{torch.Tensor} or \texttt{np.ndarray}
+(converted via \texttt{torch.as\_tensor}); all return Python floats.
+
+\begin{itemize}
+\item \textbf{Top-$k$}: $\frac{1}{N} \sum_t \mathbb{1}[\text{rank}(c^*_t) < k]$; default $k \in \{1, 5\}$.
+\item \textbf{MRR}: tie-unbiased, $\frac{1}{N} \sum_t 1/(\text{rank}(c^*_t) + 1)$ where ties split the positions evenly.
+\item \textbf{NLL}: $-\frac{1}{N} \sum_t \log P(a_{c^*_t})$, natural log.
+\item \textbf{AIC}: $2k + 2 n_{\text{train}} \cdot \text{NLL}$.
+\item \textbf{BIC}: $k \log n_{\text{train}} + 2 n_{\text{train}} \cdot \text{NLL}$.
+\end{itemize}
+
+\subsection{Stratified breakdowns}
+
+Every stratifier routes through a single
+\texttt{stratify\_by\_key(logits, c\_star, group\_key)}. Empty groups
+are omitted from the output (no NaN filling).
+
+\begin{itemize}
+\item \texttt{category\_breakdown}: group by the event's category string.
+\item \texttt{repeat\_novel\_breakdown}: $\mathrm{group} = \text{``repeat''}$ if \texttt{routine > 0} else ``novel''.
+\item \texttt{activity\_tertile\_breakdown}: tertile by
+\texttt{purchase\_frequency} using \texttt{numpy.quantile}; labels
+``low'', ``mid'', ``high''.
+\item \texttt{time\_of\_day\_breakdown}: hour $\to$
+\{night: [0, 6), morning: [6, 12), afternoon: [12, 18),
+evening: [18, 24)\}.
+\item \texttt{dominant\_attribute\_breakdown}: group by
+$m^*_t = \arg\max_m w_m(z_d) \cdot \frac{1}{K}\sum_k |u_m(e_k^{(c^*_t)})|$ (spec \S 12.3, mean-over-$K$ aggregation).
+\end{itemize}
+
+\subsection{Four interpretability reports}
+
+\texttt{run\_all\_reports(model, z\_d, E, c\_star, outcomes, out\_dir,
+event\_idx, perturbation\_fn)} produces:
+
+\begin{itemize}
+\item \texttt{head\_naming.json}: top-$N$ outcome strings per head, sorted descending by $u_m(e_k)$. Used for post-hoc attribute naming (spec \S 12.1).
+\item \texttt{per\_decision.json}: the $J \times K$ outcome strings, the $(J, K, M)$ attribute scores, the $M$ person weights, the $(J, K)$ salience, the $(J)$ values, and the softmax probabilities. One chosen event (spec \S 12.2).
+\item \texttt{dominant\_attribute.json}: stratified metrics keyed by $m^*$.
+\item \texttt{counterfactual.json}: one $z_d$ perturbation (default: $z_d[\mathrm{event}, 0]\mathrel{+}= 1$). Re-scores with $E$ held fixed; reports $\Delta w, \Delta S, \Delta P(a_{c^*})$ (spec \S 12.4).
+\end{itemize}
+
+% =========================================================================
+\section{LLM and Encoder Subsystem}
+\label{sec:llm}
+% =========================================================================
+
+\subsection{Protocols}
+
+\begin{lstlisting}[language=Python]
+@runtime_checkable
+class LLMClient(Protocol):
+    def generate(self, messages: list[dict], *,
+                 temperature: float, top_p: float,
+                 max_tokens: int, seed: int) -> GenerationResult: ...
+
+@dataclass
+class GenerationResult:
+    text: str
+    finish_reason: str
+    model_id: str
+
+@runtime_checkable
+class EncoderClient(Protocol):
+    encoder_id: str
+    d_e: int
+    def encode(self, texts: list[str]) -> np.ndarray: ...  # (N, d_e) L2-norm
+\end{lstlisting}
+
+\subsection{Client implementations}
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l l@{}}
+\toprule
+Client & Real or stub & Imports \\
+\midrule
+\texttt{StubLLMClient}                 & stub & numpy + stdlib \\
+\texttt{AnthropicLLMClient}            & real & lazy \texttt{import anthropic} in \texttt{\_\_init\_\_} \\
+\texttt{StubEncoder}                   & stub & numpy + stdlib (blake2b-seeded Gaussian) \\
+\texttt{SentenceTransformersEncoder}   & real & lazy \texttt{import sentence\_transformers} + \texttt{torch} in \texttt{\_\_init\_\_} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The lazy-import policy guarantees \texttt{import src.outcomes.generate}
+and \texttt{import src.outcomes.encode} succeed in a minimal
+environment. Importing the stubs has no side effects.
+
+\texttt{AnthropicLLMClient} reads \texttt{ANTHROPIC\_API\_KEY} from the
+environment at \texttt{\_\_init\_\_} time, splits out system prompts
+(Anthropic's SDK expects \texttt{system=} rather than a message with
+\texttt{role="system"}), and drops \texttt{top\_p} from the request
+(newer Claude models reject \texttt{temperature + top\_p} together).
+
+\subsection{Cache design}
+
+Two caches, both backed by \texttt{KVStore} (SQLite, WAL journal,
+\texttt{INSERT OR REPLACE}, null-byte field separators):
+
+\begin{itemize}
+\item \textbf{Outcomes cache} (spec \S 3.4). Key:
+$\mathrm{SHA256}(\text{customer\_id} \Vert \text{asin} \Vert
+\text{seed} \Vert \text{prompt\_version})$ with \texttt{\textbackslash 0}
+between fields. Value: JSON blob
+\texttt{\{"outcomes": [...], "metadata": {...}\}}. $K$ is folded
+into \texttt{prompt\_version} at the \texttt{generate.py} layer
+(\texttt{"v1-K3"} vs \texttt{"v1-K1"}) so $K$-variants don't
+collide — the cache layer itself sees four spec fields.
+\item \textbf{Embeddings cache} (spec \S 4.3). Key:
+$\mathrm{SHA256}(\text{outcome\_string} \Vert \text{encoder\_id})$.
+\texttt{encoder\_id} is
+\texttt{model\_id|pooling=<p>|max\_length=<n>}. Value: the
+\texttt{.npy}-serialized 1-D float32 array of shape $(d_e,)$.
+\end{itemize}
+
+\subsection{\texttt{generate\_outcomes} algorithm}
+
+\begin{algorithm}[H]
+\caption{End-to-end outcome generation with cache and retries}
+\begin{algorithmic}[1]
+\Require customer\_id, asin, $c_d$, alt, $K$, seed, prompt\_version, client, cache, diversity\_filter, max\_retries
+\Ensure OutcomesPayload
+\State cache\_prompt\_version $\gets$ \texttt{f"\{prompt\_version\}-K\{K\}"}
+\If{cache is not None}
+  \State cached $\gets$ cache.get\_outcomes(customer\_id, asin, seed, cache\_prompt\_version)
+  \If{cached and len(cached["outcomes"]) == $K$}
+    \State \Return OutcomesPayload(outcomes=cached["outcomes"], metadata=cached["metadata"])
+  \EndIf
+\EndIf
+\State messages $\gets$ build\_messages($c_d$, alt, $K$) \Comment{spec §3.2}
+\For{attempt = 0 \dots max\_retries}
+  \State result $\gets$ client.generate(messages, temp=0.8, top\_p=0.95, max\_tokens=180, seed = seed + attempt)
+  \State parsed $\gets$ parse\_completion(result.text, $K$) \Comment{split on \textbackslash n, truncate/pad with sentinel}
+  \If{diversity\_filter is None}
+    \State final $\gets$ parsed; break
+  \EndIf
+  \State (rewritten, ok) $\gets$ diversity\_filter(parsed)
+  \State final $\gets$ rewritten
+  \If{ok}{\quad break}\EndIf
+\EndFor
+\State metadata $\gets$ \{temperature, top\_p, max\_tokens, model\_id, finish\_reason, seed: seed\_used, prompt\_version, timestamp\}
+\If{cache is not None}
+  \State cache.put\_outcomes(customer\_id, asin, seed, cache\_prompt\_version, final, metadata)
+\EndIf
+\State \Return OutcomesPayload(outcomes=final, metadata=metadata)
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Diversity filter}
+
+\texttt{diversity\_filter(outcomes, threshold=0.9, embed\_fn=None)}:
+
+\begin{enumerate}
+\item Embed each outcome string into $\mathbb{R}^{64}$ via
+\texttt{HashEmbedder} (hashed character 3-grams, signed sum,
+L2-normalized; numpy-only).
+\item Compute pairwise cosines; assert row norms $\approx 1$.
+\item Return \texttt{(outcomes, ok)} where \texttt{ok} iff no pair has $\cos > 0.9$.
+\end{enumerate}
+
+The filter \emph{detects} paraphrase pairs but does not rewrite.
+Retries are the caller's responsibility (via \texttt{seed + attempt}).
+
+% =========================================================================
+\section{Runtime Orchestration}
+\label{sec:driver}
+% =========================================================================
+
+\texttt{scripts/run\_dataset.py} is the end-to-end CLI driver. It
+takes an adapter name, a customer budget, a stub/real flag, and an
+output dir; produces a fully materialized training run plus evaluation
+artifacts.
+
+\subsection{CLI surface}
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize]
+python scripts/run_dataset.py \
+    --adapter {amazon,synthetic}           (required)
+    --n-customers INT                      (required; used by subsample_customers)
+    (--stub-llm | --real-llm)              (mutually exclusive; default --stub-llm)
+    --seed INT                             (default 42)
+    --config PATH                          (default configs/default.yaml)
+    --n-epochs INT                         (default 1)
+    --batch-size INT                       (default 32; overrides config)
+    --min-events-per-customer INT          (default 5)
+    --output-dir PATH                      (default reports/<adapter>_<ts>)
+    --K INT                                (default from config.outcomes.K)
+    --dataset-config PATH                  (default configs/datasets/<adapter>.yaml)
+\end{lstlisting}
+
+\subsection{Driver flow}
+
+\begin{algorithm}[H]
+\caption{Driver pipeline (21 stages)}
+\begin{algorithmic}[1]
+\Require CLI args, dataset YAML, default config
+\Ensure \texttt{reports/<dir>/\{metrics.json, metrics\_test.json, per\_decision.json, head\_naming.json, dominant\_attribute.json, counterfactual.json, subsample\_diagnostics.json, smoke\_summary.json\}}
+\State Parse args; resolve adapter and dataset YAML.
+\State \texttt{adapter} $\gets$ \texttt{YamlAdapter(dataset\_yaml)}.
+\State \texttt{events\_raw, persons\_raw} $\gets$ \texttt{adapter.load\_events(), adapter.load\_persons()}.
+\State \texttt{events} $\gets$ \texttt{clean\_events(events\_raw, schema)}.
+\State \texttt{events} $\gets$ \texttt{join\_survey(events, persons\_raw, schema)}.
+\State \texttt{events} $\gets$ \texttt{compute\_state\_features(events)}.
+\State Filter customers with fewer than \texttt{--min-events-per-customer} events.
+\State \texttt{events} $\gets$ \texttt{temporal\_split(events, schema)}.
+\State \texttt{events} $\gets$ \texttt{attach\_train\_popularity(events)}.
+\State \texttt{(selected\_ids, omega)} $\gets$ \texttt{try\_import\_subsample\_weights(train\_df, n\_customers, seed)}. Exit(1) on (None, None).
+\State Filter \texttt{events\_subset} to \texttt{selected\_ids}; write \texttt{subsample\_diagnostics.json}.
+\State \texttt{register\_on\_adapter(adapter, train\_events\_subset)}.
+\State Orphan filter: customers in train $\cap$ persons\_raw.
+\State \texttt{persons\_canonical} $\gets$ \texttt{adapter.translate\_z\_d(persons\_for\_train, training\_events=train\_events\_subset)}.
+\State Normalize \texttt{persons\_canonical["purchase\_frequency"]} from count to events/week using train-window days.
+\State Re-filter \texttt{events\_subset} to \texttt{persons\_canonical.customer\_id}; rebuild \texttt{omega}.
+\State Extract \texttt{customer\_to\_extras} via \texttt{extract\_extra\_fields\_from\_row} over raw persons.
+\State \texttt{records\_all} $\gets$ \texttt{build\_choice\_sets(events\_subset, persons\_canonical, adapter, customer\_to\_extras)}.
+\State Split records by event.split into \texttt{records\_\{train,val,test\}}.
+\State \texttt{batch\_\{train,val,test\}} $\gets$ \texttt{assemble\_batch(records\_*, adapter, llm\_client, encoder, caches, K, seed)}.
+\State Build \texttt{POLEU(p = batch\_train.z\_d.shape[1], ...)}.
+\State \texttt{fit(model, train\_batches\_fn, val\_batches\_fn, train\_cfg, reg\_cfg, total\_steps, seed)}.
+\State Evaluate on val and test; write \texttt{metrics.json, metrics\_test.json}.
+\State \texttt{run\_all\_reports(model, batch\_val.z\_d, batch\_val.E, batch\_val.c\_star, batch\_val.outcomes\_nested, out\_dir)}.
+\State Write \texttt{smoke\_summary.json} with \texttt{effective\_p}, \texttt{regularizers\_active}, and run config.
+\end{algorithmic}
+\end{algorithm}
+
+% =========================================================================
+\section{Worked Example: One Amazon Customer}
+\label{sec:example}
+% =========================================================================
+
+We trace a single Amazon customer (Survey ResponseID
+\texttt{R\_1lztobDYoYyZWKF}, 9 purchase events between 2018-02 and
+2022-12) through every framework layer. The run uses
+\texttt{--real-llm --K 1 --n-customers 1} against a mini-fixture.
+
+\subsection{Raw persons row}
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l@{}}
+\toprule
+Raw column & Value \\
+\midrule
+\texttt{Q-demos-age}          & \texttt{"25 - 34 years"} \\
+\texttt{Q-demos-income}       & \texttt{"Less than \$25,000"} \\
+\texttt{Q-demos-education}    & \texttt{"High school diploma or GED"} \\
+\texttt{Q-demos-gender}       & \texttt{"Male"} \\
+\texttt{Q-demos-state}        & \texttt{"Ohio"} \\
+\texttt{Q-amazon-use-hh-size} & \texttt{"1 (just me!)"} \\
+\texttt{Q-amazon-use-how-oft} & \texttt{"Less than 5 times per month"} \\
+\texttt{Q-personal-diabetes}  & \texttt{"No"} \\
+\texttt{Q-personal-wheelchair}& \texttt{"No"} \\
+\texttt{Q-life-changes}       & NaN \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Stage 1 — schema translation}
+
+\texttt{adapter.translate\_z\_d(persons\_raw,
+training\_events=train\_events)} applies each YAML \texttt{kind}
+handler and aggregates the two \texttt{derived\_from\_events} fields:
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l l@{}}
+\toprule
+Canonical column & Value & Kind / source \\
+\midrule
+\texttt{age\_bucket}          & \texttt{"25-34"} & categorical\_map of \texttt{Q-demos-age} \\
+\texttt{income\_bucket}       & \texttt{"<25k"}  & collapse of \texttt{Q-demos-income} \\
+\texttt{household\_size}      & $1$              & categorical\_to\_int of \texttt{Q-amazon-use-hh-size} \\
+\texttt{has\_kids}            & $0$              & constant \\
+\texttt{city\_size}           & \texttt{"medium"} & external\_lookup (empty CSV) $\to$ fallback \\
+\texttt{education}            & $2$              & ordinal\_map of \texttt{Q-demos-education} \\
+\texttt{health\_rating}       & $5$              & composite $5 - 0 - 0$ \\
+\texttt{risk\_tolerance}      & $0$              & composite $0 + 0 + 0$ \\
+\texttt{purchase\_frequency}  & $7$              & \texttt{count} of train events \\
+\texttt{novelty\_rate}        & $1.0$            & \texttt{mean} of \texttt{novelty} on train \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Stage 2 — \texttt{purchase\_frequency} normalization}
+
+Train window spans $1780$ days $= 254.3$ weeks.
+Driver computes:
+\[
+\texttt{purchase\_frequency} \gets \frac{7}{254.3} \approx 0.0275 \text{ events/week}.
+\]
+This flows through the \texttt{very\_rare} bucket in the renderer.
+
+\subsection{Stage 3 — $z_d$ encoding}
+
+\texttt{fit\_person\_features} uses the adapter-declared
+\texttt{CategoricalVocabularies}. Output width for Amazon:
+\[
+p = 6 + 5 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 = 23.
+\]
+(\texttt{city\_size} contributes $1$ because the vocabulary collapsed
+to \{\texttt{"medium"}\}.) Concretely for this customer:
+\[
+z_d = [\,
+\underbrace{0, 1, 0, 0, 0, 0}_{\text{age=25-34}},
+\underbrace{1, 0, 0, 0, 0}_{\text{income=<25k}},
+\underbrace{1, 0, 0, 0, 0}_{\text{hh=1}},
+\underbrace{0}_{\text{has\_kids}},
+\underbrace{1}_{\text{city=medium}},
+\underbrace{\tilde{\mathrm{ed}}, \tilde{\mathrm{hr}}, \tilde{\mathrm{rt}}, \tilde{\mathrm{pf}}, 1.0}_{\text{standardized scalars + novelty}}
+\,].
+\]
+
+\subsection{Stage 4 — $c_d$ rendering}
+
+\texttt{suppress\_fields\_for\_c\_d()} $=$
+\texttt{("has\_kids", "city\_size")}. Extras from enrichment block:
+\texttt{\{gender: "Male", amazon\_frequency: "Less than 5 times per
+month"\}} (life\_event dropped because raw is NaN).
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize]
+Person profile
+- Age: late 20s/early 30s; household of 1, as a male.
+- Income: about $15k/year.
+- High-school graduate.
+- Self-reports excellent health; risk-neutral.
+- Buys on Amazon rarely; nearly all of orders are first-time products.
+- Shops on Amazon a few times a month.
+\end{lstlisting}
+
+\subsection{Stage 5 — choice-set construction for event $t = 0$}
+
+First event: SanDisk SD card, 2018-02-11, \texttt{chosen\_asin =
+B0143RTB1E}, category \texttt{FLASH\_MEMORY}. The available ASIN
+pool at that date is tiny (the customer's own history so far), so
+the dedup-fallback fires: \texttt{metadata["dedup\_fallback"] =
+True}, a WARNING is logged, and negatives are padded cyclically to
+$J = 10$. Per-event RNG seed:
+$42 + 1{,}000{,}003 \cdot 0 + 0 = 42$.
+
+\subsection{Stage 6 — alt-text rendering}
+
+Per alternative, \texttt{adapter.alt\_text(asin\_lookup[asin])}
+returns:
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize]
+{"title": "SanDisk Ultra 16GB Class 10 SDHC UHS-I Memory Card ...",
+ "category": "FLASH_MEMORY",
+ "price": 7.98,
+ "popularity_rank": "bottom 50%"}   # small fixture; bands collapse
+\end{lstlisting}
+
+\subsection{Stage 7 — LLM generation}
+
+Prompt (system + user):
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize]
+[system]
+You generate short first-person outcome narratives for a decision-maker
+considering an alternative. Produce exactly 1 sentences, each 10-25 words,
+each describing a different type of consequence: financial, health/physical,
+convenience/time, emotional/identity, social/relational. ...
+
+[user]
+CONTEXT:
+Person profile
+- Age: late 20s/early 30s; household of 1, as a male.
+- Income: about $15k/year.
+...
+
+ALTERNATIVE:
+- Name/title: SanDisk Ultra 16GB Class 10 SDHC UHS-I Memory Card ...
+- Category: FLASH_MEMORY
+- Price: $7.98
+- Popularity: bottom 50%
+
+Generate K=1 outcome sentences.
+\end{lstlisting}
+
+Claude Opus 4.6 returns:
+\begin{quote}
+\emph{``I save money on groceries by portioning ingredients precisely, stretching my tight budget further each week.''}
+\end{quote}
+
+Cache key:
+$\mathrm{SHA256}(\texttt{R\_1lztob...} \Vert \texttt{B0143RTB1E} \Vert \texttt{42} \Vert \texttt{v1-K1})$.
+
+\subsection{Stage 8 — encoding}
+
+\texttt{SentenceTransformersEncoder(all-mpnet-base-v2)} maps the
+outcome string to $e \in \mathbb{R}^{768}$, L2-normalized. Cache key:
+$\mathrm{SHA256}(\texttt{outcome} \Vert \texttt{model\_id|pooling=mean|max\_length=64})$.
+
+\subsection{Stage 9 — tensor assembly}
+
+\texttt{AssembledBatch} for the train split ($N = 7$):
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l@{}}
+\toprule
+Tensor & Shape \\
+\midrule
+\texttt{z\_d}     & $(7, 23)$ \\
+\texttt{E}        & $(7, 10, 1, 768)$ \\
+\texttt{c\_star}  & $(7,)$ int64 \\
+\texttt{omega}    & $(7,)$ \\
+\texttt{prices}   & $(7, 10)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Stage 10 — model forward and loss}
+
+\begin{equation*}
+\begin{aligned}
+A &\in \mathbb{R}^{7 \times 10 \times 1 \times 5} \\
+w &\in \Delta^4 \quad \text{(per row)} \\
+U &\in \mathbb{R}^{7 \times 10 \times 1} \\
+S &\equiv 1 \quad \text{(degenerate: only $K=1$ outcome per alternative)} \\
+V &= U.\mathrm{squeeze}(-1) \in \mathbb{R}^{7 \times 10} \\
+\text{logits} &= V / 1.0 \\
+\ell &= -\log \mathrm{softmax}(\text{logits})[\text{c\_star}]
+\end{aligned}
+\end{equation*}
+
+With one epoch over $\lceil 7/2 \rceil = 4$ steps, cosine LR decays
+$10^{-3} \to 10^{-4}$; val NLL at end of epoch $= 2.248$
+($\approx \log J$), top-1 accuracy $= 0.000$ on one val record.
+
+\subsection{Stage 11 — artifacts}
+
+All seven JSON reports are written in under 30 seconds. LLM call
+count: $9$ unique \texttt{(customer, asin)} entries
+(cache-deduplicated from $7 \cdot 10 = 70$ potential calls, because
+the customer has few unique ASINs). Dry-run cost: \$0.07.
+
+% =========================================================================
+\section{Complexity Analysis}
+\label{sec:complexity}
+% =========================================================================
+
+For $N$ events, $J$ alternatives, $K$ outcomes, $U$ unique
+\texttt{(customer, asin)} pairs, and $U_o$ unique outcome strings:
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l l l@{}}
+\toprule
+Stage & Time & Space & Notes \\
+\midrule
+load                       & $O(|CSV|)$      & $O(|CSV|)$       & pandas CSV parse \\
+clean                      & $O(N \log N)$   & $O(N)$           & sort by (customer, date) \\
+survey\_join               & $O(N)$          & $O(N)$           & left-join, hash-based \\
+state\_features            & $O(N \log N)$   & $O(N)$           & groupby + rolling \\
+split                      & $O(N)$          & $O(N)$           & per-customer allocation \\
+attach\_train\_popularity  & $O(N)$          & $O(|\text{ASIN}|)$ & \\
+subsample\_customers       & $O(n_c^2 d + n_c^2 k_{\text{iter}})$ & $O(n_c d)$ & PCA + KMeans + leverage \\
+translate\_z\_d            & $O(n_c)$        & $O(n_c \cdot p)$ & \\
+build\_choice\_sets        & $O(N \cdot J \cdot \log |\text{ASIN}|)$ & $O(N \cdot J)$ & $\log$ is the temporal-availability binary-search per event \\
+assemble\_batch            & $O(U \cdot T_{\text{LLM}} + U_o \cdot T_{\text{enc}})$ & $O(N \cdot J \cdot K \cdot d_e)$ & $T_{\text{LLM}}$ dominates (network); $T_{\text{enc}}$ amortized by batching \\
+train one step             & $O(B \cdot J \cdot K \cdot (d_e \cdot h + p \cdot h))$ & $O(B \cdot J \cdot K \cdot d_e)$ & forward dominant \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Cache amortization: on a warm run, \texttt{assemble\_batch} drops to
+$O(N)$ for cache lookups (SQLite hash lookups are $O(1)$), with zero
+LLM and zero encoder calls. The bottleneck for real-LLM runs is the
+first-run outcome generation; subsequent runs replay from SQLite at
+near-instant speed.
+
+% =========================================================================
+\section{Extension Guide}
+\label{sec:extend}
+% =========================================================================
+
+\subsection{Adding a new dataset}
+
+\textbf{Case 1: the dataset fits the purchase-event shape.}
+Write a new YAML at \texttt{configs/datasets/<name>.yaml} following
+the Amazon template. The 9 \texttt{kind} handlers cover most reasonable
+translations; the \texttt{composite} kind handles binary-or-ordinal
+arithmetic; \texttt{external\_lookup} handles enumerated mappings
+stored separately (e.g., state $\to$ region). If needed,
+create a \texttt{c\_d\_extra\_fields} block for signal that should
+appear in $c_d$ but not $z_d$. Zero Python changes.
+
+\textbf{Case 2: exotic alt rendering.}
+Subclass \texttt{YamlAdapter} and override \texttt{alt\_text}. Example
+for a health dataset:
+
+\begin{lstlisting}[language=Python]
+class DrugPrescribingAdapter(YamlAdapter):
+    def alt_text(self, event_row):
+        return {
+            "title": str(event_row.get("generic_name", "")),
+            "category": str(event_row.get("atc_class", "")),
+            "price": float(event_row.get("copay_usd", 0.0)),
+            "popularity_rank": self._popularity_percentile_fn(
+                int(event_row.get("prescriptions", 0))
+            ),
+        }
+\end{lstlisting}
+
+\subsection{Adding a regularizer}
+
+Add a new function to \texttt{src/train/regularizers.py} with
+signature \texttt{f(model, intermediates, E, ..., cfg) -> torch.Tensor}.
+Then:
+\begin{enumerate}
+\item Add a $\lambda$ field to \texttt{RegularizerConfig}.
+\item Add a YAML key to \texttt{configs/default.yaml} under
+\texttt{regularizers:}.
+\item Update \texttt{combined\_regularizer} to add the term.
+\item Add the term name to the \texttt{regularizers\_active}
+reporter in \texttt{run\_dataset.py}.
+\item Write a unit test verifying the term is differentiable and
+produces a finite scalar.
+\end{enumerate}
+
+\subsection{Adding a model variant}
+
+Ablations A7 and A8 illustrate the pattern: any module with a
+\texttt{forward(z\_d, E) $\to$ (logits, intermediates)} contract can
+drop in at the training loop level. For a new variant:
+\begin{enumerate}
+\item Add the module to \texttt{src/model/ablations.py} (or a new file).
+\item Give it an \texttt{Intermediates} dataclass compatible with
+the \texttt{run\_all\_reports} contract (must expose at least
+$U$, $S$, $V$).
+\item Add a YAML key under \texttt{configs/ablation\_<name>.yaml}
+with \texttt{model.backbone = "<name>"}.
+\item Update the driver to branch on \texttt{model.backbone} at
+model-construction time.
+\end{enumerate}
+
+% =========================================================================
+\section{Failure Modes and Invariant Coverage}
+\label{sec:failures}
+% =========================================================================
+
+The framework is designed so every silent-corruption mode has a loud
+counterpart. A representative catalog:
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.33\textwidth} p{0.28\textwidth} p{0.33\textwidth}@{}}
+\toprule
+Silent-failure mode & Where caught & Surface \\
+\midrule
+CSV column renamed upstream & \texttt{validate\_loaded} & InvariantError at load stage \\
+NaT in \texttt{order\_date} after cleaning & \texttt{validate\_cleaned} & InvariantError \\
+Negative price after coercion & \texttt{validate\_cleaned} & InvariantError \\
+Missing \texttt{split} column before popularity & \texttt{validate\_state\_features} & InvariantError \\
+Customer with no train rows & \texttt{validate\_split} & InvariantError \\
+z\_d width drift (fitted vocab $<$ schema vocab) & \texttt{fit\_person\_features(vocabularies=...)} & Strict raise on unknown value \\
+Cache collision across $K$ variants & \texttt{generate\_outcomes} & $K$ folded into \texttt{prompt\_version} \\
+Outcome length $\ne K$ returned from LLM & \texttt{assemble\_batch} invariant & AssertionError \\
+NaN in $E$ from encoder & \texttt{assemble\_batch} invariant & AssertionError \\
+$c^* \not\in [0, J)$ & \texttt{assemble\_batch} invariant & AssertionError \\
+Orphan customer in persons\_canonical & \texttt{build\_choice\_sets} fit-on-train check & AssertionError \\
+Subsample module unavailable despite config & \texttt{try\_import\_subsample\_weights} & WARNING + graceful (None, None) \\
+Monotonicity regularizer silently inert & \texttt{regularizers\_active} in run artifacts & Explicit bool reported \\
+$p$ drops below canonical (dataset-dependent) & \texttt{effective\_p} + \texttt{p\_reduction\_reason} in run artifacts & Explicit report \\
+Small-catalog dedup collision & \texttt{build\_choice\_sets} dedup guard & WARNING + \texttt{metadata.dedup\_fallback} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The guiding principle is that the framework should never
+\emph{succeed} on corrupt or unexpected state. The canonical
+rationale: in a multi-week research timeline, a silently wrong run
+that \emph{looks} right costs more than any amount of assertion
+overhead.
+
+% =========================================================================
+\appendix
+% =========================================================================
+
+\section{Public-API Signature Reference}
+\label{app:signatures}
+
+All public functions, in canonical order:
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
+# ----- schema and data -----
+load_schema(path: Path | str) -> DatasetSchema
+translate_events(events_raw: pd.DataFrame, schema: DatasetSchema) -> pd.DataFrame
+translate_persons(persons_raw: pd.DataFrame, schema: DatasetSchema,
+                  *, training_events: pd.DataFrame | None = None) -> pd.DataFrame
+
+# ----- pipeline stages -----
+load(schema, *, events_path=None, persons_path=None) -> tuple[pd.DataFrame, pd.DataFrame]
+clean_events(events_raw, schema) -> pd.DataFrame
+join_survey(events, persons_raw, schema) -> pd.DataFrame
+compute_state_features(events) -> pd.DataFrame
+temporal_split(events, schema, *, val_frac=None, test_frac=None) -> pd.DataFrame
+attach_train_popularity(events) -> pd.DataFrame
+subsample_customers(train_df, n_customers=500, seed=42) -> tuple[list[str], np.ndarray]
+apply_subsample(df, selected_ids, weights) -> tuple[pd.DataFrame, np.ndarray]
+build_choice_sets(events_df, persons_canonical, adapter, *,
+                  n_negatives=9, seed=42, n_resamples=1,
+                  customer_to_extras=None) -> list[dict]
+
+# ----- person features -----
+fit_person_features(df, *, vocabularies=None) -> PersonFeatureStats
+transform_person_features(df, stats) -> np.ndarray      # (n, p) float32
+fit_transform_person_features(df) -> tuple[np.ndarray, PersonFeatureStats]
+
+# ----- context string -----
+build_context_string(row, *, recent_purchases=None, current_time=None,
+                     suppress_fields=(), extra_fields=None) -> str
+extract_extra_fields_from_row(row, yaml_block) -> dict
+paraphrase_rules_check(text, row) -> None
+
+# ----- adapter -----
+YamlAdapter(yaml_path)                                  # all Protocol methods
+AmazonAdapter()                                         # factory
+
+# ----- outcomes -----
+generate_outcomes(customer_id, asin, c_d, alt, *, K=3, seed, prompt_version,
+                  client, cache=None, diversity_filter=None,
+                  max_retries=2) -> OutcomesPayload
+parse_completion(text, K, *, context=None) -> list[str]
+encode_batch(texts, *, client, cache=None) -> np.ndarray
+encode_outcomes_tensor(outcomes, *, client, cache=None) -> np.ndarray
+diversity_filter(outcomes, *, threshold=0.9, embed_fn=None) -> tuple[list[str], bool]
+
+# ----- batching -----
+assemble_batch(records, adapter, *, llm_client, encoder,
+               outcomes_cache, embeddings_cache, K, seed,
+               prompt_version, diversity_filter=None,
+               omega=None, progress=False) -> AssembledBatch
+iter_to_torch_batches(batch, *, batch_size, shuffle, generator=None) -> Iterator[dict]
+
+# ----- model -----
+POLEU(*, M=5, K=3, J=10, d_e=768, p=26, attribute_hidden=128,
+      weight_hidden=32, salience_hidden=64,
+      weight_normalization="softmax", uniform_salience=False,
+      temperature=1.0)
+POLEU.forward(z_d, E) -> tuple[Tensor, POLEUIntermediates]
+cross_entropy_loss(logits, c_star, omega=None) -> Tensor
+choice_probabilities(logits) -> Tensor
+
+# ----- training -----
+TrainConfig.from_default() -> TrainConfig
+RegularizerConfig.from_default() -> RegularizerConfig
+combined_regularizer(model, intermediates, E, prices, cfg) -> Tensor
+make_optimizer_and_scheduler(model, cfg, total_steps) -> tuple[Optimizer, LRScheduler]
+iter_batches(z_d, E, c_star, omega, *, batch_size, shuffle,
+             generator=None, prices=None) -> Iterator[dict]
+train_one_epoch(model, batches, optimizer, scheduler, reg_cfg, train_cfg) -> dict
+evaluate_nll(model, batches) -> float
+fit(model, train_batches_fn, val_batches_fn, *, train_cfg, reg_cfg,
+    total_steps, seed=0, on_epoch_end=None) -> TrainState
+try_import_subsample_weights(train_df, n_customers=None, seed=42)
+  -> tuple[np.ndarray | None, np.ndarray | None]
+
+# ----- evaluation -----
+topk_accuracy(logits, c_star, k=1) -> float
+mrr(logits, c_star) -> float
+nll(logits, c_star) -> float
+aic(nll_val, k, n_train) -> float
+bic(nll_val, k, n_train) -> float
+compute_all(logits, c_star, *, n_params, n_train) -> EvalMetrics
+stratify_by_key(logits, c_star, group_key, *, compute_metrics_fn=None) -> dict
+dominant_attribute(intermediates, c_star) -> Tensor
+dominant_attribute_breakdown(logits, c_star, intermediates) -> dict
+
+# ----- interpretability -----
+head_naming_report(outcomes, intermediates, *, top_n=100, head_names=None) -> dict
+per_decision_report(event_idx, outcomes, intermediates, logits, c_star) -> dict
+dominant_attribute_report(logits, c_star, intermediates) -> dict
+counterfactual_report(model, z_d, E, c_star, perturbation_fn, event_idx,
+                      *, label="custom") -> dict
+run_all_reports(model, z_d, E, c_star, outcomes, *, out_dir=None,
+                event_idx=0, head_names=None,
+                counterfactual_label="perturb-first-dim-+1") -> dict
+\end{lstlisting}
+
+\section{File-to-Responsibility Map}
+\label{app:files}
+
+\begin{center}
+\small
+\begin{longtable}{@{}l p{0.62\textwidth}@{}}
+\toprule
+File & Responsibility \\
+\midrule
+\endfirsthead
+\toprule
+File & Responsibility \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\texttt{src/data/schema\_map.py}           & YAML $\to$ DatasetSchema; 9 kind handlers; AST composite evaluator. \\
+\texttt{src/data/invariants.py}            & InvariantError + 6 per-stage validators + 5 shared helpers. \\
+\texttt{src/data/load.py}                  & Read raw CSVs per schema paths. \\
+\texttt{src/data/clean.py}                 & Delegate rename/dtype/dropna to schema\_map; sort; reset index. \\
+\texttt{src/data/survey\_join.py}          & Left-join persons onto events; snake\_case; drop all-NaN cols. \\
+\texttt{src/data/state\_features.py}       & routine/novelty/recency/brand + attach\_train\_popularity. \\
+\texttt{src/data/split.py}                 & Per-customer temporal split. \\
+\texttt{src/data/choice\_sets.py}          & Per-event choice sets with temporal/popularity sampling + v2 augmentation. \\
+\texttt{src/data/person\_features.py}      & CategoricalVocabularies + fit\_person\_features + transform\_person\_features. \\
+\texttt{src/data/context\_string.py}       & $c_d$ renderer + \texttt{suppress\_fields} + \texttt{extra\_fields} + extract helper. \\
+\texttt{src/data/adapter.py}               & DatasetAdapter Protocol + YamlAdapter + AmazonAdapter factory. \\
+\texttt{src/data/alt\_rendering.py}        & Popularity percentile renderer; register\_on\_adapter. \\
+\texttt{src/data/batching.py}              & AssembledBatch + assemble\_batch + iter\_to\_torch\_batches. \\
+\texttt{src/outcomes/prompts.py}           & SYSTEM\_PROMPT + USER\_BLOCK\_TEMPLATE + PROMPT\_VERSION + builders. \\
+\texttt{src/outcomes/cache.py}             & KVStore + OutcomesCache + EmbeddingsCache (SQLite WAL). \\
+\texttt{src/outcomes/generate.py}          & LLMClient Protocol + StubLLMClient + AnthropicLLMClient + generate\_outcomes. \\
+\texttt{src/outcomes/encode.py}            & EncoderClient Protocol + StubEncoder + SentenceTransformersEncoder + encode\_batch. \\
+\texttt{src/outcomes/diversity\_filter.py} & HashEmbedder + pairwise\_cosine + diversity\_filter. \\
+\texttt{src/model/attribute\_heads.py}     & AttributeHead + AttributeHeadStack. \\
+\texttt{src/model/weight\_net.py}          & WeightNet with softmax/softplus switch. \\
+\texttt{src/model/salience\_net.py}        & SalienceNet + UniformSalience (A6). \\
+\texttt{src/model/po\_leu.py}              & POLEU + POLEUIntermediates + cross\_entropy\_loss + choice\_probabilities. \\
+\texttt{src/model/ablations.py}            & ConcatUtility (A7) + FiLMUtility (A8). \\
+\texttt{src/train/subsample.py}            & PCA + KMeans + leverage subsample (v1 retained). \\
+\texttt{src/train/regularizers.py}         & 4 regularizers + RegularizerConfig + combined\_regularizer. \\
+\texttt{src/train/loop.py}                 & Adam + cosine + clip + early stop + try\_import\_subsample\_weights. \\
+\texttt{src/eval/metrics.py}               & top-$k$ + MRR + NLL + AIC + BIC + compute\_all. \\
+\texttt{src/eval/strata.py}                & 5 stratifiers + dominant\_attribute. \\
+\texttt{src/eval/interpret.py}             & 4 reports + run\_all\_reports. \\
+\texttt{scripts/run\_dataset.py}           & End-to-end CLI driver. \\
+\end{longtable}
+\end{center}
+
+\end{document}

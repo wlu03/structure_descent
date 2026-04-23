@@ -94,7 +94,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=REPO_ROOT / "configs" / "default.yaml",
         help="Path to the default config YAML.",
     )
-    parser.add_argument("--n-epochs", type=int, default=1)
+    parser.add_argument("--n-epochs", type=int, default=5,
+                        help="Training epochs; default 5. Early stopping on val NLL with patience 5 applies; 1 is the cost-capped smoke default.")
     parser.add_argument(
         "--batch-size",
         type=int,

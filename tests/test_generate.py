@@ -314,6 +314,258 @@ def test_diversity_filter_ok_breaks_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# AnthropicLLMClient cache_control wiring
+# ---------------------------------------------------------------------------
+
+class _FakeUsage:
+    """Mimic the ``response.usage`` struct emitted by the real SDK."""
+
+    def __init__(
+        self,
+        *,
+        cache_creation_input_tokens: int | None = 0,
+        cache_read_input_tokens: int | None = 0,
+    ) -> None:
+        self.cache_creation_input_tokens = cache_creation_input_tokens
+        self.cache_read_input_tokens = cache_read_input_tokens
+
+
+class _FakeTextBlock:
+    def __init__(self, text: str) -> None:
+        self.type = "text"
+        self.text = text
+
+
+class _FakeResponse:
+    def __init__(
+        self,
+        text: str = "I save money.\nI feel better.\nI sleep well.",
+        *,
+        model: str = "claude-test",
+        stop_reason: str = "end_turn",
+        usage: _FakeUsage | None = None,
+    ) -> None:
+        self.content = [_FakeTextBlock(text)]
+        self.stop_reason = stop_reason
+        self.model = model
+        self.usage = usage if usage is not None else _FakeUsage()
+
+
+class _CapturingMessages:
+    """Captures the kwargs passed to ``messages.create`` for assertions."""
+
+    def __init__(self, response_factory, raise_first: Exception | None = None):
+        self._response_factory = response_factory
+        self._raise_first = raise_first
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._raise_first is not None and len(self.calls) == 1:
+            exc = self._raise_first
+            self._raise_first = None
+            raise exc
+        return self._response_factory()
+
+
+class _FakeAnthropicSDK:
+    """Namespace that mimics ``anthropic.Anthropic(...)`` construction."""
+
+    def __init__(self, messages_stub: _CapturingMessages) -> None:
+        self._messages_stub = messages_stub
+        # Expose ``BadRequestError`` so generate.py's ``except`` clause
+        # binds to the real class — the test has already imported it.
+        import anthropic as _real
+        self.BadRequestError = _real.BadRequestError
+
+    def Anthropic(self, **_kwargs):  # noqa: N802  (match SDK attr name)
+        outer = self
+
+        class _Client:
+            messages = outer._messages_stub
+
+        return _Client()
+
+
+def _build_fake_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+    messages_stub: _CapturingMessages,
+) -> None:
+    """Install the fake anthropic module under the real one's name.
+
+    We monkeypatch only the attributes the client touches
+    (``Anthropic`` constructor + ``BadRequestError``) so that the
+    ``except anthropic.BadRequestError`` branch in generate.py still
+    catches instances of the real class.
+    """
+    fake = _FakeAnthropicSDK(messages_stub)
+    import anthropic as real_mod
+
+    monkeypatch.setattr(real_mod, "Anthropic", fake.Anthropic)
+
+
+def _make_anthropic_client(monkeypatch: pytest.MonkeyPatch, stub: _CapturingMessages):
+    """Construct an ``AnthropicLLMClient`` wired to ``stub.create``."""
+    _build_fake_anthropic(monkeypatch, stub)
+    return AnthropicLLMClient("claude-test-model", api_key="dummy-key")
+
+
+def _anthropic_messages(K: int = 3) -> list[dict]:
+    return build_messages(c_d=_C_D, alt=_ALT, K=K)
+
+
+def test_anthropic_client_includes_cache_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cache_control must land on the system prompt and the c_d prefix of the
+    user message; the ``ALTERNATIVE`` suffix must stay uncached."""
+    stub = _CapturingMessages(lambda: _FakeResponse())
+    client = _make_anthropic_client(monkeypatch, stub)
+
+    client.generate(
+        _anthropic_messages(),
+        temperature=0.8,
+        top_p=0.95,
+        max_tokens=180,
+        seed=7,
+    )
+
+    assert len(stub.calls) == 1
+    kw = stub.calls[0]
+
+    # System block: list of one typed dict with ephemeral cache_control.
+    assert isinstance(kw["system"], list)
+    assert len(kw["system"]) == 1
+    sys_block = kw["system"][0]
+    assert sys_block["type"] == "text"
+    assert sys_block["cache_control"] == {"type": "ephemeral"}
+    assert "generate" in sys_block["text"].lower()
+
+    # User message: content is a list of 2 typed dicts; first has
+    # cache_control and contains CONTEXT:, second is uncached and starts
+    # with the ALTERNATIVE: marker.
+    assert isinstance(kw["messages"], list) and len(kw["messages"]) == 1
+    user_msg = kw["messages"][0]
+    assert user_msg["role"] == "user"
+    blocks = user_msg["content"]
+    assert isinstance(blocks, list) and len(blocks) == 2
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert blocks[0]["text"].startswith("CONTEXT:")
+    assert "ALTERNATIVE:" not in blocks[0]["text"]
+    assert "cache_control" not in blocks[1]
+    assert blocks[1]["text"].startswith("\n\nALTERNATIVE:")
+    assert "Generate K=3" in blocks[1]["text"]
+
+
+def test_anthropic_client_falls_back_on_bad_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the server rejects cache_control, the client retries with the
+    plain-string shape and returns a normal completion."""
+    import anthropic
+    import httpx
+
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    resp = httpx.Response(400, request=req)
+    err = anthropic.BadRequestError(
+        message="cache_control not supported",
+        response=resp,
+        body={"error": "cache_control not supported"},
+    )
+
+    stub = _CapturingMessages(lambda: _FakeResponse(), raise_first=err)
+    client = _make_anthropic_client(monkeypatch, stub)
+
+    result = client.generate(
+        _anthropic_messages(),
+        temperature=0.8,
+        top_p=0.95,
+        max_tokens=180,
+        seed=3,
+    )
+
+    # Two calls: the first (cached) raised, the second (plain) succeeded.
+    assert len(stub.calls) == 2
+
+    first, second = stub.calls
+    # The first call carried the cached shape.
+    assert isinstance(first["system"], list)
+    assert isinstance(first["messages"][0]["content"], list)
+
+    # The retry falls back to plain strings.
+    assert isinstance(second["system"], str)
+    assert isinstance(second["messages"], list)
+    assert isinstance(second["messages"][0]["content"], str)
+
+    assert isinstance(result, GenerationResult)
+    assert result.text.startswith("I ")
+
+
+def test_anthropic_client_no_split_marker_single_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User messages lacking ``\\n\\nALTERNATIVE:`` fall back to a single
+    uncached block."""
+    stub = _CapturingMessages(lambda: _FakeResponse())
+    client = _make_anthropic_client(monkeypatch, stub)
+
+    # Minimal hand-rolled messages that skip the USER_BLOCK_TEMPLATE
+    # entirely — simulates a future prompt schema change.
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "Hello with no split marker here."},
+    ]
+
+    client.generate(
+        messages,
+        temperature=0.8,
+        top_p=0.95,
+        max_tokens=180,
+        seed=1,
+    )
+
+    kw = stub.calls[0]
+    blocks = kw["messages"][0]["content"]
+    assert isinstance(blocks, list) and len(blocks) == 1
+    assert blocks[0]["type"] == "text"
+    assert blocks[0]["text"] == "Hello with no split marker here."
+    assert "cache_control" not in blocks[0]
+
+
+def test_cache_usage_logged_at_debug(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``cache_creation_input_tokens`` + ``cache_read_input_tokens`` from
+    ``response.usage`` must be emitted at DEBUG level once per call."""
+    usage = _FakeUsage(
+        cache_creation_input_tokens=512,
+        cache_read_input_tokens=128,
+    )
+    stub = _CapturingMessages(lambda: _FakeResponse(usage=usage))
+    client = _make_anthropic_client(monkeypatch, stub)
+
+    with caplog.at_level(logging.DEBUG, logger="src.outcomes.generate"):
+        client.generate(
+            _anthropic_messages(),
+            temperature=0.8,
+            top_p=0.95,
+            max_tokens=180,
+            seed=0,
+        )
+
+    debug_msgs = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno == logging.DEBUG
+        and rec.name == "src.outcomes.generate"
+    ]
+    joined = "\n".join(debug_msgs)
+    assert "cache_creation_input_tokens=512" in joined
+    assert "cache_read_input_tokens=128" in joined
+
+
+# ---------------------------------------------------------------------------
 # AnthropicLLMClient lazy-import contract
 # ---------------------------------------------------------------------------
 
