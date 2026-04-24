@@ -406,7 +406,7 @@ class FewShotICLRankerFitted:
     client: LLMClient = field(default_factory=StubLLMClient, repr=False)
     timeline: Dict[str, List[ICLExample]] = field(default_factory=dict)
     n_shots: int = 3
-    n_permutations: int = 4
+    n_permutations: int = 10
     seed: int = 0
     temperature: float = 0.0
     max_tokens: int = 2
@@ -523,13 +523,14 @@ class FewShotICLRanker:
         self,
         n_shots: int = 3,
         llm_client: Optional[LLMClient] = None,
-        n_permutations: int = 4,
+        n_permutations: int = 10,
         seed: int = 0,
         max_prefix_tokens: int = 12_000,
         *,
         temperature: float = 0.0,
         max_tokens: int = 2,
         prompt_version: str = "few-shot-icl-rank-v1",
+        letters: Optional[Sequence[str]] = None,
     ) -> None:
         if n_shots < 0:
             raise ValueError(f"n_shots must be non-negative, got {n_shots}")
@@ -549,6 +550,14 @@ class FewShotICLRanker:
         self.temperature = float(temperature)
         self.max_tokens = int(max_tokens)
         self.prompt_version = str(prompt_version)
+        # ``letters`` determines the letter-set (and J = len(letters)).
+        # Default is DEFAULT_LETTERS (J=10). Tests / callers that need a
+        # smaller J pass the prefix, e.g. DEFAULT_LETTERS[:4].
+        self.letters: tuple[str, ...] = (
+            tuple(letters) if letters is not None else tuple(DEFAULT_LETTERS)
+        )
+        if len(self.letters) == 0:
+            raise ValueError("letters must be a non-empty sequence")
 
     def fit(
         self,
@@ -566,9 +575,9 @@ class FewShotICLRanker:
             raise ValueError(
                 "FewShotICLRanker.fit received an empty train batch"
             )
-        if train.n_alternatives != len(DEFAULT_LETTERS):
+        if train.n_alternatives != len(self.letters):
             raise ValueError(
-                f"FewShot-ICL-Claude requires n_alternatives={len(DEFAULT_LETTERS)} "
+                f"FewShot-ICL-Claude requires n_alternatives={len(self.letters)} "
                 f"(got {train.n_alternatives})."
             )
 
@@ -584,7 +593,7 @@ class FewShotICLRanker:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             prompt_version=self.prompt_version,
-            letters=DEFAULT_LETTERS,
+            letters=self.letters,
             model_id=model_id,
             max_prefix_tokens=self.max_prefix_tokens,
         )

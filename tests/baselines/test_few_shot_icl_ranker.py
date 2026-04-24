@@ -250,7 +250,7 @@ def test_cold_start_falls_back_to_zero_shot():
     test_batch = _make_batch_from_events(test_events)
 
     client = _RecordingStubClient()
-    ranker = FewShotICLRanker(n_shots=3, llm_client=client, n_permutations=1)
+    ranker = FewShotICLRanker(letters=DEFAULT_LETTERS[:4], n_shots=3, llm_client=client, n_permutations=1)
     fitted = ranker.fit(train_batch, train_batch)
     scores = fitted.score_events(test_batch)
 
@@ -272,7 +272,7 @@ def test_cold_start_falls_back_to_zero_shot():
 
     expected = ZT.format(
         c_d=test_events[0]["c_d"],
-        alternatives=render_alternatives(test_events[0]["alt_texts"], DEFAULT_LETTERS),
+        alternatives=render_alternatives(test_events[0]["alt_texts"], DEFAULT_LETTERS[:4]),
     )
     assert user_prompt == expected
 
@@ -297,7 +297,7 @@ def test_raw_events_none_graceful_degradation():
     ]
     test_batch = _make_batch_from_events(test_events)
 
-    ranker = FewShotICLRanker(
+    ranker = FewShotICLRanker(letters=DEFAULT_LETTERS[:4], 
         n_shots=3, llm_client=StubLLMClient(), n_permutations=1
     )
     fitted = ranker.fit(train_batch_no_raw, train_batch_no_raw)
@@ -328,7 +328,7 @@ def test_score_events_respects_permutation_count():
     test_batch = _make_batch_from_events(test_events)
 
     client = _RecordingStubClient()
-    ranker = FewShotICLRanker(n_shots=3, llm_client=client, n_permutations=4)
+    ranker = FewShotICLRanker(letters=DEFAULT_LETTERS[:4], n_shots=3, llm_client=client, n_permutations=4)
     fitted = ranker.fit(train_batch, train_batch)
     scores = fitted.score_events(test_batch)
 
@@ -341,7 +341,7 @@ def test_score_events_respects_permutation_count():
     # With n_permutations=1 we get exactly one call per event, and the
     # per-event log p_hat equals the hash-derived letter logprobs.
     client2 = _RecordingStubClient()
-    ranker2 = FewShotICLRanker(n_shots=3, llm_client=client2, n_permutations=1)
+    ranker2 = FewShotICLRanker(letters=DEFAULT_LETTERS[:4], n_shots=3, llm_client=client2, n_permutations=1)
     fitted2 = ranker2.fit(train_batch, train_batch)
     scores2 = fitted2.score_events(test_batch)
     assert len(client2.calls) == 3
@@ -394,7 +394,7 @@ def test_lockstep_letter_rotation_in_icl_examples():
             alt_texts_permuted=permuted_test,
             icl_examples=[ex],
             pi=pi,
-            letters=DEFAULT_LETTERS,
+            letters=DEFAULT_LETTERS[:4],
             max_prefix_tokens=12_000,
         )
         # Extract "CHOSEN: X" from the prompt.
@@ -430,7 +430,7 @@ def test_icl_alt_texts_rotate_with_permutation():
         alt_texts_permuted=[_make_alt(100 + pi[s]) for s in range(4)],
         icl_examples=[ex],
         pi=pi,
-        letters=DEFAULT_LETTERS,
+        letters=DEFAULT_LETTERS[:4],
     )
     # The ICL block is between header and sentinel; it must show
     # product-1 under (A), product-2 under (B), etc.
@@ -466,7 +466,7 @@ def test_context_overflow_triggers_truncation():
         alt_texts_permuted=test_alt_texts,
         icl_examples=examples,
         pi=pi,
-        letters=DEFAULT_LETTERS,
+        letters=DEFAULT_LETTERS[:4],
         max_prefix_tokens=100_000,
     )
     # Large budget keeps all 5 example headers.
@@ -481,7 +481,7 @@ def test_context_overflow_triggers_truncation():
         alt_texts_permuted=test_alt_texts,
         icl_examples=examples,
         pi=pi,
-        letters=DEFAULT_LETTERS,
+        letters=DEFAULT_LETTERS[:4],
         max_prefix_tokens=600,  # forces truncation
     )
     # Some examples must have been dropped.
@@ -504,7 +504,7 @@ def test_context_overflow_triggers_truncation():
         alt_texts_permuted=test_alt_texts,
         icl_examples=examples,
         pi=pi,
-        letters=DEFAULT_LETTERS,
+        letters=DEFAULT_LETTERS[:4],
         max_prefix_tokens=10,
     )
     assert ICL_SPLIT_MARKER not in degraded
@@ -525,7 +525,7 @@ def test_fit_raises_on_empty_batch():
         categories=[],
         raw_events=[],
     )
-    ranker = FewShotICLRanker(llm_client=StubLLMClient())
+    ranker = FewShotICLRanker(letters=DEFAULT_LETTERS[:4], llm_client=StubLLMClient())
     with pytest.raises(ValueError, match="empty"):
         ranker.fit(empty_batch, empty_batch)
 
@@ -548,7 +548,7 @@ def test_fit_raises_on_wrong_J():
         categories=["cat0"],
         raw_events=raw_events,
     )
-    ranker = FewShotICLRanker(llm_client=StubLLMClient())
+    ranker = FewShotICLRanker(letters=DEFAULT_LETTERS[:4], llm_client=StubLLMClient())
     with pytest.raises(ValueError, match="n_alternatives"):
         ranker.fit(batch, batch)
 
@@ -557,7 +557,7 @@ def test_fitted_description_and_n_params():
     t0 = pd.Timestamp("2025-01-01")
     events = [_make_event("A", t0 + pd.Timedelta(days=i), seed=i) for i in range(4)]
     batch = _make_batch_from_events(events)
-    ranker = FewShotICLRanker(
+    ranker = FewShotICLRanker(letters=DEFAULT_LETTERS[:4], 
         n_shots=3,
         llm_client=StubLLMClient(model_id="stub-v1"),
         n_permutations=4,
@@ -582,7 +582,7 @@ def test_baseline_name_is_few_shot_icl_claude():
 def test_score_events_raises_without_raw_events():
     train_events = [_make_event("A", pd.Timestamp("2025-01-01"), seed=0)]
     train_batch = _make_batch_from_events(train_events)
-    ranker = FewShotICLRanker(llm_client=StubLLMClient())
+    ranker = FewShotICLRanker(letters=DEFAULT_LETTERS[:4], llm_client=StubLLMClient())
     fitted = ranker.fit(train_batch, train_batch)
 
     no_raw = BaselineEventBatch(

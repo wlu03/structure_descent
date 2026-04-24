@@ -91,7 +91,7 @@ class ZeroShotClaudeRankerFitted:
 
     name: str = "ZeroShot-Claude"
     llm_client: LLMClient = field(default_factory=StubLLMClient, repr=False)
-    n_permutations: int = 4
+    n_permutations: int = 10
     seed: int = 0
     temperature: float = 0.0
     max_tokens: int = 2
@@ -245,11 +245,12 @@ class ZeroShotClaudeRanker:
         self,
         llm_client: Optional[LLMClient] = None,
         *,
-        K: int = 4,
+        K: int = 10,
         temperature: float = 0.0,
         max_tokens: int = 2,
         seed: int = 0,
         prompt_version: str = "zero-shot-rank-v1",
+        letters: Optional[Sequence[str]] = None,
     ) -> None:
         if K <= 0:
             raise ValueError(f"K must be positive, got {K}")
@@ -259,6 +260,14 @@ class ZeroShotClaudeRanker:
         self.max_tokens = int(max_tokens)
         self.seed = int(seed)
         self.prompt_version = str(prompt_version)
+        # ``letters`` determines the letter-set (and implicitly J via
+        # its length). Default is DEFAULT_LETTERS (J=10). Tests / callers
+        # that need a smaller J pass the prefix, e.g. DEFAULT_LETTERS[:4].
+        self.letters: tuple[str, ...] = (
+            tuple(letters) if letters is not None else tuple(DEFAULT_LETTERS)
+        )
+        if len(self.letters) == 0:
+            raise ValueError("letters must be a non-empty sequence")
 
     def fit(
         self,
@@ -275,11 +284,11 @@ class ZeroShotClaudeRanker:
         """
         if train.n_events == 0:
             raise ValueError("ZeroShotClaudeRanker.fit received an empty train batch")
-        if train.n_alternatives != len(DEFAULT_LETTERS):
+        if train.n_alternatives != len(self.letters):
             raise ValueError(
-                f"ZeroShot-Claude requires n_alternatives={len(DEFAULT_LETTERS)} "
-                f"(got {train.n_alternatives}). Adjust the letter set or use a "
-                "J=4 batch."
+                f"ZeroShot-Claude requires n_alternatives={len(self.letters)} "
+                f"(got {train.n_alternatives}). Pass `letters` at construction "
+                "or rebuild the batch at a matching J."
             )
         if train.raw_events is None:
             raise ValueError(
@@ -297,7 +306,7 @@ class ZeroShotClaudeRanker:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             prompt_version=self.prompt_version,
-            letters=DEFAULT_LETTERS,
+            letters=self.letters,
             model_id=model_id,
         )
 

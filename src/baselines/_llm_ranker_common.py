@@ -57,8 +57,15 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_LETTERS: tuple[str, ...] = ("A", "B", "C", "D")
-"""Canonical ordered letter labels for J=4 alternatives."""
+DEFAULT_LETTERS: tuple[str, ...] = (
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+)
+"""Canonical ordered letter labels for up to J=10 alternatives.
+
+Matches the Amazon dataset's ``choice_set_size=10``. Callers with
+smaller J should pass ``letters=DEFAULT_LETTERS[:J]`` at construction;
+the Latin-square helper :func:`letter_permutations` reads the first
+``len(letters)`` entries."""
 
 # Floor applied before ``np.log`` so aggregated probabilities never produce
 # ``-inf`` scores (see design doc §Known failure modes #1).
@@ -713,7 +720,7 @@ class LLMRankerBase:
     def __init__(
         self,
         llm_client: Optional[LLMClient] = None,
-        n_permutations: int = 4,
+        n_permutations: int = 10,
         seed: int = 0,
     ) -> None:
         if n_permutations <= 0:
