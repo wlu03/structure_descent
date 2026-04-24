@@ -718,6 +718,23 @@ def main(args: argparse.Namespace) -> int:
         len(records_test),
     )
 
+    # Re-align the per-event importance weights to the SURVIVING train
+    # records. ``train_event_weights_aligned`` was built earlier against
+    # ``train_events_subset`` (pre-build_choice_sets) and will therefore
+    # carry one entry per ORIGINAL train event; with
+    # ``--drop-pool-starved-events`` a few of those events are absent from
+    # ``records_train`` and the ``assemble_batch`` omega-shape invariant
+    # would fail. Rebuild from ``customer_weight`` using each surviving
+    # record's customer_id so length and order match records_train exactly.
+    if len(records_train) != len(train_event_weights_aligned):
+        train_event_weights_aligned = np.asarray(
+            [
+                float(customer_weight.get(str(r["customer_id"]), 1.0))
+                for r in records_train
+            ],
+            dtype=np.float32,
+        )
+
     if len(records_train) == 0:
         raise SystemExit(
             "No training records after all filters; cannot train. "
