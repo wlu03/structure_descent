@@ -525,6 +525,11 @@ class LaSRFitted:
     prompt_version: str = "lasr-v1"
     final_concept_library: List[Concept] = field(default_factory=list)
     equation_memory: List[Tuple[str, float]] = field(default_factory=list)
+    # Richer parallel record list for extra_artifacts_for_json — carries
+    # train_nll + coefficients that equation_memory does not. Populated
+    # by :meth:`LaSR.fit` at return time; same survivors, same order as
+    # ``equation_memory``.
+    equation_records: List["_SurvivorRecord"] = field(default_factory=list)
     _utility_fn: Optional[Callable[[np.ndarray, np.ndarray], float]] = field(
         default=None, repr=False
     )
@@ -572,6 +577,59 @@ class LaSRFitted:
             f"k={self.n_coefficients} val_nll={self.val_nll:.4f} "
             f"accepted={self.n_proposals_accepted}/{self.n_proposals_total}"
         )
+
+    # ------------------------------------------------------------------
+    # Paper-grade evaluation hook (addition 4)
+    # ------------------------------------------------------------------
+    def extra_artifacts_for_json(self) -> Optional[Dict[str, Any]]:
+        """Export top-10 equations + final concept library.
+
+        Contract (``docs/paper_evaluation_additions.md`` §4):
+
+        * ``llm_sr_top_equations`` — same schema as
+          :meth:`LLMSRFitted.extra_artifacts_for_json`, sourced from
+          :attr:`equation_records` (sorted ascending by
+          ``nll_train + nll_val``, cap 10).
+        * ``lasr_final_concept_library`` — list of
+          ``{"name", "source", "nl_summary", "usage_count",
+          "discovered_at"}`` entries from :attr:`final_concept_library`.
+
+        Returns ``None`` only when BOTH sides are empty so the row
+        surfaces ``extra_artifacts: null`` rather than an empty shell.
+        """
+        have_eqs = bool(self.equation_records)
+        have_lib = bool(self.final_concept_library)
+        if not have_eqs and not have_lib:
+            return None
+        out: Dict[str, Any] = {}
+        if have_eqs:
+            sorted_recs = sorted(
+                self.equation_records, key=lambda r: r.combined_nll
+            )[:10]
+            out["llm_sr_top_equations"] = [
+                {
+                    "source": str(r.source),
+                    "nll_train": float(r.train_nll),
+                    "nll_val": float(r.val_nll),
+                    "coefficients": [
+                        float(c) for c in np.asarray(r.coeffs).ravel()
+                    ],
+                }
+                for r in sorted_recs
+            ]
+        else:
+            out["llm_sr_top_equations"] = []
+        out["lasr_final_concept_library"] = [
+            {
+                "name": str(c.name),
+                "source": str(c.source),
+                "nl_summary": str(c.nl_summary),
+                "usage_count": int(c.usage_count),
+                "discovered_at": int(c.discovered_at),
+            }
+            for c in self.final_concept_library
+        ]
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -876,7 +934,9 @@ class LaSR:
                 prompt_version=self.prompt_version,
                 final_concept_library=library.as_list(),
                 equation_memory=[],
+                equation_records=[],
             )
+        top_records = sorted(memory, key=lambda r: r.val_nll)[: self.top_k_memory]
         return LaSRFitted(
             name=self.name,
             best_equation=best.source,
@@ -890,9 +950,9 @@ class LaSR:
             prompt_version=self.prompt_version,
             final_concept_library=library.as_list(),
             equation_memory=[
-                (r.source, float(r.val_nll))
-                for r in sorted(memory, key=lambda r: r.val_nll)[: self.top_k_memory]
+                (r.source, float(r.val_nll)) for r in top_records
             ],
+            equation_records=list(top_records),
             _utility_fn=best.fn,
         )
 

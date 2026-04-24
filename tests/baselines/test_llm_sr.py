@@ -335,6 +335,89 @@ def test_outer_loop_retries_on_rejection():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# extra_artifacts_for_json (paper-grade evaluation addition 4)
+# ---------------------------------------------------------------------------
+
+
+def test_extra_artifacts_returns_none_when_memory_empty():
+    """A fitted object with no memory entries → ``extra_artifacts_for_json`` → None.
+
+    The leaderboard writer interprets ``None`` as "omit / null this
+    baseline's extra_artifacts" — non-LLM-SR rows must see None here
+    and so must LLM-SR rows that fit with zero proposals accepted.
+    """
+    fitted = LLMSRFitted(
+        name="LLM-SR",
+        best_skeleton=FALLBACK_SKELETON,
+        best_coefficients=np.zeros(4, dtype=np.float64),
+        n_coefficients=4,
+        train_nll=1.0,
+        val_nll=1.2,
+        memory=[],
+    )
+    assert fitted.extra_artifacts_for_json() is None
+
+
+def test_extra_artifacts_sorts_by_combined_nll_and_caps_at_10():
+    """Top-K export respects ``nll_train + nll_val`` ascending; cap = 10."""
+    from src.baselines.llm_sr import _SkeletonRecord
+
+    records = []
+    for i in range(15):
+        records.append(
+            _SkeletonRecord(
+                source=f"def utility(x, c): return c[0]*x[{i % 4}]  # id={i}",
+                fn=lambda x, c: 0.0,
+                coeffs=np.array([float(i), -float(i)]),
+                k=2,
+                train_nll=float(15 - i),   # smaller i → higher NLL; reverse sort
+                val_nll=float(15 - i),
+            )
+        )
+    fitted = LLMSRFitted(
+        name="LLM-SR",
+        best_skeleton=records[-1].source,
+        best_coefficients=records[-1].coeffs,
+        n_coefficients=2,
+        train_nll=records[-1].train_nll,
+        val_nll=records[-1].val_nll,
+        memory=records,
+    )
+    out = fitted.extra_artifacts_for_json()
+    assert out is not None
+    eqs = out["llm_sr_top_equations"]
+    assert len(eqs) == 10  # cap
+    # First entry has the lowest combined_nll — records[14] has train+val=2.
+    assert eqs[0]["nll_train"] == 1.0 and eqs[0]["nll_val"] == 1.0
+    # Ordering is ascending.
+    combined = [e["nll_train"] + e["nll_val"] for e in eqs]
+    assert combined == sorted(combined)
+    # Shape of each entry.
+    for e in eqs:
+        assert set(e.keys()) == {"source", "nll_train", "nll_val", "coefficients"}
+        assert isinstance(e["source"], str)
+        assert isinstance(e["nll_train"], float)
+        assert isinstance(e["nll_val"], float)
+        assert isinstance(e["coefficients"], list)
+        for c in e["coefficients"]:
+            assert type(c) is float
+
+
+def test_extra_artifacts_populated_after_fit():
+    """After a real stub-path fit, memory is non-empty and the hook fires."""
+    train = _make_synthetic_dcm_batch(50, true_w=np.array([1.0, -0.5, 0.3, -0.1]), seed=1)
+    val = _make_synthetic_dcm_batch(20, true_w=np.array([1.0, -0.5, 0.3, -0.1]), seed=2)
+    baseline = LLMSR(llm_client=StubLLMClient(), n_proposals=2)
+    fitted = baseline.fit(train, val)
+    # Stub path only seeds the fallback into memory, but memory is non-empty.
+    assert len(fitted.memory) >= 1
+    out = fitted.extra_artifacts_for_json()
+    assert out is not None
+    assert "llm_sr_top_equations" in out
+    assert len(out["llm_sr_top_equations"]) >= 1
+
+
 def test_registry_factory_wires_llm_sr():
     """``LLM-SR-*`` rows appear in BASELINE_REGISTRY and factories are callable."""
     from src.baselines.run_all import BASELINE_REGISTRY, LLM_CLIENT_FACTORIES

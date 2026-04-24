@@ -333,6 +333,11 @@ class LLMSRFitted:
     ``score_events`` can evaluate without re-compiling. The field is
     ``repr=False`` / excluded from dict serialisation because it is not
     picklable in general.
+
+    ``memory`` carries the full top-K experience buffer at the end of
+    :meth:`LLMSR.fit`; used by :meth:`extra_artifacts_for_json` to
+    export the top-10 equations into the leaderboard row per the
+    paper-grade evaluation doc (addition 4).
     """
 
     name: str = "LLM-SR"
@@ -345,6 +350,7 @@ class LLMSRFitted:
     n_proposals_accepted: int = 0
     n_proposals_total: int = 0
     prompt_version: str = "llm-sr-v1"
+    memory: List["_SkeletonRecord"] = field(default_factory=list)
     _utility_fn: Optional[Callable[[np.ndarray, np.ndarray], float]] = field(
         default=None, repr=False
     )
@@ -397,6 +403,36 @@ class LLMSRFitted:
             f"train_nll={self.train_nll:.4f} val_nll={self.val_nll:.4f} "
             f"accepted={self.n_proposals_accepted}/{self.n_proposals_total}"
         )
+
+    # ------------------------------------------------------------------
+    # Paper-grade evaluation hook (addition 4)
+    # ------------------------------------------------------------------
+    def extra_artifacts_for_json(self) -> Optional[Dict[str, Any]]:
+        """Export the top-10 fitted skeletons for the leaderboard row.
+
+        Contract (``docs/paper_evaluation_additions.md`` §4):
+
+        * Key ``llm_sr_top_equations`` maps to a list of dicts with
+          fields ``{"source", "nll_train", "nll_val", "coefficients"}``.
+        * Ordered ascending by ``nll_train + nll_val`` (lower is better).
+        * Capped at 10 entries.
+        * Returns ``None`` when :attr:`memory` is empty so the row
+          surfaces ``extra_artifacts: null`` rather than an empty list.
+        """
+        if not self.memory:
+            return None
+        sorted_mem = sorted(self.memory, key=lambda r: r.combined_nll)[:10]
+        return {
+            "llm_sr_top_equations": [
+                {
+                    "source": str(r.source),
+                    "nll_train": float(r.train_nll),
+                    "nll_val": float(r.val_nll),
+                    "coefficients": [float(c) for c in np.asarray(r.coeffs).ravel()],
+                }
+                for r in sorted_mem
+            ]
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +643,7 @@ class LLMSR:
                 n_proposals_accepted=accepted_proposals,
                 n_proposals_total=total_proposals,
                 prompt_version=self.prompt_version,
+                memory=[],
                 _utility_fn=None,
             )
         best = memory[0]
@@ -621,6 +658,7 @@ class LLMSR:
             n_proposals_accepted=accepted_proposals,
             n_proposals_total=total_proposals,
             prompt_version=self.prompt_version,
+            memory=list(memory),
             _utility_fn=best.fn,
         )
 

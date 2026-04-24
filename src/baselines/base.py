@@ -114,6 +114,21 @@ class BaselineReport:
 
     metrics keys (always present):
         top1, top5, mrr, test_nll, aic, bic, n_events
+
+    Additional per-event / per-customer fields (populated iff the
+    baseline completes evaluation successfully; see
+    ``docs/paper_evaluation_additions.md`` for the contract):
+
+    per_event_nll : list[float]
+        Parallel to the test batch: ``-log_softmax(logits)[chosen_idx]``
+        for each event. ``mean(per_event_nll) == metrics['test_nll']``
+        up to float error.
+    per_event_topk_correct : list[bool]
+        Per-event top-1 correctness flag (``argmax(logits) == chosen``,
+        lowest-index tie-break matching :func:`topk_accuracy`).
+    per_customer_nll : dict[str, dict]
+        Groups the above by ``batch.customer_ids``. Each value is
+        ``{"nll": float, "n_events": int, "top1": float}``.
     """
 
     name: str
@@ -124,6 +139,9 @@ class BaselineReport:
     sign_check: Optional[Dict[str, float]] = None
     fit_time_seconds: float = 0.0
     extra: Dict[str, object] = field(default_factory=dict)
+    per_event_nll: List[float] = field(default_factory=list)
+    per_event_topk_correct: List[bool] = field(default_factory=list)
+    per_customer_nll: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
     def summary(self) -> str:
         m = self.metrics

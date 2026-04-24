@@ -305,6 +305,25 @@ def run_all_baselines(
 
         reports[display_name] = report
 
+        # Optional equation-export hook. Fitted objects may implement
+        # ``extra_artifacts_for_json(self) -> dict | None`` to surface
+        # qualitative artifacts (LLM-SR top equations, LaSR concept
+        # library). Duck-type: the FittedBaseline Protocol is runtime-
+        # checkable and does NOT require the hook, so every baseline
+        # that doesn't implement it reports ``extra_artifacts: null``.
+        extra_artifacts_fn = getattr(fitted, "extra_artifacts_for_json", None)
+        extra_artifacts: Optional[dict] = None
+        if callable(extra_artifacts_fn):
+            try:
+                extra_artifacts = extra_artifacts_fn()
+            except Exception as exc:  # noqa: BLE001
+                if verbose:
+                    print(
+                        f"[{display_name}] extra_artifacts_for_json "
+                        f"failed ({exc}); recording null."
+                    )
+                extra_artifacts = None
+
         m = report.metrics
         row = {
             "name": display_name,
@@ -319,6 +338,12 @@ def run_all_baselines(
             "fit_seconds": fit_seconds,
             "description": getattr(fitted, "description", ""),
             "error": None,
+            # Paper-grade per-event + per-customer instrumentation.
+            # Present iff status == "ok"; omitted/null on other rows.
+            "per_event_nll": list(report.per_event_nll),
+            "per_event_topk_correct": list(report.per_event_topk_correct),
+            "per_customer_nll": dict(report.per_customer_nll),
+            "extra_artifacts": extra_artifacts,
         }
         rows.append(row)
 

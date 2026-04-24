@@ -121,6 +121,20 @@ def evaluate_baseline(
     mrr_val = _mrr(logits, c_star)
     nll_val = _nll(logits, c_star)
 
+    # --- per-event NLL + top-1 (paper-grade instrumentation) ----------
+    # Compute log-softmax rows directly so the mean matches ``nll_val``
+    # to within float error. The aggregate ``_nll`` uses the same
+    # formula, so mean(per_event_nll) == test_nll exactly (bar
+    # floating-point rounding over the mean reduction).
+    logits_f64 = logits.astype(np.float64)
+    row_max = logits_f64.max(axis=1, keepdims=True)
+    shifted = logits_f64 - row_max
+    log_Z = np.log(np.exp(shifted).sum(axis=1, keepdims=True))
+    log_probs = shifted - log_Z  # shape (N, J)
+    row_idx = np.arange(n)
+    per_event_nll_arr = -log_probs[row_idx, c_star]
+    per_event_nll = [float(v) for v in per_event_nll_arr]
+
     n_for_ic = train_n_events if train_n_events is not None else n
     k = max(int(fitted.n_params), 1)
     aic_val = _aic(nll_val, k=k, n_train=n_for_ic)
@@ -140,6 +154,28 @@ def evaluate_baseline(
     # Note: np.argmax ties lowest-index, torch.topk ties lowest-index
     # too — both match; aggregate top1 reported above uses torch.topk.
     correct_mask = (top1_idx == c_star)
+    per_event_topk_correct = [bool(v) for v in correct_mask]
+
+    # Per-customer NLL + top-1 breakdown, grouped by batch.customer_ids.
+    # Paper-grade instrumentation: downstream scripts (e.g. customer
+    # segmentation) consume this dict verbatim. Keys are a subset of
+    # batch.customer_ids (only customers with ≥1 test event appear).
+    per_customer_agg: Dict[str, Dict[str, float]] = {}
+    for i, cid in enumerate(batch.customer_ids):
+        bucket = per_customer_agg.setdefault(
+            str(cid), {"_nll_sum": 0.0, "_t1_sum": 0, "n_events": 0}
+        )
+        bucket["_nll_sum"] += float(per_event_nll_arr[i])
+        bucket["_t1_sum"] += int(correct_mask[i])
+        bucket["n_events"] += 1
+    per_customer_nll: Dict[str, Dict[str, float]] = {}
+    for cid, b in per_customer_agg.items():
+        n_c = int(b["n_events"])
+        per_customer_nll[cid] = {
+            "nll": float(b["_nll_sum"] / max(n_c, 1)),
+            "n_events": n_c,
+            "top1": float(b["_t1_sum"] / max(n_c, 1)),
+        }
 
     for i, (cat, meta) in enumerate(zip(batch.categories, batch.metadata)):
         correct = int(correct_mask[i])
@@ -188,4 +224,7 @@ def evaluate_baseline(
         per_repeat_novel=per_rep_df,
         fit_time_seconds=float(fit_time_seconds),
         extra={"scoring_time_seconds": scoring_time},
+        per_event_nll=per_event_nll,
+        per_event_topk_correct=per_event_topk_correct,
+        per_customer_nll=per_customer_nll,
     )

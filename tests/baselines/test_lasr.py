@@ -467,6 +467,125 @@ def test_end_to_end_fit_with_scripted_proposals():
     ), f"scripted proposal missing from memory: {memory_sources}"
 
 
+# ---------------------------------------------------------------------------
+# 9. extra_artifacts_for_json (paper-grade evaluation addition 4)
+# ---------------------------------------------------------------------------
+
+
+def test_extra_artifacts_returns_none_when_both_empty():
+    """No records AND no library → hook returns None."""
+    fitted = LaSRFitted(
+        name="LaSR",
+        best_equation=FALLBACK_SKELETON,
+        best_coefficients=np.zeros(4, dtype=np.float64),
+        n_coefficients=4,
+        final_concept_library=[],
+        equation_memory=[],
+        equation_records=[],
+    )
+    assert fitted.extra_artifacts_for_json() is None
+
+
+def test_extra_artifacts_carries_top_equations_and_library():
+    """Both ``llm_sr_top_equations`` and ``lasr_final_concept_library`` are present."""
+    from src.baselines.lasr import _SurvivorRecord
+
+    # Six records with varying combined NLL so sort ordering is testable.
+    records = []
+    for i in range(6):
+        records.append(
+            _SurvivorRecord(
+                source=f"def utility(x, c): return c[0]*x[{i % 4}]",
+                fn=lambda x, c: 0.0,
+                coeffs=np.array([0.1 * i, -0.2 * i], dtype=np.float64),
+                k=2,
+                train_nll=1.0 + 0.1 * i,
+                val_nll=1.0 + 0.1 * i,
+            )
+        )
+    library = [
+        Concept(
+            name="price_term",
+            source="-c[0] * x[0]",
+            nl_summary="price sensitivity",
+            usage_count=3,
+            discovered_at=1,
+            n_coeffs=1,
+        ),
+        Concept(
+            name="log_price",
+            source="log1p(x[0]) * c[0]",
+            nl_summary="log-price term",
+            usage_count=1,
+            discovered_at=2,
+            n_coeffs=1,
+        ),
+    ]
+    fitted = LaSRFitted(
+        name="LaSR",
+        best_equation=records[0].source,
+        best_coefficients=records[0].coeffs,
+        n_coefficients=2,
+        train_nll=records[0].train_nll,
+        val_nll=records[0].val_nll,
+        final_concept_library=library,
+        equation_records=records,
+        equation_memory=[(r.source, r.val_nll) for r in records],
+    )
+    out = fitted.extra_artifacts_for_json()
+    assert out is not None
+    # Top equations — ascending by combined, at most 10.
+    eqs = out["llm_sr_top_equations"]
+    assert 1 <= len(eqs) <= 10
+    combined = [e["nll_train"] + e["nll_val"] for e in eqs]
+    assert combined == sorted(combined)
+    for e in eqs:
+        assert set(e.keys()) == {"source", "nll_train", "nll_val", "coefficients"}
+    # Library — schema + ordering preserved from final_concept_library.
+    lib = out["lasr_final_concept_library"]
+    assert len(lib) == 2
+    for entry in lib:
+        assert set(entry.keys()) == {
+            "name", "source", "nl_summary", "usage_count", "discovered_at"
+        }
+    assert {entry["name"] for entry in lib} == {"price_term", "log_price"}
+
+
+def test_extra_artifacts_library_only_when_no_records():
+    """Library present but no records → ``llm_sr_top_equations`` is empty list."""
+    library = [
+        Concept(
+            name="c0",
+            source="x[0]",
+            nl_summary="raw price",
+            usage_count=1,
+            discovered_at=0,
+            n_coeffs=0,
+        )
+    ]
+    fitted = LaSRFitted(
+        name="LaSR",
+        final_concept_library=library,
+        equation_records=[],
+    )
+    out = fitted.extra_artifacts_for_json()
+    assert out is not None
+    assert out["llm_sr_top_equations"] == []
+    assert len(out["lasr_final_concept_library"]) == 1
+
+
+def test_extra_artifacts_populated_after_fit():
+    """End-to-end stub fit populates equation_records so the hook fires."""
+    train = _make_synthetic_dcm_batch(30, true_w=np.ones(4), seed=20)
+    val = _make_synthetic_dcm_batch(15, true_w=np.ones(4), seed=21)
+    baseline = LaSR(llm_client=StubLLMClient(), n_iters=1, proposals_per_iter=1)
+    fitted = baseline.fit(train, val)
+    out = fitted.extra_artifacts_for_json()
+    assert out is not None
+    assert "llm_sr_top_equations" in out
+    assert "lasr_final_concept_library" in out
+
+
 def test_fit_records_equation_memory():
     """After a successful fit the ``equation_memory`` is populated."""
     train = _make_synthetic_dcm_batch(30, true_w=np.ones(4), seed=20)

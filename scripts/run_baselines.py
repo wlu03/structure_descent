@@ -427,6 +427,22 @@ def main() -> int:
             raise SystemExit(2)
         test = records_to_baseline_batch(test_recs)
 
+    # Paper-grade evaluation sidecar (see
+    # ``docs/paper_evaluation_additions.md`` §3): pin the canonical
+    # test-event ordering on disk so downstream significance/segment
+    # scripts can cross-reference by event index across baselines.
+    # Written BEFORE the baseline fits so a mid-run crash still produces
+    # the sidecar for the rows that did complete.
+    if args.output_dir:
+        _write_events_sidecar(
+            test_batch=test,
+            output_dir=args.output_dir,
+            tag=args.tag,
+            seed=int(args.seed),
+            split_mode=str(args.split_mode),
+            n_customers=int(args.n_customers),
+        )
+
     rows: List[dict[str, object]] = run_all_baselines(
         train, val, test, verbose=True
     )
@@ -445,6 +461,81 @@ def main() -> int:
             print(f"  {fmt}: {path}")
 
     return 0
+
+
+def _write_events_sidecar(
+    *,
+    test_batch,
+    output_dir: str,
+    tag: str | None,
+    seed: int,
+    split_mode: str,
+    n_customers: int,
+) -> str:
+    """Write ``events_<tag>.json`` pinning the test-event ordering.
+
+    The filename stem replaces the ``baselines_leaderboard`` prefix
+    with ``events``; e.g. ``--tag=main_seed7`` yields
+    ``events_main_seed7.json`` (matches the contract in
+    ``docs/paper_evaluation_additions.md`` §3). When ``tag`` is unset,
+    the file is written as ``events.json``.
+
+    Event schema per design doc:
+
+        {
+            "event_idx": int,
+            "customer_id": str,
+            "category": str,
+            "chosen_idx": int,
+            "n_alternatives": int,
+            "is_repeat": bool,
+            "order_date": str,
+        }
+    """
+    import json
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = "events"
+    if tag:
+        stem = f"{stem}_{tag}"
+    sidecar_path = out_dir / f"{stem}.json"
+
+    n_alt = int(test_batch.n_alternatives)
+    events: list[dict] = []
+    for i in range(test_batch.n_events):
+        meta = test_batch.metadata[i] if i < len(test_batch.metadata) else {}
+        order_date_raw = meta.get("order_date", "")
+        # Normalise non-string order_date values (pd.Timestamp, datetime)
+        # into ISO strings so the JSON is stable across run environments.
+        order_date = "" if order_date_raw is None else str(order_date_raw)
+        events.append(
+            {
+                "event_idx": int(i),
+                "customer_id": str(test_batch.customer_ids[i]),
+                "category": str(test_batch.categories[i]),
+                "chosen_idx": int(test_batch.chosen_indices[i]),
+                "n_alternatives": n_alt,
+                "is_repeat": bool(meta.get("is_repeat", False)),
+                "order_date": order_date,
+            }
+        )
+
+    # n_customers: honour the CLI arg (matches design doc field) but
+    # also surface the *observed* customer count in the sidecar via the
+    # events list — downstream scripts can recompute if needed.
+    payload = {
+        "split_mode": str(split_mode),
+        "seed": int(seed),
+        "n_customers": int(n_customers),
+        "n_events": int(test_batch.n_events),
+        "events": events,
+    }
+    sidecar_path.write_text(
+        json.dumps(payload, indent=2, default=str), encoding="utf-8"
+    )
+    logger.info("wrote events sidecar: %s", sidecar_path.resolve())
+    return str(sidecar_path.resolve())
 
 
 if __name__ == "__main__":
