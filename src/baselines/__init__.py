@@ -54,9 +54,12 @@ from .base import (
     BaselineReport,
     FittedBaseline,
 )
+from .delphos import Delphos, DelphosFitted
 from .evaluate import evaluate_baseline
 from .feature_pool import build_expanded_pool, expand_batch
 from .few_shot_icl_ranker import FewShotICLRanker, FewShotICLRankerFitted
+from .lasr import Concept, ConceptLibrary, LaSR, LaSRFitted
+from .llm_sr import LLMSR, LLMSRFitted
 from .popularity import PopularityBaseline, PopularityFitted
 from .st_mlp_ablation import STMLPChoice, STMLPFitted
 from .zero_shot_claude_ranker import (
@@ -68,9 +71,17 @@ __all__ = [
     "Baseline",
     "BaselineEventBatch",
     "BaselineReport",
+    "Concept",
+    "ConceptLibrary",
+    "Delphos",
+    "DelphosFitted",
     "FewShotICLRanker",
     "FewShotICLRankerFitted",
     "FittedBaseline",
+    "LaSR",
+    "LaSRFitted",
+    "LLMSR",
+    "LLMSRFitted",
     "PopularityBaseline",
     "PopularityFitted",
     "STMLPChoice",

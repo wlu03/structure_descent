@@ -115,6 +115,8 @@ LLM_MODEL_SWEEP: List[Tuple[str, Callable[[], Any]]] = [
 _LLM_BASELINE_BASES: List[Tuple[str, str, str]] = [
     ("ZeroShot",    "src.baselines.zero_shot_claude_ranker", "ZeroShotClaudeRanker"),
     ("FewShot-ICL", "src.baselines.few_shot_icl_ranker",     "FewShotICLRanker"),
+    ("LLM-SR",      "src.baselines.llm_sr",                  "LLMSR"),
+    ("LaSR",        "src.baselines.lasr",                    "LaSR"),
 ]
 
 # Populated below via :func:`_build_registry`. Maps expanded display_name
@@ -141,6 +143,7 @@ def _build_registry() -> List[Tuple[str, str, str]]:
         ("MLP",              "src.baselines.classical_ml",  "MLPChoice"),
         ("Bayesian-ARD",     "src.baselines.bayesian_ard",  "BayesianARD"),
         ("DUET",             "src.baselines.duet_ga",       "DUET"),
+        ("Delphos",          "src.baselines.delphos",       "Delphos"),
         # LLM-free ablation — embeds raw alt-metadata with the same
         # sentence encoder PO-LEU uses and trains a small MLP.
         ("ST-MLP",           "src.baselines.st_mlp_ablation", "STMLPChoice"),
