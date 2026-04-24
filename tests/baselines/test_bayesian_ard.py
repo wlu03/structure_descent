@@ -102,6 +102,54 @@ def test_bayesian_ard_pruning_actually_prunes(fitted_smoke):
     assert fitted.n_params < total
 
 
+def test_bayesian_ard_temperature_scaling_calibrates_without_changing_topk():
+    """Post-hoc temperature scaling (Guo et al. 2017) must:
+
+      1. Return T > 1 when raw logits are over-confident.
+      2. Strictly reduce val NLL vs. T = 1.
+      3. Preserve argmax (top-1 invariance).
+
+    Directly exercises the module-level _fit_temperature helper on a toy
+    logit batch — independent of the NumPyro fit path, which is covered by
+    the smoke test.
+    """
+    from scipy.special import log_softmax
+    from src.baselines.bayesian_ard import _fit_temperature
+
+    # Same toy setup as the LASSO-MNL calibration test: 4 events, 3 alts,
+    # extreme logit spread (100, 0, -50). One event has a "surprise" chosen
+    # alt so the raw NLL under T=1 is catastrophic; calibrated T must fix it.
+    raw_logits = np.array([100.0, 0.0, -50.0])
+    val_logits_list = [raw_logits.copy() for _ in range(4)]
+    chosen_indices = [0, 0, 0, 2]
+
+    nll_t1 = 0.0
+    for lg, ch in zip(val_logits_list, chosen_indices):
+        nll_t1 -= float(log_softmax(lg)[ch])
+
+    T = _fit_temperature(val_logits_list, chosen_indices)
+    assert T > 1.0, f"expected T > 1 on over-confident logits, got T={T}"
+
+    nll_tT = 0.0
+    for lg, ch in zip(val_logits_list, chosen_indices):
+        nll_tT -= float(log_softmax(lg / T)[ch])
+    assert nll_tT < nll_t1, (
+        f"temperature scaling should reduce NLL: nll(T=1)={nll_t1:.3f} "
+        f"vs nll(T={T:.3f})={nll_tT:.3f}"
+    )
+
+    for lg in val_logits_list:
+        assert int(np.argmax(lg)) == int(np.argmax(lg / T))
+
+
+def test_bayesian_ard_fit_populates_temperature_field(fitted_smoke):
+    """End-to-end: the fitted object carries a positive, finite temperature."""
+    _, _, fitted = fitted_smoke
+    assert hasattr(fitted, "temperature")
+    assert np.isfinite(fitted.temperature)
+    assert fitted.temperature > 0.0
+
+
 def test_bayesian_ard_posterior_precisions_learned(fitted_smoke):
     """posterior_alpha must be finite and updated from the tiny prior mean."""
     _, _, fitted = fitted_smoke

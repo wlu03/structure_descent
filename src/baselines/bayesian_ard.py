@@ -64,9 +64,50 @@ from dataclasses import dataclass
 from typing import List
 
 import numpy as np
+from scipy.optimize import minimize_scalar
+from scipy.special import log_softmax
 
 from .base import BaselineEventBatch, FittedBaseline
 from .feature_pool import expand_batch
+
+
+# -----------------------------------------------------------------------------
+# Post-hoc temperature scaling (Guo et al. 2017)
+# -----------------------------------------------------------------------------
+
+
+def _fit_temperature(
+    val_logits_list: List[np.ndarray],
+    chosen_indices: List[int],
+    t_lo: float = 0.01,
+    t_hi: float = 1000.0,
+) -> float:
+    """Fit one scalar T > 0 minimizing val NLL of ``logits / T``.
+
+    Scaling logits by a positive constant preserves argmax ordering, so
+    top-k metrics are invariant; only the softmax distribution sharpens
+    (T<1) or flattens (T>1). A degenerate val set short-circuits to T=1.0.
+    """
+    if len(val_logits_list) == 0:
+        return 1.0
+    if all(float(np.max(np.abs(lg))) < 1e-12 for lg in val_logits_list):
+        return 1.0
+
+    def _neg_log_lik(log_T: float) -> float:
+        T = float(np.exp(log_T))
+        total = 0.0
+        for lg, ch in zip(val_logits_list, chosen_indices):
+            total -= float(log_softmax(lg / T)[ch])
+        return total
+
+    res = minimize_scalar(
+        _neg_log_lik,
+        bounds=(float(np.log(t_lo)), float(np.log(t_hi))),
+        method="bounded",
+        options={"xatol": 1e-6},
+    )
+    T = float(np.exp(res.x))
+    return float(np.clip(T, t_lo, t_hi))
 
 
 # -----------------------------------------------------------------------------
@@ -178,10 +219,14 @@ class BayesianARDFitted:
     alpha_threshold: float
     n_warmup: int
     n_samples: int
+    temperature: float = 1.0
 
     def score_events(self, batch: BaselineEventBatch) -> List[np.ndarray]:
         expanded_list, _ = expand_batch(batch, self.include_interactions)
-        return [feats @ self.posterior_mean_weights for feats in expanded_list]
+        return [
+            (feats @ self.posterior_mean_weights) / self.temperature
+            for feats in expanded_list
+        ]
 
     @property
     def n_params(self) -> int:
@@ -330,6 +375,15 @@ class BayesianARD:
         pruned = np.where(prune_mask, 0.0, posterior_mean_w).astype(np.float64)
         n_pruned = int(prune_mask.sum())
 
+        # Post-hoc temperature scaling on the validation set (Guo et al. 2017).
+        # ARD applies no magnitude regularization to surviving weights, so a
+        # few events can have extreme logit spreads that blow up NLL while
+        # argmax stays correct. Dividing logits by learned T > 0 recalibrates
+        # without changing top-k.
+        val_exp, _ = expand_batch(val, self.include_interactions)
+        val_logits_list = [X_e @ pruned for X_e in val_exp]
+        temperature = _fit_temperature(val_logits_list, list(val.chosen_indices))
+
         return BayesianARDFitted(
             name=self.name,
             posterior_mean_weights=pruned,
@@ -341,4 +395,5 @@ class BayesianARD:
             alpha_threshold=self.alpha_threshold,
             n_warmup=self.n_warmup,
             n_samples=self.n_samples,
+            temperature=float(temperature),
         )

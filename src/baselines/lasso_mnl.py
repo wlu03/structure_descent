@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import List, Sequence, Tuple
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 from scipy.special import log_softmax, softmax
 
 from .base import BaselineEventBatch, FittedBaseline
@@ -90,6 +91,48 @@ def _nll_only(
 def _soft_threshold(x: np.ndarray, thresh: float) -> np.ndarray:
     """Element-wise soft-thresholding prox operator for L1 with step `thresh`."""
     return np.sign(x) * np.maximum(np.abs(x) - thresh, 0.0)
+
+
+def _fit_temperature(
+    val_logits_list: List[np.ndarray],
+    chosen_indices: Sequence[int],
+    t_lo: float = 0.01,
+    t_hi: float = 1000.0,
+) -> float:
+    """Post-hoc temperature scaling (Guo et al. 2017, "On Calibration of
+    Modern Neural Networks").
+
+    Fits one scalar T > 0 by minimizing val NLL of ``logits / T``. Since
+    scaling logits by a positive constant does not change argmax ordering,
+    top-k metrics are invariant; only the softmax distribution sharpens
+    (T<1) or flattens (T>1).
+
+    A degenerate val set (no events, or all zero-logit slates) short-circuits
+    to T=1.0.
+    """
+    if len(val_logits_list) == 0:
+        return 1.0
+
+    # Short-circuit if all logits are numerically zero (nothing to calibrate).
+    if all(float(np.max(np.abs(lg))) < 1e-12 for lg in val_logits_list):
+        return 1.0
+
+    def _neg_log_lik(log_T: float) -> float:
+        T = float(np.exp(log_T))
+        total = 0.0
+        for lg, ch in zip(val_logits_list, chosen_indices):
+            total -= float(log_softmax(lg / T)[ch])
+        return total
+
+    # Optimize in log-T space for numerical stability, then clamp to bounds.
+    res = minimize_scalar(
+        _neg_log_lik,
+        bounds=(float(np.log(t_lo)), float(np.log(t_hi))),
+        method="bounded",
+        options={"xatol": 1e-6},
+    )
+    T = float(np.exp(res.x))
+    return float(np.clip(T, t_lo, t_hi))
 
 
 def _fista(
@@ -162,10 +205,11 @@ class LassoMnlFitted:
     alpha: float
     include_interactions: bool
     train_nll: float
+    temperature: float = 1.0
 
     def score_events(self, batch: BaselineEventBatch) -> List[np.ndarray]:
         expanded_list, _ = expand_batch(batch, self.include_interactions)
-        return [feats @ self.weights for feats in expanded_list]
+        return [(feats @ self.weights) / self.temperature for feats in expanded_list]
 
     @property
     def n_params(self) -> int:
@@ -248,6 +292,13 @@ class LassoMnl:
         best_w = np.where(np.abs(best_w) < 1e-6, 0.0, best_w)
         train_nll = _nll_only(best_w, train_exp, train.chosen_indices)
 
+        # Post-hoc temperature scaling on the validation set (Guo et al. 2017).
+        # FISTA applies no magnitude regularization to surviving weights, so
+        # extreme logit spreads can blow up NLL while argmax stays correct.
+        # Dividing logits by a learned T > 0 recalibrates without changing top-k.
+        val_logits_list = [X_e @ best_w for X_e in val_exp]
+        temperature = _fit_temperature(val_logits_list, val.chosen_indices)
+
         return LassoMnlFitted(
             name=self.name,
             weights=best_w,
@@ -255,4 +306,5 @@ class LassoMnl:
             alpha=best_alpha,
             include_interactions=self.include_interactions,
             train_nll=float(train_nll),
+            temperature=float(temperature),
         )
