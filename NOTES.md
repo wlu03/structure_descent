@@ -1171,3 +1171,213 @@ changes.
 entries in production caches (`outcomes_cache/*.sqlite`) need a
 one-time purge. That's an orchestrator concern, not a library
 concern — no delete path lives in `generate.py` or `batching.py`.
+
+## Wave 13 — paper-grade evaluation work
+
+Session spanning 2026-04-23 covers three independent threads: new
+external-comparison DCM baselines, LLM client provider-quirk fixes,
+and paper-grade evaluation instrumentation. Organized below.
+
+### 13.1 — three new external-comparison baselines (committed)
+
+Added Delphos (Aboutaleb et al. 2024), LLM-SR (Shojaee et al. 2024),
+and LaSR (Grayeli et al. 2024) as DCM-adapted baselines. All three
+predict via per-alt utility then softmax CE over J alternatives,
+not regression — the adaptation deliberately diverges from the
+original papers' continuous-target setting.
+
+**Delphos.** Vendored DQN + DSL + flat-MNL inner loop from
+`old_pipeline/` into `src/baselines/_delphos_{dqn,dsl,inner_loop}.py`
+(hand-rolled NumPy MLP with He init, Adam, replay buffer; no torch
+dependency). `src/baselines/delphos.py` exposes `Delphos` /
+`DelphosFitted` implementing the `Baseline` / `FittedBaseline`
+protocols. Design doc `docs/llm_baselines/delphos_baseline.md`
+locks in Option B (4-feature pool matching the rest of the suite),
+flat MNL not hierarchical (30× faster per episode), and 300/1500
+episode budgets for pilot/paper. 14 tests pass; backprop verified
+numerically to 9 decimals; all action-masking invariants tested.
+
+**LLM-SR.** Shared module `src/baselines/_symbolic_regression_common.py`
+carries the AST sandbox (empty `__builtins__`, explicit allowlist
+of nodes + call targets, `np.seterr(all="raise")` during evaluation
+with try/finally restore), BFGS fitter with scipy minimize and 4
+random restarts under softmax-CE loss, and safe primitives
+(`_safe_div`, `exp_c`, `sqrt_abs`, `tanh`). `src/baselines/llm_sr.py`
+drives the 100-proposal outer loop with top-K memory sorted by
+`train_nll + val_nll`, Anthropic prompt caching via
+`cache_control: ephemeral`, and a `FALLBACK_SKELETON` seed so
+hermetic CI produces a valid fitted object when every proposal is
+rejected. 13 tests pass.
+
+**LaSR.** Extends the shared SR module with `SEED_CONCEPTS`,
+`canonicalize(ast_node)` (rename-invariant stable form via
+first-seen index remap), and `extract_subexpression_candidates`
+(structural-depth filter that skips operator/ctx nodes). LaSR
+proper at `src/baselines/lasr.py` adds `Concept` (frozen dataclass),
+`ConceptLibrary` (cap=20, LRU-of-usefulness eviction with tie-break
+by `discovered_at`, TTL=5 iters at zero usage), and the promotion
+rule (frequency ≥ 3 in survivors OR explicit LLM nomination with
+≥ 1 occurrence, trivial-concept filter rejects `c[0]*x[0]` and
+feature-free forms). 16 tests pass.
+
+**Registry.** Delphos is a single row; LLM-SR and LaSR expand across
+`LLM_MODEL_SWEEP` to 5 variants each (Sonnet, Opus, Gemini Pro,
+Gemini Flash, GPT-5). Total registry = 29 rows (8 tabular + 1
+ablation + 20 LLM). PO-LEU itself is fused via `--poleu-logits`
+for a 30-row leaderboard.
+
+**Full baseline suite**: 155 tests pass (139 prior + 16 LaSR).
+Commits `ec9febc` (baselines), `2f17394` (docs), `9a44a8b` (scripts
+.env + output-dir/tag), `5cc357a` (outcomes short-completion retry),
+`4aa0602` (LLM ranker J=10 + letters kwarg), `9a588b1` (LASSO-MNL
++ Bayesian-ARD temperature scaling), `35806c3` (data_adapter
+leakage fix: `is_repeat` and `brand_known` removed).
+
+### 13.2 — LLM client provider-quirk fixes (uncommitted)
+
+Smoke test `python /tmp/smoke_llms.py` (exercises all 5 LLMs on a
+one-word prompt) surfaced two hard failures on live APIs:
+
+**GPT-5.** Three sequential fixes at `src/outcomes/_openai_client.py`:
+(a) `_REASONING_MODEL_PREFIXES` list changed from `("o1", "o3",
+"gpt-5-thinking")` to `("o1", "o3", "gpt-5")` — plain `gpt-5`
+requires `max_completion_tokens` too, not just `gpt-5-thinking-*`;
+(b) for reasoning-family models, strip `temperature` and `top_p`
+from the request payload because OpenAI rejects `temperature=0.0`
+("Only the default (1) value is supported"); (c) bump
+`max_completion_tokens` by +1000 for reasoning models because
+GPT-5 burns ~500 tokens on the reasoning trace BEFORE emitting
+visible output and both budgets come out of the same pool (caller
+asking for `max_tokens=2` would otherwise get an empty response
+with `finish_reason=length`).
+
+**Gemini 2.5 Pro.** Fix at `src/outcomes/_gemini_client.py` to
+import `ThinkingConfig` and, when `self.model_id` contains
+`gemini-2.5-pro`, construct
+`ThinkingConfig(thinking_budget=128, include_thoughts=False)`
+and bump `max_output_tokens` by 128. Pro's minimum thinking budget
+is 128 (it cannot be 0, unlike Flash) and thinking tokens come out
+of the output budget. Without this the single-letter rankers
+(ZeroShot max_tokens=2) return empty text with
+`finish_reason=max_tokens`.
+
+**Verification.** Re-running the smoke test after the fixes:
+all 5 LLMs return non-empty text under `max_tokens=8` at 1–7 s
+latency. ~4-agent audit (see 13.3) surfaced additional P0 bugs
+not yet fixed at the time of these notes.
+
+### 13.3 — four-agent verification sweep (completed; fixes pending)
+
+Launched four parallel verification agents covering the session's
+work. Consolidated findings:
+
+**Verified solid.** Delphos (14/14 tests, backprop numerically
+verified); LLM-SR/LaSR sandbox (7/7 adversarial probes rejected —
+nested `__import__`, lambda call, `getattr('__class__')`, list
+comprehension, slice step, walrus operator, Cyrillic-homoglyph
+`_ѕafe_div`); temperature scaling (math correct, applied
+consistently to val + test, top-1 invariance pinned); registry
+wiring (29 rows, stub tripwire fires, factory injection correct);
+data-adapter leakage fix (complete in the tabular path, no hidden
+6-column assumptions anywhere); 155/155 baseline tests pass.
+
+**P0 findings requiring fix before a paid sweep.**
+
+1. `src/outcomes/_gemini_client.py:~283` — Gemini Flash has the
+   SAME thinking-tokens bug as Pro, just at a slightly higher
+   threshold. `max_tokens ≤ 10` returns empty text. Flash
+   supports `thinking_budget=0` (unlike Pro); the fix is to set
+   `ThinkingConfig(thinking_budget=0, include_thoughts=False)`
+   for Flash. Every Flash row in the sweep would silently return
+   empty text without this fix.
+
+2. `src/baselines/_symbolic_regression_common.py:562, 647` —
+   `_softmax_nll_batch` catches `(FloatingPointError, ValueError,
+   OverflowError)` but not `ZeroDivisionError`. Python's native
+   `1/0` raises `ZeroDivisionError`, which bubbles through the
+   fitter and crashes `LLMSR.fit()` on any LLM-proposed `1/c[0]`
+   where BFGS steps `c[0] → 0`. Fix: add `ZeroDivisionError` to
+   both except tuples.
+
+3. `src/baselines/_llm_ranker_common.py:249-256` — `is_repeat`
+   rendered into LLM ranker prompts. Same 1-hot-on-chosen leak
+   pattern as ST-MLP (which we fixed at the feature matrix level).
+   A perfectly instruction-following LLM can read the answer from
+   its prompt. **Paper-integrity issue.** Fix: drop the field from
+   the prompt render, or gate behind the same
+   `drop_is_repeat='auto'` guard ST-MLP uses.
+
+4. `tests/outcomes/test_gemini_client.py:~123` — fake SDK module
+   doesn't expose `ThinkingConfig`, so the new tuple import in
+   `_gemini_client.py` fails → 5/6 tests crash. Fix: add a
+   `_FakeThinkingConfig` kwarg-capturing shell.
+
+5. `tests/outcomes/test_openai_client.py:387` — assertion
+   `kw["max_completion_tokens"] == 256` is stale after the +1000
+   fix; actual value is 1256 → 4 parametrized cases fail. Fix:
+   update to `== 256 + 1000` or factor out the reasoning budget
+   as a module constant.
+
+**P1 drift.** Anthropic finish-reason not normalized (leaks raw
+`"end_turn"`); Anthropic errors missing `AnthropicLLMClient:`
+prefix; no test pinning Gemini Pro `thinking_config`; no test
+pinning GPT-5 `temperature`/`top_p` stripping; no test asserting
+LLM-SR/LaSR `cache_control: ephemeral` is passed; `_walk_with_depth`
+docstring off by one; docs (`evaluation_runbook.md`,
+`session_changelog.md`) still say "19 rows" and "6-feature"; no
+`tests/baselines/test_run_all.py`; leakage regression guard is
+name-only (no symptom test).
+
+### 13.4 — paper-grade evaluation additions (design locked; impl in flight)
+
+User request: rigorous evaluation requires paired statistical
+tests, per-customer subgroup analysis, and qualitative artifacts
+— none of which the current `run_full_evaluation.sh` produces.
+Full spec at `docs/paper_evaluation_additions.md`. Five additions:
+
+1. **Per-event NLL arrays** — serialize the per-event
+   `-log_softmax(logits)[chosen_idx]` values that `evaluate_baseline`
+   already computes and throws away. ~30 LOC in
+   `src/baselines/evaluate.py` + `src/baselines/run_all.py`.
+
+2. **Per-customer NLL breakdown** — group (1) by
+   `batch.customer_ids` into
+   `dict[customer_id, {nll, n_events, top1}]`. ~50 LOC.
+
+3. **`events_main_seed{SEED}.json` sidecar** — canonical
+   event-order reference pinning `(customer_id, category,
+   chosen_idx, is_repeat, order_date)` per test event so
+   downstream scripts can join across baselines. ~40 LOC in
+   `scripts/run_baselines.py`.
+
+4. **LLM-SR / LaSR equation export** — optional
+   `extra_artifacts_for_json(self) -> dict | None` hook on fitted
+   objects. LLMSRFitted returns top-10 equations with coefficients;
+   LaSRFitted returns that plus `final_concept_library`. ~40 LOC.
+
+5. **`scripts/paired_significance.py`** (new) — paired bootstrap
+   CI + Wilcoxon signed-rank + McNemar per (baseline, PO-LEU)
+   pair. Consumes the extended JSONs. ~200 LOC. Pure post-hoc;
+   zero LLM spend.
+
+6. **`scripts/customer_analysis.py`** (new) — segment customers by
+   trajectory length, category concentration, novelty rate.
+   Produces per-segment NLL and top-1 grids plus a "PO-LEU wins
+   most in segment X" summary ranked by effect size. ~150 LOC.
+
+**Schema contract** documented in
+`docs/paper_evaluation_additions.md`. Tests pin the invariants
+(`len(per_event_nll) == n_events`,
+`abs(mean(per_event_nll) - test_nll) < 1e-6`, per-customer
+aggregation matches per-event, `extra_artifacts == null` for
+non-LLM-SR/LaSR rows).
+
+**Three parallel sub-agents** implement the additions: Agent A
+owns (1)-(4) inside the baselines package, Agents B and C each
+own one new script. B and C develop against the documented schema
+(so A can land in parallel without blocking them) and verify
+against synthetic fixtures.
+
+**Out of scope.** Human read-through of LLM outputs deferred;
+automated regret-style analysis deferred; cross-dataset
+generalization deferred.
