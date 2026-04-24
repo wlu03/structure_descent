@@ -630,3 +630,186 @@ saving. Gemini Flash is the cheapest operational signal per dollar.
   is a robustness appendix.
 - **No `Co-Authored-By: Claude`** on any commit (per user preference
   saved to memory).
+
+---
+
+## 12. Wave 13 — paper-grade evaluation round (2026-04-23)
+
+Three independent workstreams this session. Full design + implementation
+spec in `docs/paper_evaluation_additions.md`; build log detail in
+`NOTES.md` §Wave 13.
+
+### 12.1 Three new external-comparison baselines (commit `ec9febc`)
+
+Delphos (Aboutaleb et al. 2024), LLM-SR (Shojaee et al. 2024), and
+LaSR (Grayeli et al. 2024) — all DCM-adapted from their regression
+originals to per-alt utility + softmax-CE over J alternatives. Three
+design docs at `docs/llm_baselines/{delphos,llm_sr,lasr}_baseline.md`.
+
+- Delphos = NumPy-only DQN + DSL + flat-MNL inner loop, vendored
+  from `old_pipeline/` into `src/baselines/_delphos_*.py`. 14/14 tests
+  pass; backprop numerically verified to 9 decimals.
+- LLM-SR = LLM proposes equation skeletons, BFGS fits coefficients,
+  top-K memory. Shared `src/baselines/_symbolic_regression_common.py`
+  carries the AST sandbox (empty `__builtins__`, explicit allowlist,
+  `np.seterr(all="raise")` with try/finally restore). 13/13 tests.
+- LaSR = LLM-SR + concept library (cap=20, LRU + TTL=5, promotion at
+  freq≥3 or LLM nomination). 16/16 tests.
+
+Registry grew from 19 rows (2 LLM baselines × 5 LLMs + 7 tabular + 1
+ablation + PO-LEU) to 30 rows (4 LLM baselines × 5 LLMs + 8 tabular +
+1 ablation + PO-LEU). Full baseline suite: 155 tests pass.
+
+### 12.2 LLM client provider-quirk fixes (commit `dcc1aef`)
+
+A one-shot smoke test against all 5 LLMs surfaced two hard failures
+and one soft failure. Fixed at the client layer:
+
+**GPT-5** (`src/outcomes/_openai_client.py`):
+- `_REASONING_MODEL_PREFIXES` changed from `("o1","o3","gpt-5-thinking")`
+  to `("o1","o3","gpt-5")`. Plain `gpt-5` also requires
+  `max_completion_tokens` and rejects legacy `max_tokens`.
+- Strip `temperature` and `top_p` from the request payload for
+  reasoning-family models — OpenAI rejects `temperature=0.0` at the
+  request layer ("Only the default (1) value is supported"). The
+  deterministic rankers pass 0.0, so the stripping is load-bearing.
+- Reserve `+_REASONING_BUDGET_TOKENS` (= 1000) on
+  `max_completion_tokens`. GPT-5 burns ~500 tokens on an internal
+  reasoning trace BEFORE emitting output, and both budgets come out
+  of the same pool; without the reserve, `max_tokens=2` (from
+  ZeroShot) returns empty text with `finish_reason=length`. Extracted
+  as a module-level constant so per-model overrides (e.g. gpt-5-nano)
+  have a clean entry point.
+
+**Gemini 2.5** (`src/outcomes/_gemini_client.py`):
+- Import `ThinkingConfig` from `google.genai.types`.
+- For `gemini-2.5-pro`: attach
+  `ThinkingConfig(thinking_budget=128, include_thoughts=False)` and
+  bump `max_output_tokens` by 128. Pro's minimum thinking budget is
+  128 (the API rejects `thinking_budget=0` for Pro); thinking tokens
+  come out of the output budget, so without the bump `max_tokens=2`
+  returns empty text.
+- For `gemini-2.5-flash`: attach
+  `ThinkingConfig(thinking_budget=0, include_thoughts=False)`. Flash
+  supports disabling thinking outright (Pro does not). Without this,
+  Flash with `max_tokens ≤ 10` also returned empty text — this
+  would have silently poisoned every Flash-backed leaderboard row.
+
+Test updates: `_FakeThinkingConfig` shim added to the Gemini fake SDK;
+OpenAI reasoning-model test extended to plain `gpt-5` + `gpt-5-mini`
+with assertions that `temperature`/`top_p` are stripped and
+`max_completion_tokens == base + _REASONING_BUDGET_TOKENS`.
+
+### 12.3 Two paper-integrity fixes from the audit (commit `71e6c4d`)
+
+A four-agent verification sweep across the session's work surfaced
+two load-bearing bugs beyond the LLM-client layer:
+
+- **`is_repeat` leaked into LLM ranker prompts**
+  (`src/baselines/_llm_ranker_common.py`). The adapter sets
+  `is_repeat=True` only on the chosen alt for repeat purchases;
+  negatives from the ASIN lookup always read False. Rendering it
+  into the prompt as "Previously purchased by this person" hands
+  the answer to the model — same pattern we caught in
+  `data_adapter.py` (commit `35806c3`). Fixed by dropping the
+  line from `render_alternatives`; a proper "bought this ASIN
+  before" feature would require train-history threading.
+- **`ZeroDivisionError` not caught in BFGS fitter**
+  (`src/baselines/_symbolic_regression_common.py`). The except tuple
+  caught `(FloatingPointError, ValueError, OverflowError)` but not
+  Python's native `ZeroDivisionError`. An LLM-proposed skeleton
+  like `1/c[0]` where BFGS steps `c[0]→0` crashes
+  `LLMSR.fit()`/`LaSR.fit()` mid-run. Fixed by adding
+  `ZeroDivisionError` to both except tuples.
+
+### 12.4 Paper-grade evaluation instrumentation (commits `a72511e`, `f1ee9a3`, `33234e5`)
+
+Six additions driven by the "what would reviewers ask for" checklist.
+Zero extra LLM spend — every number flowed through memory at eval
+time; we just stopped discarding it.
+
+**Additions 1–4 (commit `a72511e`)** — extend `BaselineReport` with:
+- `per_event_nll: list[float]` — length `n_events`
+- `per_event_topk_correct: list[bool]` — length `n_events`
+- `per_customer_nll: dict[cid, {nll, n_events, top1}]`
+- `extra_artifacts` (duck-typed hook via `extra_artifacts_for_json`)
+  populated for LLM-SR (top-10 equations + coefficients) and LaSR
+  (same + final concept library)
+
+Plus a new `events_{tag}.json` sidecar per seed pinning the canonical
+test-event ordering (customer_id, category, chosen_idx,
+n_alternatives, is_repeat, order_date) so downstream scripts can
+cross-join baselines on event index.
+
+Invariants pinned in tests:
+- `len(per_event_nll) == len(per_event_topk_correct) == n_events`
+- `abs(mean(per_event_nll) − test_nll) < 1e-6`
+- `mean(per_event_nll where customer==k) == per_customer_nll[k].nll`
+- `extra_artifacts == null` for non-LLM-SR/non-LaSR rows
+
+15 new tests + extensions to LLM-SR/LaSR tests for the artifact hook.
+Full baseline suite: 175 pass.
+
+**Addition 5 (commit `f1ee9a3`)** — `scripts/paired_significance.py`.
+Pure post-hoc pairwise-significance analysis consuming the extended
+JSONs across seeds. For each other baseline B vs PO-LEU:
+- Paired bootstrap CI (B=1000 resamples, seeded) on mean ΔNLL
+- Wilcoxon signed-rank on per-event NLL differences
+- McNemar's test on the 2×2 top-1 contingency
+- ASO (Dror et al. 2019) via `deepsig` if installed; else skip
+
+Writes `pairwise_vs_PO-LEU.{md,json}` — paper-ready table + machine
+readable form. 15/15 tests pass. Added `statsmodels>=0.14` to
+`requirements.txt` (needed for McNemar). `deepsig` stays optional.
+
+**Addition 6 (commit `33234e5`)** — `scripts/customer_analysis.py`.
+Three independent segmentation schemes (trajectory length, category
+concentration, novelty rate); customer-weighted aggregation; emits
+per-segment NLL + top-1 grids per baseline plus a distilled
+`summary.md` ranking the top-5 "PO-LEU wins most in segment X"
+claims by effect size. Stdlib only. 8/8 tests pass.
+
+**Automatic integration** — `run_full_evaluation.sh` now invokes both
+post-hoc scripts after the per-seed aggregation. Failures don't abort
+the sweep; they log to `paired_significance.log` /
+`customer_analysis.log` and the sweep continues.
+
+### 12.5 Commits this wave
+
+```
+80ef3a5 docs: paper-evaluation additions spec + Wave-13 session log
+33234e5 scripts: customer_analysis.py — trajectory / category / novelty segmentation
+f1ee9a3 scripts: paired_significance.py — bootstrap CI + Wilcoxon + McNemar + ASO
+a72511e baselines: paper-grade evaluation instrumentation additions (1)-(4)
+71e6c4d baselines: two paper-integrity fixes surfaced by the verification audit
+dcc1aef outcomes/llm-clients: fix GPT-5 + Gemini 2.5 reasoning-model quirks
+2f17394 docs: session changelog + evaluation runbook + DCM-adapted baseline design docs
+ec9febc baselines: add Delphos, LLM-SR, and LaSR DCM baselines
+```
+
+### 12.6 Test state at end of wave
+
+**789 tests pass** (139 prior baseline tests + 16 LaSR + 15 paper-eval
+instrumentation additions + 15 paired_significance + 8 customer_analysis
++ the rest of the repo's existing test surface). 1 pre-existing
+unrelated flake (`test_bugfixes_wave8.py::test_subsample_warns_on_runtime_failure`).
+
+### 12.7 How to run the full evaluation
+
+```bash
+# Sanity check — all 5 LLMs reachable (< $0.05 total, see runbook §3)
+venv/bin/python /tmp/smoke_llms.py
+
+# Default: 3 seeds × 50 customers (~14–24 h, ~$500; use tmux)
+tmux new -s sweep
+./run_full_evaluation.sh
+# Ctrl-B D to detach; `tmux attach -t sweep` to return.
+
+# Pilots
+SEEDS="7" N_CUSTOMERS=20 ./run_full_evaluation.sh   # ~2–3 h
+SEEDS="7" ./run_full_evaluation.sh                  # ~5–8 h
+```
+
+Outputs include `significance/pairwise_vs_PO-LEU.md` (paper-ready
+significance table) and `segmentation/summary.md` (top-5 subgroup
+wins) out-of-the-box. See runbook §7 for the full layout.

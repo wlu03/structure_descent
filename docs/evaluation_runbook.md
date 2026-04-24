@@ -121,6 +121,47 @@ tmux new -s sweep
 
 Without tmux, closing the terminal kills the Python process mid-sweep.
 
+### Recommended pre-flight — verify all 5 LLMs respond
+
+Before a paid sweep, confirm every provider is reachable with the
+current credentials. The smoke probe hits each LLM once with a single
+"reply with one word" prompt (total cost < $0.05):
+
+```bash
+venv/bin/python - <<'PY'
+import sys, time
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(Path(".env"))
+sys.path.insert(0, ".")
+from src.baselines.run_all import LLM_MODEL_SWEEP
+
+print(f"{'model':<22s} {'status':<6s} {'latency':>8s}  text")
+print("-" * 60)
+for suffix, factory in LLM_MODEL_SWEEP:
+    t0 = time.time()
+    try:
+        client = factory()
+        r = client.generate(
+            [{"role":"user","content":"Reply with exactly one word: hello"}],
+            temperature=0.0, top_p=1.0, max_tokens=8, seed=0,
+        )
+        print(f"{suffix:<22s} {'OK':<6s} {time.time()-t0:>6.2f}s  {r.text!r}")
+    except Exception as e:
+        print(f"{suffix:<22s} {'FAIL':<6s} {time.time()-t0:>6.2f}s  {type(e).__name__}: {str(e)[:50]}")
+PY
+```
+
+Expected: 5 rows, all **OK**, text column non-empty. If any row FAILs:
+
+- `Claude-*` → missing `ANTHROPIC_API_KEY`
+- `Gemini-*` → expired ADC (`gcloud auth application-default login`) or missing `GOOGLE_CLOUD_PROJECT`
+- `GPT-5` → missing `OPENAI_API_KEY`
+
+Do not start the full sweep until all 5 are green — a failing LLM
+means up to 6 rows (4 baseline × 1 failed LLM + 2 fallbacks) silently
+errored on every seed.
+
 ---
 
 ## 4. Pre-flight — what the script checks before spending
@@ -220,18 +261,25 @@ results_data/
 │   └── metadata.json               ← training config + best_val_nll
 ├── poleu_50cust_seed11/
 ├── poleu_50cust_seed13/
-├── baselines_leaderboard_main_seed7.json
-├── baselines_leaderboard_main_seed7.csv
-├── baselines_leaderboard_main_seed7.txt       ← human-readable table
+├── baselines_leaderboard_main_seed7.{json,csv,txt}   ← 30-row leaderboard per seed
 ├── baselines_leaderboard_main_seed11.{json,csv,txt}
 ├── baselines_leaderboard_main_seed13.{json,csv,txt}
-├── leaderboard_summary.json                   ← mean ± std across seeds
-├── poleu_seed7.log                            ← per-seed stdout+stderr
-├── poleu_seed11.log
-├── poleu_seed13.log
-├── baselines_seed7.log
-├── baselines_seed11.log
-└── baselines_seed13.log
+├── events_main_seed7.json                        ← canonical event order (sidecar)
+├── events_main_seed11.json
+├── events_main_seed13.json
+├── leaderboard_summary.json                      ← mean ± std across seeds
+├── significance/                                 ← post-hoc analysis (addition 5)
+│   ├── pairwise_vs_PO-LEU.md                         paper-ready significance table
+│   └── pairwise_vs_PO-LEU.json                       machine-readable
+├── segmentation/                                 ← post-hoc analysis (addition 6)
+│   ├── by_trajectory_length.{md,json}
+│   ├── by_category_concentration.{md,json}
+│   ├── by_novelty_rate.{md,json}
+│   └── summary.md                                    top-5 "PO-LEU wins most in X"
+├── poleu_seed{7,11,13}.log                       ← per-seed stdout+stderr
+├── baselines_seed{7,11,13}.log
+├── paired_significance.log                       ← post-hoc script output
+└── customer_analysis.log
 ```
 
 ### Per-row columns in the leaderboard JSON/CSV
@@ -240,61 +288,103 @@ results_data/
 |---|---|
 | `name` | Display name — e.g. `ZeroShot-Claude-Sonnet-4.6`, `PO-LEU` |
 | `status` | `ok` / `unavailable` / `errored` |
-| `top1` | Top-1 accuracy. Chance = 1/J (=0.25 at J=4) |
-| `top5` | Top-5 accuracy (≡1.0 if J=4) |
+| `top1` | Top-1 accuracy. Chance = 1/J (=0.10 at J=10) |
+| `top5` | Top-5 accuracy |
 | `mrr` | Mean reciprocal rank |
 | `test_nll` | Mean per-event NLL (natural log) |
 | `aic` / `bic` | Information criteria, natural-log |
 | `n_params` | Effective param count — 0 for frozen-LLM baselines |
 | `fit_seconds` | Wall-clock fit time |
 | `nll_uplift_vs_popularity` | `popularity_nll − row_nll` in nats. **The bottom line.** |
-| `description` | Row-specific state — e.g. `FewShot-ICL n_shots=3 K=4 cold_start=42/500` |
+| `description` | Row-specific state — e.g. `FewShot-ICL n_shots=3 K=10 cold_start=42/500` |
 | `error` / `traceback` | Populated when `status != ok` |
+| **`per_event_nll`** | List[float], length n_events — paper-grade addition 1 |
+| **`per_event_topk_correct`** | List[bool], length n_events — paper-grade addition 1 |
+| **`per_customer_nll`** | Dict[customer_id, {nll, n_events, top1}] — paper-grade addition 2 |
+| **`extra_artifacts`** | LLM-SR / LaSR only: top-10 equations + concept library — addition 4 |
+
+### Post-hoc analyses (automatic, run after the sweep)
+
+After all seeds finish and `leaderboard_summary.json` is written, the
+script runs two additional consumers of the extended JSONs — **zero
+extra LLM spend**:
+
+**`scripts.paired_significance`** — for each other baseline B vs
+PO-LEU: paired bootstrap CI on mean ΔNLL (B=1000 resamples), Wilcoxon
+signed-rank on per-event NLL differences, McNemar on the 2×2 top-1
+contingency, and optionally ASO (Dror et al. 2019) if `deepsig` is
+installed. Emits `significance/pairwise_vs_PO-LEU.md` (paper-ready
+table) and `.json`.
+
+**`scripts.customer_analysis`** — segments customers by three
+independent schemes (trajectory length, category concentration,
+novelty rate), produces per-segment NLL + top-1 grids per baseline,
+and a distilled `summary.md` ranking the top-5 "PO-LEU wins most in
+segment X" claims by effect size. Outputs land in `segmentation/`.
+
+Both scripts fail soft: if either errors, the sweep continues and logs
+the failure in `paired_significance.log` / `customer_analysis.log`.
+You can re-run them manually against an existing `results_data/`:
+
+```bash
+python -m scripts.paired_significance \
+    --input-dir results_data/ \
+    --baseline-of-interest "PO-LEU" \
+    --output-dir results_data/significance/
+
+python -m scripts.customer_analysis \
+    --input-dir results_data/ \
+    --baseline-of-interest "PO-LEU" \
+    --output-dir results_data/segmentation/
+```
 
 ---
 
-## 8. Known gotcha — J=4 vs J=10
+## 8. LLM baselines at J=10 (resolved)
 
-`configs/datasets/amazon.yaml` controls `choice_set_size`. The 10 LLM
-baselines are **hard-coded to J=4** (the A/B/C/D letter set + K=4 Latin
-square permutation debiasing). If the YAML says `choice_set_size: 10`,
-every LLM row will show:
+`DEFAULT_LETTERS` in `src/baselines/_llm_ranker_common.py` is now
+`A..J` (10 letters, matching the Amazon dataset's default
+`choice_set_size: 10`). Default `n_permutations` is 10 for full
+Latin-square positional debiasing at J=10. All 20 LLM baseline rows
+(ZeroShot, FewShot-ICL, LLM-SR, LaSR × 5 models) operate natively
+at J=10.
 
-```
-errored — requires n_alternatives=4 (got 10)
-```
+Earlier versions hardcoded J=4 and this section documented the
+workaround. That constraint is gone. The runbook now carries this
+section for historical context; `docs/llm_baselines/j_size_decision.md`
+has the methodological write-up.
 
-The script warns about this before starting and asks for confirmation.
-Tabular + ablation + PO-LEU rows still populate at any J. See
-`docs/llm_baselines/j_size_decision.md` for the full methodological
-write-up (bias scaling, power trade-off, literature survey).
-
-**Recommendation for the paper**: set `choice_set_size: 4` in
-`amazon.yaml` so all 19 rows populate. Tabular uplift numbers will be
-smaller than at J=10 (easier negatives), but that's a fair trade for
-getting the LLM comparison working in the same leaderboard.
+If you push J past 10, extend `DEFAULT_LETTERS` (add `K`, `L`, ...)
+before running. The preflight script aborts with a warning when
+`choice_set_size > 10`.
 
 ---
 
 ## 9. Cost + time budget
 
-Estimates for 50 customers per seed (roughly 10k choice sets, ~1k test events):
+Estimates for 50 customers per seed (roughly 10k choice sets, ~1k test
+events). The sweep now runs **four** LLM baseline families across 5
+LLMs each (20 LLM rows + 8 tabular + 1 ablation + PO-LEU = 30 rows).
 
 | Step | Cost | Wall-clock |
 |---|---|---|
 | PO-LEU training (Sonnet outcome gen + head fit) | ~$25 | ~30 min |
-| Popularity + 6 tabular + ST-MLP | $0 | ~1 min |
-| `ZeroShot-Claude-Sonnet-4.6` | ~$3 | ~15 min |
-| `ZeroShot-Claude-Opus-4.6` | ~$18 | ~30 min |
-| `ZeroShot-Gemini-2.5-Pro` | ~$2 | ~15 min |
-| `ZeroShot-Gemini-2.5-Flash` | ~$0.50 | ~10 min |
-| `ZeroShot-GPT-5` | ~$6 | ~15 min |
-| 5× `FewShot-ICL` (slightly more input tokens than Zero-Shot) | ~$35 | ~1.5 h |
-| **Per-seed total** | **~$90–160** | **~4–8 h** |
+| 8 tabular + ST-MLP (Popularity / LASSO-MNL / RF / GBM / MLP / ARD / DUET / Delphos) | $0 | ~5 min |
+| 5 × ZeroShot (Sonnet ~$3, Opus ~$18, Gemini Pro ~$2, Flash ~$0.50, GPT-5 ~$6) | ~$30 | ~1.5 h |
+| 5 × FewShot-ICL (slightly more input tokens than ZeroShot) | ~$35 | ~1.5 h |
+| 5 × LLM-SR (100 proposals/customer, ~$0.05-$2 each depending on model) | ~$20 | ~1–2 h |
+| 5 × LaSR (LLM-SR + concept library prompting overhead) | ~$30 | ~1–2 h |
+| Post-hoc significance + segmentation | $0 | ~1 min |
+| **Per-seed total** | **~$140–220** | **~5–8 h** |
 
-×3 seeds → **~$400, ~24 h wall-clock**. Budget up to $500 for safety.
+×3 seeds → **~$500, ~14–24 h wall-clock**. The outcome cache saves
+most of the PO-LEU training cost on seeds 2 & 3 (they hit the cache
+for the same (customer, alt, c_d_hash) tuples).
 
-Drop Opus to save ~$60 per seed. Drop Few-Shot to save ~$35 per seed.
+**Cost reduction levers**:
+- Drop Opus from `LLM_MODEL_SWEEP` — saves ~$60–80 per seed
+- Drop LaSR (keep LLM-SR) — saves ~$30 per seed
+- Drop to 20 customers × 3 seeds — cuts everything ~60%
 
 ---
 
