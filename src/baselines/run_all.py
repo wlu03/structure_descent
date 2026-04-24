@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import time
 import traceback
 from pathlib import Path
@@ -100,13 +101,52 @@ def _openai_factory(model_id: str) -> Callable[[], Any]:
 # Each row: (display_suffix, factory).
 # display_suffix becomes the "-<model>" tail on the baseline's leaderboard
 # name, e.g. ``ZeroShot`` + ``Claude-Sonnet-4.6`` -> ``ZeroShot-Claude-Sonnet-4.6``.
-LLM_MODEL_SWEEP: List[Tuple[str, Callable[[], Any]]] = [
+#
+# The full sweep can be filtered at import-time via the ``LLM_SWEEP`` env
+# var (comma-separated display_suffix allowlist, case-insensitive).
+# Use this for cheap pilot runs without editing code:
+#   LLM_SWEEP="Claude-Sonnet-4.6" ./run_full_evaluation.sh
+#   LLM_SWEEP="Claude-Sonnet-4.6,Gemini-2.5-Flash" ./run_full_evaluation.sh
+# An empty / unset ``LLM_SWEEP`` keeps the full 5-model sweep.
+_LLM_MODEL_SWEEP_FULL: List[Tuple[str, Callable[[], Any]]] = [
     ("Claude-Sonnet-4.6",  _anthropic_factory("claude-sonnet-4-6")),
     ("Claude-Opus-4.6",    _anthropic_factory("claude-opus-4-6")),
     ("Gemini-2.5-Pro",     _gemini_factory("gemini-2.5-pro")),
     ("Gemini-2.5-Flash",   _gemini_factory("gemini-2.5-flash")),
     ("GPT-5",              _openai_factory("gpt-5")),
 ]
+
+
+def _apply_llm_sweep_filter(
+    full: List[Tuple[str, Callable[[], Any]]],
+) -> List[Tuple[str, Callable[[], Any]]]:
+    """Filter ``_LLM_MODEL_SWEEP_FULL`` by the ``LLM_SWEEP`` env var.
+
+    ``LLM_SWEEP`` is a comma-separated allowlist of display suffixes
+    (case-insensitive). Unrecognized names raise at import time so a
+    typo doesn't silently drop to the full sweep and run a $400 bill.
+    Empty / unset returns the full list unchanged.
+    """
+    raw = os.environ.get("LLM_SWEEP", "").strip()
+    if not raw:
+        return full
+    wanted = {s.strip().lower() for s in raw.split(",") if s.strip()}
+    allowed = {suffix.lower() for suffix, _ in full}
+    unknown = wanted - allowed
+    if unknown:
+        raise ValueError(
+            f"LLM_SWEEP contains unknown model suffixes {sorted(unknown)}; "
+            f"expected any of {sorted(allowed)}."
+        )
+    filtered = [(s, f) for s, f in full if s.lower() in wanted]
+    if not filtered:  # defensive: shouldn't happen given the unknown check
+        raise ValueError(f"LLM_SWEEP={raw!r} resolved to an empty filter.")
+    return filtered
+
+
+LLM_MODEL_SWEEP: List[Tuple[str, Callable[[], Any]]] = _apply_llm_sweep_filter(
+    _LLM_MODEL_SWEEP_FULL
+)
 
 # LLM-backed baselines in the base registry. For each entry below, the
 # expansion machinery appends one ``(<prefix>-<model>, module, class)`` row
