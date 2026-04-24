@@ -136,6 +136,7 @@ def build_choice_sets(
     customer_to_extras: dict | None = None,
     recent_purchases_window_days: int = 30,
     max_recent_purchases: int = 5,
+    drop_pool_starved: bool = False,
 ) -> list[dict]:
     """Return per-event choice-set records with ``z_d`` and ``c_d`` attached.
 
@@ -551,6 +552,13 @@ def build_choice_sets(
     # --------------------------------------------------------------- #
     customer_ids = df["customer_id"].to_numpy()
     categories = df["category"].to_numpy()
+    # Split label per event — embedded into each output record so callers can
+    # partition records by split without zipping against events_df (required
+    # once drop_pool_starved starts removing events from the output).
+    if split_column in df.columns:
+        split_arr = df[split_column].to_numpy()
+    else:
+        split_arr = np.array([""] * n_events, dtype=object)
     routines = (
         df["routine"].to_numpy()
         if "routine" in df.columns
@@ -671,6 +679,7 @@ def build_choice_sets(
 
     records: List[dict] = []
     dedup_fallback_any = False
+    n_dropped_pool_starved = 0
     for i in range(n_events):
         chosen_code = int(chosen_int[i])
         ev_date = order_dates_ns[i]
@@ -689,6 +698,18 @@ def build_choice_sets(
         )
         available_neg_pool_size = max(0, avail_len_i - chosen_in_prefix)
         dedup_target_size = min(J, available_neg_pool_size + 1)
+
+        # --- drop_pool_starved filter ----------------------------------- #
+        # When the available pool is genuinely too small to assemble J
+        # distinct alternatives (chosen + (J-1) unique negatives), the
+        # default path falls back to cyclic padding (so the same ASIN may
+        # appear twice in one choice set). Callers that would rather drop
+        # those events than see padded choice sets set
+        # ``drop_pool_starved=True`` — statistically cleanest; loses some
+        # events from thin customers / very-late timeline positions.
+        if drop_pool_starved and available_neg_pool_size < n_negatives:
+            n_dropped_pool_starved += 1
+            continue
 
         samples_per_k: List[List[str]] = []
         chosen_idx_per_k: List[int] = []
@@ -905,14 +926,20 @@ def build_choice_sets(
             "z_d": zd_row,
             "c_d": event_c_d,
             "alt_texts": alt_texts,
+            # Split label mirrored from events_df so callers can partition
+            # records without zipping against the source frame — needed
+            # once drop_pool_starved starts dropping rows from the output.
+            "split": str(split_arr[i]) if split_arr[i] is not None else "",
         }
         records.append(record)
 
-    logger.info(
-        "build_choice_sets: done (%d choice sets built%s).",
-        len(records),
-        "; dedup fallback triggered on at least one event"
-        if dedup_fallback_any
-        else "",
-    )
+    msg_parts: List[str] = [f"{len(records)} choice sets built"]
+    if dedup_fallback_any:
+        msg_parts.append("dedup fallback triggered on at least one event")
+    if drop_pool_starved:
+        msg_parts.append(
+            f"dropped {n_dropped_pool_starved} pool-starved events "
+            f"(available_pool < {n_negatives})"
+        )
+    logger.info("build_choice_sets: done (%s).", "; ".join(msg_parts))
     return records

@@ -107,6 +107,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-events-per-customer", type=int, default=5)
     parser.add_argument(
+        "--drop-pool-starved-events",
+        action="store_true",
+        help=(
+            "Drop events whose available-negative pool is smaller than "
+            "J-1 instead of cycle-padding the choice set. Cleaner "
+            "leaderboard (every choice set is J genuinely-distinct "
+            "ASINs) at the cost of losing a few events from thin "
+            "customers / very-late-timeline positions. Off by default "
+            "— the legacy cyclic-padding path stays so existing runs "
+            "stay bit-identical."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -689,13 +702,15 @@ def main(args: argparse.Namespace) -> int:
         n_resamples=int(adapter.schema.n_resamples),
         n_negatives=int(adapter.schema.choice_set_size) - 1,
         customer_to_extras=customer_to_extras or None,
+        drop_pool_starved=bool(getattr(args, "drop_pool_starved_events", False)),
     )
 
-    # Split records by the attached event's split (via per-record index).
-    split_by_idx = events_subset["split"].tolist()
-    records_train = [r for r, s in zip(records_all, split_by_idx) if s == "train"]
-    records_val = [r for r, s in zip(records_all, split_by_idx) if s == "val"]
-    records_test = [r for r, s in zip(records_all, split_by_idx) if s == "test"]
+    # Split records by the split label embedded in each record. Needed
+    # once drop_pool_starved drops rows from records_all — can no longer
+    # zip against events_subset since lengths may diverge.
+    records_train = [r for r in records_all if r.get("split") == "train"]
+    records_val = [r for r in records_all if r.get("split") == "val"]
+    records_test = [r for r in records_all if r.get("split") == "test"]
     logger.info(
         "records: train=%d val=%d test=%d.",
         len(records_train),
