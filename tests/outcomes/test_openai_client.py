@@ -364,18 +364,31 @@ def test_not_flagged_as_stub(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize(
     "model_id",
-    ["o1-preview", "o3-mini", "gpt-5-thinking", "GPT-5-Thinking-2026-04"],
+    [
+        "o1-preview",
+        "o3-mini",
+        "gpt-5",
+        "gpt-5-thinking",
+        "GPT-5-Thinking-2026-04",
+        "gpt-5-mini",
+    ],
 )
 def test_model_id_routes_max_completion_tokens_for_reasoning_models(
     monkeypatch: pytest.MonkeyPatch, model_id: str
 ) -> None:
-    """Reasoning-family prefixes (``o1``, ``o3``, ``gpt-5-thinking``;
-    case-insensitive) must send ``max_completion_tokens`` instead of the
-    legacy ``max_tokens`` kwarg."""
+    """Reasoning-family prefixes (``o1``, ``o3``, ``gpt-5*``; case-insensitive)
+    must send ``max_completion_tokens`` instead of the legacy ``max_tokens``
+    kwarg, reserve ``_REASONING_BUDGET_TOKENS`` extra budget for the
+    reasoning trace, and strip the ``temperature``/``top_p`` sampler knobs
+    (these models only accept the default value=1 and reject any forwarded
+    override)."""
     completions = _install_fake_openai(monkeypatch)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
 
-    from src.outcomes._openai_client import OpenAILLMClient
+    from src.outcomes._openai_client import (
+        OpenAILLMClient,
+        _REASONING_BUDGET_TOKENS,
+    )
 
     client = OpenAILLMClient(model_id)
     client.generate(
@@ -384,8 +397,13 @@ def test_model_id_routes_max_completion_tokens_for_reasoning_models(
 
     kw = completions.calls[0]
     assert kw["model"] == model_id
-    assert kw["max_completion_tokens"] == 256
+    assert kw["max_completion_tokens"] == 256 + _REASONING_BUDGET_TOKENS
     assert "max_tokens" not in kw
+    # Reasoning models reject non-default temperature/top_p at the request
+    # layer — the client must strip them from the payload so the caller's
+    # deterministic temperature=0.0 (used by the rankers) doesn't hard-fail.
+    assert "temperature" not in kw
+    assert "top_p" not in kw
 
 
 def test_non_reasoning_model_uses_plain_max_tokens(

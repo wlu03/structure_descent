@@ -24,10 +24,12 @@ writing:
 * ``gpt-4o``
 * ``gpt-4o-mini``
 
-Reasoning-family models (``o1-*``, ``o3-*``, ``gpt-5-thinking-*``) accept
+Reasoning-family models (``o1-*``, ``o3-*``, ``gpt-5-*``) accept
 ``max_completion_tokens`` rather than the legacy ``max_tokens`` parameter;
 the client detects these by model-id prefix and forwards the caller's
-``max_tokens`` argument under the correct kwarg name. No other parameter
+``max_tokens`` argument under the correct kwarg name. Plain ``gpt-5`` is
+also covered — as of the 2026-Q1 API, all ``gpt-5`` variants (thinking,
+mini, etc.) reject ``max_tokens`` at the request layer. No other parameter
 routing differs.
 
 Logprob support
@@ -76,8 +78,16 @@ logger = logging.getLogger(__name__)
 _REASONING_MODEL_PREFIXES: tuple[str, ...] = (
     "o1",
     "o3",
-    "gpt-5-thinking",
+    "gpt-5",
 )
+
+# Reasoning-family models burn internal tokens on a reasoning trace BEFORE
+# producing visible output, and both budgets share the single
+# ``max_completion_tokens`` allowance. Empirically GPT-5 needs ~500 tokens
+# before emitting a single word; 1000 gives headroom without dominating the
+# caller's answer budget. Exposed at module scope so tests can reference it
+# cleanly and so a future per-model override table can live next to it.
+_REASONING_BUDGET_TOKENS: int = 1000
 
 
 # Error-message prefix used for every re-raised OpenAI SDK failure.
@@ -232,13 +242,28 @@ class OpenAILLMClient:
         kwargs: dict[str, Any] = {
             "model": self.model_id,
             "messages": list(messages),
-            "temperature": temperature,
-            "top_p": top_p,
             "seed": seed,
         }
         if _uses_max_completion_tokens(self.model_id):
-            kwargs["max_completion_tokens"] = int(max_tokens)
+            # Reasoning-family models (o1/o3/gpt-5) reject any non-default
+            # temperature / top_p at the request layer ("Only the default
+            # (1) value is supported"). Skip forwarding them so the caller's
+            # temperature=0.0 (used by the deterministic rankers) doesn't
+            # hard-fail the request. Decoding is driven by the reasoning
+            # trace, not the classical sampler knobs.
+            #
+            # These models also burn tokens on an internal reasoning pass
+            # BEFORE producing visible output, and both budgets come out of
+            # max_completion_tokens. With small caller budgets (e.g.
+            # max_tokens=2 from ZeroShot), reasoning consumes the entire
+            # allowance and the response comes back empty with
+            # finish_reason=length. The +_REASONING_BUDGET_TOKENS reserve
+            # (module-level constant) ensures the caller's answer budget
+            # survives with headroom.
+            kwargs["max_completion_tokens"] = int(max_tokens) + _REASONING_BUDGET_TOKENS
         else:
+            kwargs["temperature"] = temperature
+            kwargs["top_p"] = top_p
             kwargs["max_tokens"] = int(max_tokens)
 
         try:

@@ -258,7 +258,10 @@ class GeminiLLMClient:
         try:
             from google import genai  # type: ignore[import-not-found]  # noqa: F401
             from google.genai import errors as genai_errors  # type: ignore[import-not-found]
-            from google.genai.types import GenerateContentConfig  # type: ignore[import-not-found]
+            from google.genai.types import (  # type: ignore[import-not-found]
+                GenerateContentConfig,
+                ThinkingConfig,
+            )
         except ImportError as exc:  # pragma: no cover
             raise ImportError(
                 "GeminiLLMClient requires the `google-genai` package. "
@@ -267,14 +270,44 @@ class GeminiLLMClient:
 
         system_instruction, contents = _convert_messages(messages)
 
+        # Gemini 2.5 models (both Pro and Flash) consume internal "thinking"
+        # tokens out of max_output_tokens. With a small budget (e.g.
+        # max_tokens=2 for the letter-token rankers), thinking burns the
+        # entire allowance and the response comes back empty with
+        # finish_reason=max_tokens.
+        #
+        # Flash supports disabling thinking outright via thinking_budget=0,
+        # so we take that path — the ranker needs deterministic letter-only
+        # output, not chain-of-thought. Pro's minimum thinking budget is 128
+        # (it cannot be 0); for Pro we allocate the 128-token minimum and
+        # bump max_output_tokens accordingly so the caller's answer budget
+        # survives.
+        model_lower = self.model_id.lower()
+        effective_max_tokens = int(max_tokens)
+        thinking_config: Any = None
+        if "gemini-2.5-pro" in model_lower:
+            pro_thinking_budget = 128
+            effective_max_tokens = int(max_tokens) + pro_thinking_budget
+            thinking_config = ThinkingConfig(
+                thinking_budget=pro_thinking_budget,
+                include_thoughts=False,
+            )
+        elif "gemini-2.5-flash" in model_lower:
+            thinking_config = ThinkingConfig(
+                thinking_budget=0,
+                include_thoughts=False,
+            )
+
         config_kwargs: dict[str, Any] = {
             "temperature": float(temperature),
             "top_p": float(top_p),
-            "max_output_tokens": int(max_tokens),
+            "max_output_tokens": effective_max_tokens,
             "seed": int(seed),
         }
         if system_instruction is not None:
             config_kwargs["system_instruction"] = system_instruction
+        if thinking_config is not None:
+            config_kwargs["thinking_config"] = thinking_config
         config = GenerateContentConfig(**config_kwargs)
 
         try:

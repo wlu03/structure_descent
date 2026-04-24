@@ -87,6 +87,18 @@ class _FakeGenerateContentConfig:
         self.kwargs = kwargs
 
 
+class _FakeThinkingConfig:
+    """Stand-in for ``google.genai.types.ThinkingConfig``.
+
+    Kwarg-capturing shell — tests read ``.kwargs["thinking_budget"]`` and
+    ``.kwargs["include_thoughts"]`` to verify the Gemini 2.5 path built
+    the right config.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
 class _FakeAPIError(Exception):
     """Stand-in for ``google.genai.errors.APIError``."""
 
@@ -124,6 +136,7 @@ def _install_fake_genai(monkeypatch: pytest.MonkeyPatch) -> None:
     types_mod = types.ModuleType("google.genai.types")
     types_mod.GenerateContentConfig = _FakeGenerateContentConfig  # type: ignore[attr-defined]
     types_mod.HttpOptions = _FakeHttpOptions  # type: ignore[attr-defined]
+    types_mod.ThinkingConfig = _FakeThinkingConfig  # type: ignore[attr-defined]
 
     # google.genai.errors
     errors_mod = types.ModuleType("google.genai.errors")
@@ -314,14 +327,16 @@ def test_generate_maps_finish_reason_strings(monkeypatch: pytest.MonkeyPatch) ->
 def test_generate_passes_temperature_top_p_max_tokens_seed_to_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``max_tokens`` must be forwarded as ``max_output_tokens``; other params pass through."""
+    """``max_tokens`` must be forwarded as ``max_output_tokens``; other params
+    pass through. Uses ``gemini-1.5-pro`` to avoid the 2.5-specific
+    thinking-config path; that path is covered by dedicated tests below."""
     _install_fake_genai(monkeypatch)
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "p")
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "l")
 
     from src.outcomes._gemini_client import GeminiLLMClient
 
-    client = GeminiLLMClient(model_id="gemini-2.5-pro")
+    client = GeminiLLMClient(model_id="gemini-1.5-pro")
     fake_models = _FakeClient.instances[-1].models
 
     client.generate(
@@ -333,12 +348,71 @@ def test_generate_passes_temperature_top_p_max_tokens_seed_to_config(
     )
 
     call = fake_models.calls[0]
-    assert call["model"] == "gemini-2.5-pro"
+    assert call["model"] == "gemini-1.5-pro"
     cfg = call["config"].kwargs
     assert cfg["temperature"] == pytest.approx(0.37)
     assert cfg["top_p"] == pytest.approx(0.81)
     assert cfg["max_output_tokens"] == 256
     assert cfg["seed"] == 2024
+    # No thinking-config on pre-2.5 models.
+    assert "thinking_config" not in cfg
+
+
+def test_gemini_2_5_pro_sets_thinking_config_and_bumps_max_output_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gemini 2.5 Pro cannot disable thinking (``thinking_budget=0`` is
+    disallowed by the API) and always consumes thinking tokens out of
+    ``max_output_tokens``. The client must attach a ``ThinkingConfig`` with
+    the 128-token minimum and bump ``max_output_tokens`` accordingly so the
+    caller's answer budget survives."""
+    _install_fake_genai(monkeypatch)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "p")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "l")
+
+    from src.outcomes._gemini_client import GeminiLLMClient
+
+    client = GeminiLLMClient(model_id="gemini-2.5-pro")
+    fake_models = _FakeClient.instances[-1].models
+    client.generate(
+        [{"role": "user", "content": "ping"}],
+        temperature=0.0, top_p=1.0, max_tokens=2, seed=0,
+    )
+
+    cfg = fake_models.calls[0]["config"].kwargs
+    assert cfg["max_output_tokens"] == 2 + 128
+    tc = cfg["thinking_config"]
+    assert tc.kwargs["thinking_budget"] == 128
+    assert tc.kwargs["include_thoughts"] is False
+
+
+def test_gemini_2_5_flash_sets_thinking_config_with_zero_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gemini 2.5 Flash supports disabling thinking outright
+    (``thinking_budget=0``). The rankers need deterministic letter-only
+    output, not chain-of-thought — the client must route Flash through the
+    disabled-thinking path. Without this, Flash with a small ``max_tokens``
+    returns empty text just like Pro did before its fix."""
+    _install_fake_genai(monkeypatch)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "p")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "l")
+
+    from src.outcomes._gemini_client import GeminiLLMClient
+
+    client = GeminiLLMClient(model_id="gemini-2.5-flash")
+    fake_models = _FakeClient.instances[-1].models
+    client.generate(
+        [{"role": "user", "content": "ping"}],
+        temperature=0.0, top_p=1.0, max_tokens=2, seed=0,
+    )
+
+    cfg = fake_models.calls[0]["config"].kwargs
+    # Flash does NOT bump max_output_tokens because thinking is disabled.
+    assert cfg["max_output_tokens"] == 2
+    tc = cfg["thinking_config"]
+    assert tc.kwargs["thinking_budget"] == 0
+    assert tc.kwargs["include_thoughts"] is False
 
 
 # ---------------------------------------------------------------------------
