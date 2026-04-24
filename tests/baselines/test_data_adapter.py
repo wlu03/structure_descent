@@ -119,44 +119,27 @@ def test_popularity_rank_parses_embedded_number():
     np.testing.assert_allclose(col, np.asarray([42.0, 20.0, 7.0], dtype=np.float32))
 
 
-def test_is_repeat_column_per_alt():
-    flags = [False, True, False, True]
-    rec = _record("C0", chosen_idx=1, J=4, is_repeat=flags)
-    batch = records_to_baseline_batch([rec])
-    col = batch.base_features_list[0][:, BUILTIN_FEATURE_NAMES.index("is_repeat")]
-    np.testing.assert_allclose(col, np.asarray([0.0, 1.0, 0.0, 1.0]))
+def test_leaky_columns_removed_from_builtin_schema():
+    """Pin the label-leakage audit fix.
 
+    ``is_repeat`` and ``brand_known`` were removed after an audit found
+    them leaking the chosen-alt identity into the per-alt feature
+    matrix:
 
-def test_brand_known_matches_chosen_brand_only():
-    # Chosen is alt #2 (brand 'A'); two negatives share brand 'A', one
-    # has brand 'B'.
-    rec = _record(
-        "C0",
-        chosen_idx=2,
-        J=4,
-        brands=["A", "B", "A", "A"],
-    )
-    batch = records_to_baseline_batch([rec])
-    col = batch.base_features_list[0][
-        :, BUILTIN_FEATURE_NAMES.index("brand_known")
-    ]
-    np.testing.assert_allclose(col, np.asarray([1.0, 0.0, 1.0, 1.0]))
+    - ``is_repeat`` is True only on the chosen alt when the purchase
+      is a repeat (negatives from the ASIN lookup always get False) —
+      effectively a 1-hot label indicator on repeat events.
+    - ``brand_known`` was defined as "1 iff the alt shares the chosen
+      alt's brand" — direct reference to ``record["chosen_idx"]``, so
+      the column names the answer.
 
-
-def test_brand_known_is_zero_when_chosen_brand_is_unknown():
-    # Chosen has the sentinel default; every alt should get brand_known=0
-    # regardless of its own brand string.
-    rec = _record(
-        "C0",
-        chosen_idx=0,
-        J=3,
-        brands=["unknown_brand", "A", "A"],
-    )
-    batch = records_to_baseline_batch([rec])
-    col = batch.base_features_list[0][
-        :, BUILTIN_FEATURE_NAMES.index("brand_known")
-    ]
-    np.testing.assert_allclose(col, np.zeros(3, dtype=np.float32))
+    Regression guard: BUILTIN_FEATURE_NAMES must NOT contain either
+    column name. If you add them back, explain why they're no longer
+    leaky (e.g. replaced with a per-customer historical brand affinity
+    computed from train rows only).
+    """
+    assert "is_repeat" not in BUILTIN_FEATURE_NAMES
+    assert "brand_known" not in BUILTIN_FEATURE_NAMES
 
 
 def test_non_uniform_J_raises():

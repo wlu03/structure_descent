@@ -40,13 +40,25 @@ per-alt-verified** feature set derived purely from the 7-key
                                                 ``alt_texts[j]["popularity_rank"]``
                                                 string ("popularity score N")
                                                 or passed-through if numeric
-    - ``is_repeat``        (0.0 / 1.0)       — from ``alt_texts[j]["is_repeat"]``
-    - ``brand_known``      (0.0 / 1.0)       — 1 iff the alt's brand matches
-                                                the chosen-alt brand for this
-                                                event (proxy for brand_affinity)
     - ``log1p_price``      (float)           — ``log1p(max(price, 0))``
     - ``price_rank``       (float, 0..1)     — within-event dense rank of
                                                 ``price``, scaled to [0, 1]
+
+    Two earlier candidate columns were REMOVED after an audit caught them
+    leaking the label:
+
+    - ``is_repeat``:  ``alt_text()`` sets it True only on the chosen alt
+      when ``routine > 0``; every negative gets False because the ASIN
+      lookup carries no per-customer routine info. The column is
+      effectively a 1-hot indicator of "this is the chosen alt" on repeat-
+      purchase events. See ``src/baselines/st_mlp_ablation.py``'s
+      ``drop_is_repeat='auto'`` guard for the analysis.
+    - ``brand_known``: defined as 1 iff the alt's brand matches the
+      CHOSEN alt's brand. Using ``chosen_idx`` to define a per-alt
+      feature is direct label leakage — at test time we don't know which
+      alt is chosen. Symptom: DUET / GradientBoosting / RandomForest
+      scored top1 >> chance via this signal; LASSO-MNL / Bayesian-ARD
+      produced runaway NLL from interaction terms built on it.
 
 Baselines that previously required the full 12-primitive pool see this
 restricted 6-column pool. For LASSO-MNL / Bayesian-ARD the
@@ -74,8 +86,6 @@ from .base import BaselineEventBatch
 BUILTIN_FEATURE_NAMES: tuple[str, ...] = (
     "price",
     "popularity_rank",
-    "is_repeat",
-    "brand_known",
     "log1p_price",
     "price_rank",
 )
@@ -141,29 +151,6 @@ def _build_feature_matrix(
         [_parse_popularity_rank(alt.get("popularity_rank", 0.0)) for alt in alt_texts],
         dtype=np.float32,
     )
-    is_repeat = np.asarray(
-        [1.0 if bool(alt.get("is_repeat", False)) else 0.0 for alt in alt_texts],
-        dtype=np.float32,
-    )
-    chosen_idx = int(record["chosen_idx"])
-    chosen_brand = str(alt_texts[chosen_idx].get("brand", "") or "")
-    # ``brand_known``: a purchase-context proxy for brand affinity
-    # available under our per-alt constraint. A learned coefficient
-    # picks up whether alternatives sharing the same brand as the
-    # chosen row are systematically preferred — not the same as
-    # historical brand affinity but a legal per-alt signal.
-    if chosen_brand and chosen_brand != "unknown_brand":
-        brand_known = np.asarray(
-            [
-                1.0
-                if str(alt.get("brand", "") or "") == chosen_brand
-                else 0.0
-                for alt in alt_texts
-            ],
-            dtype=np.float32,
-        )
-    else:
-        brand_known = np.zeros(J, dtype=np.float32)
     log1p_price = np.log1p(np.maximum(prices, 0.0)).astype(np.float32)
     price_rank = _price_rank(prices)
 
@@ -172,10 +159,8 @@ def _build_feature_matrix(
     mat = np.empty((J, n_builtin + n_extra), dtype=np.float32)
     mat[:, 0] = prices
     mat[:, 1] = popularities
-    mat[:, 2] = is_repeat
-    mat[:, 3] = brand_known
-    mat[:, 4] = log1p_price
-    mat[:, 5] = price_rank
+    mat[:, 2] = log1p_price
+    mat[:, 3] = price_rank
 
     if n_extra:
         if extra_feature_fn is None:
