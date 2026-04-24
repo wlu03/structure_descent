@@ -212,10 +212,12 @@ def render_alternatives(
 
     Uses the subset of the 7-key ``alt_texts`` adapter schema documented
     in ``docs/llm_baselines/zero_shot_claude_ranker.md`` §2 (``title``,
-    ``category``, ``price``, ``popularity_rank``, ``brand``, ``is_repeat``;
-    ``state`` is dropped because it is a context attribute, not an
-    alternative attribute). Missing keys render as ``"n/a"`` so a partially
-    populated ``alt_texts`` dict never raises.
+    ``category``, ``price``, ``popularity_rank``, ``brand``; ``state`` is
+    dropped because it is a context attribute, not an alternative
+    attribute, and ``is_repeat`` is dropped because it is label-leaky
+    under the current adapter (see comment on the render loop).
+    Missing keys render as ``"n/a"`` so a partially populated
+    ``alt_texts`` dict never raises.
 
     Parameters
     ----------
@@ -246,14 +248,17 @@ def render_alternatives(
             alt.get("popularity_rank", "n/a") if isinstance(alt, Mapping) else "n/a"
         )
         brand = alt.get("brand", "n/a") if isinstance(alt, Mapping) else "n/a"
-        is_repeat = alt.get("is_repeat", False) if isinstance(alt, Mapping) else False
 
         lines.append(f"({letter}) Title: {title}")
         lines.append(f"    Category: {category}")
         lines.append(f"    Price: {price}")
         lines.append(f"    Popularity: {popularity}")
         lines.append(f"    Brand: {brand}")
-        lines.append(f"    Previously purchased by this person: {bool(is_repeat)}")
+        # Intentionally omitted: ``is_repeat``. The adapter sets it to True
+        # only on the chosen alt (negatives from the ASIN lookup carry no
+        # per-customer history) — so rendering it to the LLM is direct
+        # label leakage. A paper-grade reintroduction would need a
+        # per-customer train-history lookup, not the alt_texts flag.
     return "\n".join(lines)
 
 

@@ -559,7 +559,7 @@ def _softmax_nll_batch(
                 return np.inf
             total += nll
         return float(total)
-    except (FloatingPointError, ValueError, OverflowError):
+    except (FloatingPointError, ValueError, OverflowError, ZeroDivisionError):
         return np.inf
 
 
@@ -644,7 +644,7 @@ def fit_coefficients_softmax_ce(
                     jac="2-point",
                     options={"maxiter": int(maxiter), "gtol": float(gtol)},
                 )
-            except (FloatingPointError, ValueError, OverflowError) as exc:
+            except (FloatingPointError, ValueError, OverflowError, ZeroDivisionError) as exc:
                 logger.debug(
                     "fit_coefficients restart %d raised %s; skipping",
                     restart,
