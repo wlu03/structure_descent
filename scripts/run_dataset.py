@@ -46,6 +46,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Load .env before any LLM client is constructed so ANTHROPIC_API_KEY,
+# OPENAI_API_KEY, GOOGLE_CLOUD_PROJECT, etc. are visible to os.environ.
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(REPO_ROOT / ".env")
+
 # Heavy / optional imports kept lazy inside main() for ``anthropic`` and
 # ``sentence_transformers`` -- we want a helpful error message (not an
 # ImportError at module load) when those packages are missing.

@@ -32,9 +32,19 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
+from dotenv import load_dotenv
+
+# Load .env before any LLM client is constructed so ANTHROPIC_API_KEY,
+# OPENAI_API_KEY, GOOGLE_CLOUD_PROJECT, etc. are visible to os.environ.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from src.baselines.data_adapter import records_to_baseline_batch
-from src.baselines.run_all import BASELINE_REGISTRY, format_table, run_all_baselines
+from src.baselines.run_all import (
+    BASELINE_REGISTRY,
+    format_table,
+    run_all_baselines,
+    save_rows_to_data_dir,
+)
 
 logger = logging.getLogger("run_baselines")
 
@@ -333,6 +343,25 @@ def main() -> int:
             "failing. Default: disabled (fail loud)."
         ),
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory to write the leaderboard artifacts (JSON + CSV "
+            "+ TXT). When unset, results only print to stdout."
+        ),
+    )
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help=(
+            "Optional suffix for the leaderboard filename stem, e.g. "
+            "--tag=main_seed7 yields baselines_leaderboard_main_seed7.json. "
+            "Ignored when --output-dir is unset."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -407,6 +436,14 @@ def main() -> int:
 
     print()
     print(format_table(rows))
+
+    if args.output_dir:
+        paths = save_rows_to_data_dir(rows, args.output_dir, tag=args.tag)
+        print()
+        print("wrote leaderboard to:")
+        for fmt, path in paths.items():
+            print(f"  {fmt}: {path}")
+
     return 0
 
 
