@@ -723,6 +723,16 @@ def generate_outcomes(
     final_outcomes: list[str] = []
     result: GenerationResult | None = None
     seed_used = seed
+    # Track whether the accepted completion was short (had to be padded
+    # with SENTINEL_OUTCOME). We prefer to retry short completions before
+    # accepting them rather than silently training on sentinels.
+    accepted_was_padded = False
+
+    def _count_nonempty_lines(txt: str) -> int:
+        """Count valid outcome lines a ``parse_completion`` call would keep."""
+        if not txt:
+            return 0
+        return sum(1 for ln in txt.split("\n") if ln.strip())
 
     for attempt_idx in range(attempts_budget):
         seed_used = seed + attempt_idx
@@ -733,6 +743,28 @@ def generate_outcomes(
             max_tokens=max_tokens,
             seed=seed_used,
         )
+        # Short-completion retry: if the model returned fewer than K
+        # non-empty lines and we still have attempts left, reissue with
+        # a different seed rather than padding with SENTINEL_OUTCOME and
+        # teaching downstream embeddings on a dummy sentence. Only the
+        # last attempt accepts a short completion.
+        nonempty = _count_nonempty_lines(result.text)
+        is_short = nonempty < int(K)
+        is_last_attempt = attempt_idx == attempts_budget - 1
+        if is_short and not is_last_attempt:
+            logger.warning(
+                "generate_outcomes: short completion (%d/%d lines) on "
+                "attempt %d/%d for customer_id=%r asin=%r — retrying "
+                "with seed+%d",
+                nonempty,
+                int(K),
+                attempt_idx + 1,
+                attempts_budget,
+                customer_id,
+                asin,
+                attempt_idx + 1,
+            )
+            continue
         parsed = parse_completion(
             result.text,
             K,
@@ -740,11 +772,13 @@ def generate_outcomes(
         )
         if diversity_filter is None:
             final_outcomes = parsed
+            accepted_was_padded = is_short  # may be True on last attempt
             break
 
         rewritten, ok = diversity_filter(parsed)
         final_outcomes = list(rewritten)
         if ok:
+            accepted_was_padded = is_short
             break
     else:  # pragma: no cover - for clarity; loop always executes once
         pass
@@ -770,6 +804,12 @@ def generate_outcomes(
         "prompt_version": prompt_version,
         "cache_prompt_version": cache_prompt_version,
         "timestamp": time.time(),
+        # ``was_padded`` marks cached entries whose last attempt still
+        # produced fewer than K lines and therefore got SENTINEL_OUTCOME
+        # padding. Downstream audits can filter these out (they are a
+        # tiny fraction of calls — ~0.1% on Amazon — but a paper-grade
+        # run may want to exclude them).
+        "was_padded": bool(accepted_was_padded),
     }
 
     if cache is not None:
