@@ -225,6 +225,7 @@ def iter_batches(
     shuffle: bool,
     generator: torch.Generator | None = None,
     prices: torch.Tensor | None = None,
+    x_tab: torch.Tensor | None = None,
 ) -> Iterator[dict[str, torch.Tensor]]:
     """Yield mini-batches of a full-in-memory dataset.
 
@@ -238,10 +239,15 @@ def iter_batches(
         when supplied, each yielded batch includes a ``"prices"`` key used
         by the §9.2 monotonicity regularizer. When ``None``, no ``"prices"``
         key is emitted and the monotonicity term is inert.
+    ``x_tab``: optional ``(N, J, F)`` float tensor of per-alternative
+        tabular features for the PO-LEU Strategy B linear residual. When
+        supplied, each yielded batch includes an ``"x_tab"`` key. When
+        ``None``, no ``"x_tab"`` key is emitted and PO-LEU's residual is
+        skipped (preserving baseline behaviour).
 
-    Each yielded dict has keys ``"z_d", "E", "c_star", "omega"`` and,
-    when ``prices`` is provided, ``"prices"``. First-axis is reduced to
-    ``batch_size`` (last batch may be shorter).
+    Each yielded dict has keys ``"z_d", "E", "c_star", "omega"`` plus
+    ``"prices"`` and/or ``"x_tab"`` when those tensors are supplied.
+    First-axis is reduced to ``batch_size`` (last batch may be shorter).
 
     When ``shuffle=True`` a permutation is drawn with the provided
     ``generator`` (or the default generator if ``None``); when ``False``
@@ -275,6 +281,16 @@ def iter_batches(
                 f"prices must be 2-D (N, J); got {prices.shape=}."
             )
 
+    if x_tab is not None:
+        if x_tab.shape[0] != N:
+            raise ValueError(
+                f"x_tab first dim must equal N={N}; got {x_tab.shape=}."
+            )
+        if x_tab.dim() != 3:
+            raise ValueError(
+                f"x_tab must be 3-D (N, J, F); got {x_tab.shape=}."
+            )
+
     if shuffle:
         perm = torch.randperm(N, generator=generator)
     else:
@@ -290,6 +306,8 @@ def iter_batches(
         }
         if prices is not None:
             batch["prices"] = prices.index_select(0, idx)
+        if x_tab is not None:
+            batch["x_tab"] = x_tab.index_select(0, idx)
         yield batch
 
 
@@ -407,14 +425,24 @@ def _compute_batch_loss(
     When ``prices is None`` the §9.2 monotonicity term is inert regardless
     of ``cfg.monotonicity_enabled`` — the caller must thread real prices
     to enable it.
+
+    Strategy B: when ``"x_tab"`` is present in the batch dict, it is
+    forwarded to ``model(...)`` as the third positional argument so the
+    PO-LEU tabular residual fires. Models that don't accept ``x_tab``
+    (e.g. ablation backbones) will error loudly; the caller's
+    responsibility is to ensure batch shape matches model capability.
     """
     z_d = batch["z_d"]
     E = batch["E"]
     c_star = batch["c_star"]
     omega = batch["omega"]
     prices = batch.get("prices")  # optional; None disables monotonicity term
+    x_tab = batch.get("x_tab")    # optional; None disables PO-LEU residual
 
-    logits, intermediates = model(z_d, E)
+    if x_tab is not None:
+        logits, intermediates = model(z_d, E, x_tab)
+    else:
+        logits, intermediates = model(z_d, E)
     loss = cross_entropy_loss(logits, c_star, omega)
 
     if reg_cfg is not None:
@@ -497,7 +525,11 @@ def evaluate_nll(
     total_count = 0
 
     for batch in batches:
-        logits, _ = model(batch["z_d"], batch["E"])
+        x_tab = batch.get("x_tab")
+        if x_tab is not None:
+            logits, _ = model(batch["z_d"], batch["E"], x_tab)
+        else:
+            logits, _ = model(batch["z_d"], batch["E"])
         per_event = torch.nn.functional.cross_entropy(
             logits, batch["c_star"], reduction="none"
         )

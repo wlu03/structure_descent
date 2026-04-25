@@ -54,7 +54,83 @@ __all__ = [
     "AssembledBatch",
     "assemble_batch",
     "iter_to_torch_batches",
+    "DEFAULT_TABULAR_FEATURE_NAMES",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Strategy B tabular-feature column list
+# --------------------------------------------------------------------------- #
+
+# Default per-alternative columns for the PO-LEU Strategy B linear
+# residual. ``popularity_rank`` is intentionally excluded — see the
+# rationale in :mod:`src.model.po_leu` (the encoder text already renders
+# popularity, so adding it here creates an identifiability fight with the
+# neural branch). Mirrors the price-only subset of
+# ``src.baselines.data_adapter.BUILTIN_FEATURE_NAMES``.
+DEFAULT_TABULAR_FEATURE_NAMES: tuple[str, ...] = (
+    "price",
+    "log1p_price",
+    "price_rank",
+)
+
+
+def _build_x_tab_matrix(
+    prices_np: np.ndarray,
+    feature_names: tuple[str, ...],
+) -> np.ndarray:
+    """Build the per-event ``(N, J, F)`` tabular tensor from a price matrix.
+
+    Mirrors ``src/baselines/data_adapter._build_feature_matrix`` for the
+    three supported columns:
+
+    * ``price``        — pass-through (already non-negative).
+    * ``log1p_price``  — ``log1p(max(price, 0))``.
+    * ``price_rank``   — within-event dense rank of ``price`` scaled to
+                         ``[0, 1]``; constant within events of size 1.
+
+    Any unrecognised column name raises ``ValueError`` at the caller's
+    boundary so a typo in YAML surfaces here rather than as a silent
+    column of zeros down in the optimizer.
+    """
+    N, J = prices_np.shape
+    F = len(feature_names)
+    out = np.zeros((N, J, F), dtype=np.float32)
+
+    # Pre-compute price_rank lazily; only some configs request it.
+    log1p_prices: np.ndarray | None = None
+    price_ranks: np.ndarray | None = None
+
+    for f, name in enumerate(feature_names):
+        if name == "price":
+            out[:, :, f] = prices_np
+        elif name == "log1p_price":
+            if log1p_prices is None:
+                log1p_prices = np.log1p(np.maximum(prices_np, 0.0)).astype(
+                    np.float32
+                )
+            out[:, :, f] = log1p_prices
+        elif name == "price_rank":
+            if price_ranks is None:
+                price_ranks = np.zeros((N, J), dtype=np.float32)
+                if J > 1:
+                    for i in range(N):
+                        order = np.argsort(prices_np[i], kind="stable")
+                        ranks = np.empty(J, dtype=np.float32)
+                        ranks[order] = (
+                            np.arange(J, dtype=np.float32) / float(J - 1)
+                        )
+                        price_ranks[i] = ranks
+                # else: J=1 leaves the column at zero, which is the
+                # documented behaviour of _price_rank in data_adapter.
+            out[:, :, f] = price_ranks
+        else:
+            raise ValueError(
+                f"Unsupported tabular feature {name!r}; supported: "
+                f"price, log1p_price, price_rank."
+            )
+
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -204,6 +280,26 @@ class AssembledBatch:
     prices: torch.Tensor
     """(N, J) float32. Per-alternative price used by §9.2 monotonicity."""
 
+    x_tab: torch.Tensor | None = None
+    """(N, J, F) float32 or ``None``.
+
+    Per-alternative tabular features for the Strategy B linear residual
+    on PO-LEU. Columns follow ``tabular_feature_names`` (default:
+    ``("price", "log1p_price", "price_rank")``). ``None`` when the
+    caller did not request the residual; the training loop and PO-LEU
+    forward both treat ``None`` as "skip the residual entirely", which
+    keeps existing runs bit-identical.
+    """
+
+    tabular_feature_names: tuple[str, ...] = ()
+    """Names of the columns in :attr:`x_tab` (parallel to its last axis).
+
+    Empty tuple when :attr:`x_tab` is ``None``; populated when the
+    residual features are materialised. Preserved alongside the tensor
+    so the model and downstream interpretability code can label
+    ``β`` coefficients without re-deriving the column order.
+    """
+
     # Diagnostics (not consumed by training):
     customer_ids: list[str] = field(default_factory=list)
     chosen_asins: list[str] = field(default_factory=list)
@@ -234,6 +330,7 @@ def assemble_batch(
     omega: np.ndarray | None = None,
     progress: bool = False,
     max_concurrent_llm_calls: int = 8,
+    tabular_feature_names: Sequence[str] | None = None,
 ) -> AssembledBatch:
     """Materialize training tensors from choice-set records.
 
@@ -541,6 +638,25 @@ def assemble_batch(
     omega_t = torch.from_numpy(omega_np).to(torch.float32)
     prices_t = torch.from_numpy(prices_np).to(torch.float32)
 
+    # ----- Strategy B x_tab ------------------------------------------------
+    x_tab_t: torch.Tensor | None = None
+    tab_names: tuple[str, ...] = ()
+    if tabular_feature_names is not None:
+        tab_names = tuple(tabular_feature_names)
+        if tab_names:  # empty tuple => skip silently (config off-switch)
+            x_tab_np = _build_x_tab_matrix(prices_np, tab_names)
+            x_tab_t = torch.from_numpy(x_tab_np).to(torch.float32)
+            if x_tab_t.shape != (N, J, len(tab_names)):
+                raise AssertionError(
+                    f"x_tab_shape: {tuple(x_tab_t.shape)} != "
+                    f"{(N, J, len(tab_names))}"
+                )
+            if not torch.isfinite(x_tab_t).all().item():
+                raise AssertionError(
+                    "x_tab_finite: tabular feature tensor contains "
+                    "non-finite entries (likely upstream price/NaN bug)."
+                )
+
     # ----- final invariant checks (boundary assertions) --------------------
     if z_d_t.shape != (N, p):
         raise AssertionError(
@@ -614,6 +730,8 @@ def assemble_batch(
         c_star=c_star_t,
         omega=omega_t,
         prices=prices_t,
+        x_tab=x_tab_t,
+        tabular_feature_names=tab_names,
         customer_ids=customer_ids,
         chosen_asins=chosen_asins,
         outcomes_nested=outcomes_nested,
@@ -637,10 +755,18 @@ def iter_to_torch_batches(
     regularizer fires (the Wave-8 bug-fix: training-loop callers used
     to drop prices silently).
 
+    Also forwards :attr:`AssembledBatch.x_tab` when populated, so the
+    Strategy B tabular residual on PO-LEU sees per-alternative numeric
+    features. When ``x_tab`` is ``None`` the yielded dicts have no
+    ``"x_tab"`` key — the training loop reads ``batch.get("x_tab")``
+    and treats absence as "skip the residual", preserving bit-identical
+    behaviour for runs that don't enable the feature.
+
     Shape contract matches :func:`src.train.loop.iter_batches`; each
     yielded dict always has a ``"prices"`` key of shape
     ``(batch_size, J)`` (``batch_size`` trimmed on the last partial
-    batch).
+    batch). When applicable, ``"x_tab"`` has shape
+    ``(batch_size, J, F)`` where ``F = len(batch.tabular_feature_names)``.
     """
     yield from iter_batches(
         batch.z_d,
@@ -651,4 +777,5 @@ def iter_to_torch_batches(
         shuffle=shuffle,
         generator=generator,
         prices=batch.prices,
+        x_tab=batch.x_tab,
     )

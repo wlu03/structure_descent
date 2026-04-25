@@ -22,6 +22,20 @@ model:
   person_dependent_heads: false  # §5.3
   uniform_salience: false        # §7.3
 
+  # Strategy B: Sifringer feature-partition tabular residual.
+  # When enabled, PO-LEU adds a small linear branch
+  #   V_total = V + Σ_f β_f · standardize(x_tab_f)
+  # giving the model direct access to numeric per-alternative columns
+  # the frozen sentence-transformer encoder cannot see (raw price etc.).
+  # ``β`` is zero-initialised, so enabling this knob alone does NOT
+  # change initial logits — bit-identical to baseline at step 0.
+  # ``popularity_rank`` is intentionally absent: the encoder text
+  # already renders a popularity band, so adding it numerically
+  # creates an identifiability fight (see src/model/po_leu.py).
+  tabular_residual:
+    enabled: false
+    features: [price, log1p_price, price_rank]
+
 data:
   split: temporal      # reuses v2.0 split artifact
   choice_set_size: 10  # J
@@ -67,6 +81,7 @@ regularizers:
     lambda: 1.0e-3
     price_key: "price"
   diversity: 1.0e-4          # §9.2 λ_div
+  head_variance: 1.0e-2      # anti-dead-head pull on per-head score variance (subtract to maximize). 0.0 = legacy.
 
 eval:
   top_k_list: [1, 5]

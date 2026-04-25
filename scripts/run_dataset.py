@@ -778,6 +778,29 @@ def main(args: argparse.Namespace) -> int:
     outcomes_cache = OutcomesCache(outcomes_cache_path)
     embeddings_cache = EmbeddingsCache(embeddings_cache_path)
 
+    # Strategy B tabular residual: read the YAML gate. When ``enabled`` is
+    # true we materialise the optional ``x_tab`` tensor on every assembled
+    # batch and pass the same feature-name list to the model below. When
+    # the block is missing, off, or set to an empty list, ``tab_names`` is
+    # ``None`` and assemble_batch silently leaves ``batch.x_tab`` as None
+    # — bit-identical to pre-residual runs.
+    tab_cfg = (config.get("model") or {}).get("tabular_residual") or {}
+    tab_enabled = bool(tab_cfg.get("enabled", False))
+    tab_features_yaml = list(tab_cfg.get("features") or [])
+    tab_names: list[str] | None = (
+        tab_features_yaml if (tab_enabled and tab_features_yaml) else None
+    )
+    if tab_enabled and not tab_features_yaml:
+        logger.warning(
+            "tabular_residual.enabled=true but features list is empty; "
+            "running without the residual."
+        )
+    if tab_names is not None:
+        logger.info(
+            "Strategy B tabular residual: enabled (features=%s)",
+            tab_names,
+        )
+
     logger.info("stage: assemble_batch (train)")
     batch_train = assemble_batch(
         records_train,
@@ -790,6 +813,7 @@ def main(args: argparse.Namespace) -> int:
         seed=int(args.seed),
         diversity_filter=_default_div_filter,
         omega=train_event_weights_aligned,
+        tabular_feature_names=tab_names,
     )
 
     # Val batch: reuse train batch when val is empty so downstream forward
@@ -810,6 +834,7 @@ def main(args: argparse.Namespace) -> int:
             seed=int(args.seed),
             diversity_filter=_default_div_filter,
             omega=None,
+            tabular_feature_names=tab_names,
         )
 
     # Test batch: §9.1 held-out split, un-weighted. Reuse val batch when
@@ -835,6 +860,7 @@ def main(args: argparse.Namespace) -> int:
             seed=int(args.seed),
             diversity_filter=_default_div_filter,
             omega=None,
+            tabular_feature_names=tab_names,
         )
         if len(batch_test) < 10:
             logger.warning(
@@ -858,7 +884,7 @@ def main(args: argparse.Namespace) -> int:
     wnet_cfg = model_cfg.get("weight_net") or {}
     snet_cfg = model_cfg.get("salience_net") or {}
 
-    model = POLEU(
+    poleu_kwargs: dict[str, Any] = dict(
         M=int(model_cfg.get("M", 5)),
         K=K,
         J=J,
@@ -871,6 +897,33 @@ def main(args: argparse.Namespace) -> int:
         uniform_salience=bool(model_cfg.get("uniform_salience", False)),
         temperature=float(model_cfg.get("temperature", 1.0)),
     )
+    # Strategy B: only pass the residual kwargs when actively enabled +
+    # x_tab is materialised; otherwise stay on POLEU's default-False
+    # constructor branch so model.parameters() does not gain a stray
+    # beta_tab the training step will never see gradients for.
+    if tab_names is not None and batch_train.x_tab is not None:
+        poleu_kwargs["tabular_residual_enabled"] = True
+        poleu_kwargs["tabular_features"] = tuple(tab_names)
+    model = POLEU(**poleu_kwargs)
+
+    # Fit train-set per-feature mean/std and install them as buffers on
+    # the model. Standardising before β receives any gradient makes
+    # |β_f| comparable across features whose natural scales differ by
+    # orders of magnitude (price in dollars vs. price_rank in [0, 1]).
+    if (
+        tab_names is not None
+        and batch_train.x_tab is not None
+        and getattr(model, "tabular_residual_enabled", False)
+    ):
+        flat = batch_train.x_tab.reshape(-1, batch_train.x_tab.shape[-1])
+        mean = flat.mean(dim=0)
+        std = flat.std(dim=0, unbiased=False)
+        model.set_tabular_feature_stats(mean, std)
+        logger.info(
+            "tabular_residual stats fit on train: mean=%s std=%s",
+            mean.tolist(),
+            std.tolist(),
+        )
 
     # Train config: start from default YAML, then override from CLI.
     train_cfg = TrainConfig.from_default()
@@ -956,7 +1009,14 @@ def main(args: argparse.Namespace) -> int:
     logger.info("stage: evaluate (val)")
     model.eval()
     with torch.no_grad():
-        logits_val, interm_val = model(batch_val.z_d, batch_val.E)
+        if batch_val.x_tab is not None and getattr(
+            model, "tabular_residual_enabled", False
+        ):
+            logits_val, interm_val = model(
+                batch_val.z_d, batch_val.E, batch_val.x_tab
+            )
+        else:
+            logits_val, interm_val = model(batch_val.z_d, batch_val.E)
     metrics = compute_all(
         logits_val,
         batch_val.c_star,
@@ -979,7 +1039,14 @@ def main(args: argparse.Namespace) -> int:
 
     logger.info("stage: evaluate (test)")
     with torch.no_grad():
-        logits_test, _interm_test = model(batch_test.z_d, batch_test.E)
+        if batch_test.x_tab is not None and getattr(
+            model, "tabular_residual_enabled", False
+        ):
+            logits_test, _interm_test = model(
+                batch_test.z_d, batch_test.E, batch_test.x_tab
+            )
+        else:
+            logits_test, _interm_test = model(batch_test.z_d, batch_test.E)
     test_metrics = compute_all(
         logits_test,
         batch_test.c_star,
