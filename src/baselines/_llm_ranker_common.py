@@ -294,6 +294,11 @@ def _stub_letter_probs(text: str, letters: Sequence[str]) -> np.ndarray:
 
 _JSON_OBJECT_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 
+# Set to False once the installed Anthropic SDK proves it doesn't accept the
+# logprobs/top_logprobs kwargs, so subsequent calls skip the primary path
+# instead of re-raising and re-logging on every event × permutation.
+_ANTHROPIC_LOGPROBS_SUPPORTED: Optional[bool] = None
+
 
 def _parse_verbalized_json(text: str, letters: Sequence[str]) -> Optional[np.ndarray]:
     """Parse a ``{"A": p, "B": p, ...}`` JSON fragment from the response.
@@ -626,48 +631,60 @@ def _call_anthropic_for_ranking(
         },
         {"role": "assistant", "content": "The answer is ("},
     ]
-    primary_kwargs: Dict[str, Any] = {
-        "model": resolved_model,
-        "system": [
-            {
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        "messages": primary_messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "logprobs": True,
-        "top_logprobs": top_logprobs,
-    }
-    try:
-        response = inner.messages.create(**primary_kwargs)
-        vec = _try_extract_anthropic_top_logprobs(response, letters)
-        if vec is not None:
-            shifted = vec - np.max(vec)
-            exp = np.exp(shifted)
-            total = exp.sum()
-            if total > 0 and np.isfinite(total):
-                return (exp / total).astype(np.float64)
-        # No usable logprobs → fall through to the verbalised path below.
-        logger.warning(
-            "Anthropic response for ranker did not carry usable "
-            "top_logprobs; falling back to verbalised elicitation."
-        )
-    except Exception as exc:  # noqa: BLE001 - SDK raises varied errors here
-        logger.warning(
-            "Anthropic messages.create(logprobs=True) failed (%s); "
-            "falling back to verbalised JSON elicitation.",
-            exc,
-        )
+    global _ANTHROPIC_LOGPROBS_SUPPORTED
+    if _ANTHROPIC_LOGPROBS_SUPPORTED is not False:
+        primary_kwargs: Dict[str, Any] = {
+            "model": resolved_model,
+            "system": [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": primary_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "logprobs": True,
+            "top_logprobs": top_logprobs,
+        }
+        try:
+            response = inner.messages.create(**primary_kwargs)
+            _ANTHROPIC_LOGPROBS_SUPPORTED = True
+            vec = _try_extract_anthropic_top_logprobs(response, letters)
+            if vec is not None:
+                shifted = vec - np.max(vec)
+                exp = np.exp(shifted)
+                total = exp.sum()
+                if total > 0 and np.isfinite(total):
+                    return (exp / total).astype(np.float64)
+            logger.warning(
+                "Anthropic response for ranker did not carry usable "
+                "top_logprobs; falling back to verbalised elicitation."
+            )
+        except TypeError as exc:
+            _ANTHROPIC_LOGPROBS_SUPPORTED = False
+            logger.warning(
+                "Installed anthropic SDK does not accept logprobs kwargs (%s); "
+                "using verbalised JSON path for all subsequent calls.",
+                exc,
+            )
+        except Exception as exc:  # noqa: BLE001 - SDK raises varied errors here
+            logger.warning(
+                "Anthropic messages.create(logprobs=True) failed (%s); "
+                "falling back to verbalised JSON elicitation.",
+                exc,
+            )
 
     # Verbalised-JSON fallback: ask for probabilities as JSON, parse.
+    # System prompt is identical across the K permutations × N events for a
+    # given baseline+model, so we mark it as a prompt-cache breakpoint to
+    # avoid re-billing input tokens on every call.
     verbal_system = (
         system
-        + "\n\nReturn JSON with keys "
+        + "\n\nReturn ONLY a compact JSON object with keys "
         + ", ".join(f'"{l}"' for l in letters)
-        + " and probabilities summing to 1. Do not explain."
+        + " and probabilities summing to 1. No whitespace, no explanation."
     )
     verbal_messages = [
         {
@@ -677,9 +694,18 @@ def _call_anthropic_for_ranking(
     ]
     verbal_kwargs: Dict[str, Any] = {
         "model": resolved_model,
-        "system": verbal_system,
+        "system": [
+            {
+                "type": "text",
+                "text": verbal_system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         "messages": verbal_messages,
-        "max_tokens": 128,
+        # Headroom for J=10 compact JSON (~60 tokens worst-case) plus a margin
+        # so a slightly verbose response still parses cleanly. max_tokens is
+        # only an upper bound — short responses don't get billed extra.
+        "max_tokens": 96,
         "temperature": temperature,
     }
     try:
