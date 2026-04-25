@@ -24,8 +24,14 @@ paper/
 .mypy_cache/
 .ruff_cache/
 outcomes_cache/*.sqlite
+outcomes_cache/*.sqlite-wal
+outcomes_cache/*.sqlite-shm
+outcomes_cache/*.sqlite.corrupt.bak
 outcomes_cache/*.parquet
 embeddings_cache/*.sqlite
+embeddings_cache/*.sqlite-wal
+embeddings_cache/*.sqlite-shm
+embeddings_cache/*.sqlite.corrupt.bak
 embeddings_cache/*.parquet
 checkpoints/*
 !checkpoints/.gitkeep
