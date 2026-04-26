@@ -718,6 +718,25 @@ def main(args: argparse.Namespace) -> int:
         len(records_test),
     )
 
+    # Persist the record set so downstream drivers
+    # (scripts/run_baselines.py --records-from) can score the same events
+    # PO-LEU saw. Without this, the baselines re-derive records
+    # independently (slightly different filter chain) and end up on a
+    # different slice, breaking apples-to-apples comparison on the
+    # leaderboard.
+    import pickle
+    records_pkl = out_dir / "records.pkl"
+    with records_pkl.open("wb") as _fh:
+        pickle.dump(
+            {"train": records_train, "val": records_val, "test": records_test},
+            _fh,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    logger.info(
+        "wrote %s (%d+%d+%d records)",
+        records_pkl, len(records_train), len(records_val), len(records_test),
+    )
+
     # Re-align the per-event importance weights to the SURVIVING train
     # records. ``train_event_weights_aligned`` was built earlier against
     # ``train_events_subset`` (pre-build_choice_sets) and will therefore

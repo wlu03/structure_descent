@@ -273,6 +273,13 @@ def _poleu_row(
 
     Expects a ``.npz`` with keys ``logits`` (shape ``(N, J)``),
     ``c_star`` (shape ``(N,)``), and optionally ``n_params``.
+
+    Slice-alignment guard: verifies that the (N, c_star) in the npz match
+    ``test_batch``'s (n_events, chosen_indices) exactly. If they don't,
+    PO-LEU was scored on a different test slice than the baselines and
+    folding the row into the leaderboard would be a structurally invalid
+    apples-to-oranges comparison. Fail loud rather than silently emit
+    misleading numbers (the bug we hit pre-records.pkl).
     """
     from src.eval.metrics import compute_all
 
@@ -280,6 +287,30 @@ def _poleu_row(
     logits = data["logits"]
     c_star = data["c_star"]
     n_params = int(data["n_params"]) if "n_params" in data else 0
+
+    # --- slice-alignment guard ----------------------------------------------
+    if int(logits.shape[0]) != int(test_batch.n_events):
+        raise SystemExit(
+            f"PO-LEU slice mismatch: --poleu-logits has N={logits.shape[0]} "
+            f"but test batch has N={test_batch.n_events}. The two were "
+            f"scored on different test sets; the leaderboard row would be "
+            f"meaningless. Re-run scripts/run_dataset.py against the same "
+            f"records.pkl that produced the baselines, or pass "
+            f"--records-from <run_dir>/records.pkl to scripts/run_baselines.py."
+        )
+    test_c_star = np.asarray(test_batch.chosen_indices, dtype=np.int64)
+    npz_c_star = np.asarray(c_star, dtype=np.int64)
+    if not np.array_equal(test_c_star, npz_c_star):
+        n_mismatch = int(np.sum(test_c_star != npz_c_star))
+        raise SystemExit(
+            f"PO-LEU slice mismatch: chosen_indices disagree on "
+            f"{n_mismatch}/{len(test_c_star)} test events between "
+            f"--poleu-logits and the test batch. The two were scored on "
+            f"different events (or in different order). Re-run "
+            f"scripts/run_dataset.py against the same records.pkl that "
+            f"produced the baselines, or pass --records-from to "
+            f"scripts/run_baselines.py."
+        )
 
     em = compute_all(
         logits, c_star, n_params=n_params, n_train=int(train_n_events)
@@ -316,6 +347,18 @@ def main() -> int:
         type=str,
         default=None,
         help="Path to a .npz carrying PO-LEU's test-set logits / c_star / n_params.",
+    )
+    parser.add_argument(
+        "--records-from",
+        type=str,
+        default=None,
+        help=(
+            "Path to a records.pkl written by scripts/run_dataset.py. When set, "
+            "baselines score on the EXACT same (train, val, test) records PO-LEU "
+            "was trained on, so the leaderboard is apples-to-apples. Overrides "
+            "--dataset-yaml / --n-customers / --seed / --split-mode for record "
+            "construction."
+        ),
     )
     parser.add_argument(
         "--split-mode",
@@ -378,10 +421,32 @@ def main() -> int:
         test = make_synthetic_batch(n_events=200, seed=1003)
         logger.info("synthetic mode: %d train / %d val / %d test events",
                     train.n_events, val.n_events, test.n_events)
+    elif args.records_from:
+        import pickle
+        records_path = Path(args.records_from)
+        if not records_path.exists():
+            parser.error(f"--records-from path does not exist: {records_path}")
+        logger.info("loading records from %s (PO-LEU-authoritative set)", records_path)
+        with records_path.open("rb") as _fh:
+            _bundle = pickle.load(_fh)
+        train_recs = _bundle["train"]
+        val_recs   = _bundle["val"]
+        test_recs  = _bundle["test"]
+        logger.info("records: %d train / %d val / %d test (from %s)",
+                    len(train_recs), len(val_recs), len(test_recs), records_path)
+        if not train_recs or not test_recs:
+            logger.error("empty train or test split in records bundle "
+                         "(train=%d test=%d); cannot run", len(train_recs), len(test_recs))
+            return 2
+        train = records_to_baseline_batch(train_recs)
+        val = (records_to_baseline_batch(val_recs)
+               if val_recs
+               else records_to_baseline_batch(train_recs[: max(1, len(train_recs)//5)]))
+        test = records_to_baseline_batch(test_recs)
     else:
         if not args.dataset_yaml:
             parser.error(
-                "--dataset-yaml is required unless --synthetic is passed"
+                "--dataset-yaml is required unless --synthetic or --records-from is passed"
             )
         logger.info("loading dataset %s", args.dataset_yaml)
         train_recs, val_recs, test_recs = _build_records_from_dataset(
