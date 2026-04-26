@@ -69,7 +69,7 @@ train:
   beta1: 0.9
   beta2: 0.999
   max_epochs: 30
-  early_stopping_patience: 5
+  early_stopping_patience: 9999  # effectively disabled (must exceed max_epochs); patience-counter telemetry still updates so logs reflect val-NLL plateaus, but the loop runs the full epoch budget.
   grad_clip: 1.0
   seeds: [0, 1, 2]           # 3 seeds reported
 

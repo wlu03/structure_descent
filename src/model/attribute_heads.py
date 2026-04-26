@@ -34,6 +34,20 @@ def _xavier_init_linear(layer: nn.Linear) -> None:
     nn.init.zeros_(layer.bias)
 
 
+def _kaiming_relu_init_linear(layer: nn.Linear) -> None:
+    """Kaiming-uniform (fan_in, ReLU gain) on weight, zero on bias.
+
+    Better matched than Xavier for the ReLU non-linearity in fc1 — Xavier
+    targets a symmetric activation (tanh) and under-scales for ReLU,
+    leaving early-epoch activations small enough that one head can lose
+    the routing race in the weight net and never recover (the dead-m0
+    pattern observed at n=10). Kaiming+ReLU restores symmetric variance
+    propagation across all M heads at init.
+    """
+    nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
+    nn.init.zeros_(layer.bias)
+
+
 class AttributeHead(nn.Module):
     """A single attribute head ``u_m : R^{d_e} -> R`` (§5.1).
 
@@ -41,7 +55,10 @@ class AttributeHead(nn.Module):
         Linear(d_e -> hidden) -> ReLU -> Linear(hidden -> 1).
 
     No final activation. No dropout / layernorm / residuals. Biases start
-    at zero; weights are Xavier-uniform.
+    at zero. The first layer (``fc1``) uses Kaiming-uniform init to
+    match the ReLU non-linearity that follows; the output layer
+    (``fc2``) keeps Xavier — its output is consumed linearly via the
+    weight net, so symmetric init is the right default.
     """
 
     def __init__(self, d_e: int = DEFAULT_D_E, hidden: int = DEFAULT_HIDDEN) -> None:
@@ -51,7 +68,7 @@ class AttributeHead(nn.Module):
         self.fc1 = nn.Linear(self.d_e, self.hidden)
         self.fc2 = nn.Linear(self.hidden, 1)
         self.act = nn.ReLU()
-        _xavier_init_linear(self.fc1)
+        _kaiming_relu_init_linear(self.fc1)
         _xavier_init_linear(self.fc2)
 
     def forward(self, e: torch.Tensor) -> torch.Tensor:

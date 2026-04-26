@@ -150,7 +150,7 @@ def test_train_config_from_default():
     assert cfg.beta1 == pytest.approx(0.9)
     assert cfg.beta2 == pytest.approx(0.999)
     assert cfg.max_epochs == 30
-    assert cfg.early_stopping_patience == 5
+    assert cfg.early_stopping_patience == 9999  # disabled in default.yaml; runs full max_epochs
     assert cfg.grad_clip == pytest.approx(1.0)
 
 

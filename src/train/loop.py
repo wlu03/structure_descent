@@ -26,6 +26,8 @@ scope for this module — see the orchestrator plan).
 
 from __future__ import annotations
 
+import copy
+import importlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -161,6 +163,10 @@ class TrainState:
     best_val_nll: float = float("inf")
     patience_counter: int = 0
     stopped_early: bool = False
+    # Strategy A.1: True iff fit() actually reloaded best-val weights into
+    # the model before returning. Only set when ``stopped_early=True`` and a
+    # best-state snapshot was captured during training.
+    reloaded_best_checkpoint: bool = False
 
 
 # --- Optimizer + scheduler --------------------------------------------------
@@ -359,12 +365,10 @@ def try_import_subsample_weights(
     if n_customers is None:
         return (None, None)
 
+    # Step 1: try the import. A failure here means the module isn't on the
+    # import path at all — log "not importable" and fall back.
     try:
-        from src.train.subsample import (  # type: ignore
-            apply_subsample,
-            random_subsample_customers,
-            subsample_customers,
-        )
+        subsample_mod = importlib.import_module("src.train.subsample")
     except ImportError:
         logger.warning(
             "src.train.subsample not importable — falling back to ω_t=1. "
@@ -379,8 +383,18 @@ def try_import_subsample_weights(
             f"subsample method must be 'leverage' or 'random'; got {method!r}."
         )
 
+    # Step 2: call the subsample functions on the imported module. A failure
+    # here means the module IS importable but its routine raised (or a needed
+    # attribute is missing) — log a DIFFERENT warning that contains the
+    # literal word ``raised`` so callers (and tests) can distinguish runtime
+    # errors from import-time failures.
     try:
+        subsample_customers = subsample_mod.subsample_customers  # type: ignore[attr-defined]
+        apply_subsample = subsample_mod.apply_subsample  # type: ignore[attr-defined]
         if method_lc == "random":
+            random_subsample_customers = (
+                subsample_mod.random_subsample_customers  # type: ignore[attr-defined]
+            )
             selected_ids, customer_weights = random_subsample_customers(
                 train_df, n_customers=n_customers, seed=seed
             )
@@ -395,10 +409,11 @@ def try_import_subsample_weights(
         # Any runtime failure (e.g., missing columns, degenerate SVD,
         # KMeans warning elevated to error) falls back to ω=1 per §9.1.
         logger.warning(
-            "src.train.subsample.subsample_customers raised %r — "
+            "src.train.subsample raised %s during execution (%r) — "
             "falling back to ω_t=1. Most likely cause: state_features "
             "did not produce the required columns (routine, recency_days, "
             "novelty) on this DataFrame. Run compute_state_features first.",
+            type(exc).__name__,
             exc,
         )
         return (None, None)
@@ -591,6 +606,13 @@ def fit(
     )
 
     state = TrainState()
+    # Strategy A.1: snapshot of state_dict at the best-val-NLL epoch.
+    # Stored on CPU (detached) so it does not pin GPU memory and survives
+    # a later .to(device) on the model. Re-loaded after the loop if we
+    # stopped early — the final-epoch weights are otherwise *worse* than
+    # the early-stop "best" point, which silently degrades val/test
+    # metrics (the bug this strategy fixes).
+    best_state: dict[str, torch.Tensor] | None = None
 
     for epoch in range(train_cfg.max_epochs):
         train_stats = train_one_epoch(
@@ -613,6 +635,15 @@ def fit(
         if improved:
             state.best_val_nll = float(val_nll)
             state.patience_counter = 0
+            # Capture a fresh best-state snapshot. ``copy.deepcopy`` on the
+            # state_dict is safe with subclasses that nest objects (e.g. tied
+            # parameters); we then ensure the tensors themselves are detached
+            # CPU clones so the snapshot is independent of model device and
+            # does not retain autograd graph references.
+            raw_state = copy.deepcopy(model.state_dict())
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in raw_state.items()
+            }
         else:
             state.patience_counter += 1
 
@@ -622,5 +653,41 @@ def fit(
         if state.patience_counter >= train_cfg.early_stopping_patience:
             state.stopped_early = True
             break
+
+    # --- Strategy A.1: reload best checkpoint after early stop --------------
+    # PO-LEU was leaving the final-epoch (worse) weights in place after early
+    # stop, which silently degrades downstream metrics by the gap between
+    # final and best val NLL. Reload only when we *actually* stopped early —
+    # the natural end-of-loop case keeps the weights the loop just produced.
+    if state.stopped_early and best_state is not None:
+        # Re-cast each tensor back to whatever device/dtype the model is
+        # currently on. Handles the GPU-mode case where the snapshot lives
+        # on CPU but the model lives on cuda.
+        cur_state = model.state_dict()
+        reloaded = {}
+        for k, v in best_state.items():
+            if k in cur_state:
+                tgt = cur_state[k]
+                reloaded[k] = v.to(device=tgt.device, dtype=tgt.dtype)
+            else:
+                reloaded[k] = v
+        pre_reload = state.val_nll if state.val_nll is not None else float("nan")
+        model.load_state_dict(reloaded)
+        state.reloaded_best_checkpoint = True
+        # Update val_nll to reflect the reloaded weights. We have the value
+        # cached as ``best_val_nll`` already, but a fresh eval pass is
+        # defensive against any nondeterminism (BatchNorm, dropout, etc.).
+        state.val_nll = float(evaluate_nll(model, val_batches_fn()))
+        logger.info(
+            "strategy A.1 fired: reloaded best-val checkpoint "
+            "(final-epoch val_nll=%.4f -> reloaded val_nll=%.4f, "
+            "best_val_nll captured=%.4f)",
+            pre_reload, state.val_nll, state.best_val_nll,
+        )
+    elif state.stopped_early and best_state is None:
+        logger.warning(
+            "strategy A.1 SKIPPED: stopped_early=True but no best_state "
+            "captured — train run kept final-epoch (worse) weights."
+        )
 
     return state

@@ -48,6 +48,12 @@ DEFAULT_LAMBDA_WEIGHT_L2: float = 1e-4
 DEFAULT_LAMBDA_SALIENCE_ENTROPY: float = 1e-3
 DEFAULT_LAMBDA_MONOTONICITY: float = 1e-3
 DEFAULT_LAMBDA_DIVERSITY: float = 1e-4
+# Head-variance pull (anti-dead-head). Subtracted from loss to *maximize*
+# per-head score variance across the K outcome axis. Default 0.0 reproduces
+# legacy behavior; small positive values (1e-3 to 1e-2) prevent the dead-m0
+# pattern observed at n=10 (one head receives no routing mass and stays
+# at init for the entire run). See ``head_score_variance``.
+DEFAULT_LAMBDA_HEAD_VARIANCE: float = 0.0
 DEFAULT_MONOTONICITY_ENABLED: bool = False
 
 # Default financial-head index (§5.2 ordering: financial is attribute 0).
@@ -282,6 +288,49 @@ def outcome_diversity(E: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# 4b. Head-score variance (anti-dead-head, not in §9.2; see NOTES.md).
+# ---------------------------------------------------------------------------
+
+
+def head_score_variance(A: torch.Tensor) -> torch.Tensor:
+    """Mean per-head variance of attribute scores over the K outcome axis.
+
+    The ``M`` attribute heads are independent at init but share gradient
+    competition through the weight net ``w_m(z_d)``: a head whose
+    initialization happens to lose the routing race in the first epoch
+    receives near-zero gradient and gets stuck producing a near-constant
+    output for the rest of training (the dead-m0 pattern observed at
+    n=10 — head 0's outputs sat at ≈ 0.02 across every test event).
+
+    This term scores how much each head's output varies across the K
+    outcomes within an alternative. A flat (dead) head has near-zero
+    variance; a useful head varies. We want this *up*, so the combined
+    regularizer applies a NEGATIVE coefficient to subtract this term
+    from the loss (same pattern as ``salience_entropy``).
+
+    Parameters
+    ----------
+    A:
+        Attribute-score tensor ``(B, J, K, M)`` from
+        :class:`POLEUIntermediates.A`.
+
+    Returns
+    -------
+    torch.Tensor
+        0-dim scalar — mean across (B, J, M) of variance over K.
+    """
+    if A.dim() != 4:
+        raise ValueError(
+            f"A must be 4-D (B, J, K, M); got shape {tuple(A.shape)}."
+        )
+    if A.shape[2] < 2:
+        # Variance over a single sample is 0; nothing to push.
+        return (A * 0.0).sum()
+    var_k = A.var(dim=2, unbiased=False)  # (B, J, M)
+    return var_k.mean()
+
+
+# ---------------------------------------------------------------------------
 # 5. RegularizerConfig (§9.2 λ table + configs/default.yaml Appendix B).
 # ---------------------------------------------------------------------------
 
@@ -317,6 +366,10 @@ class RegularizerConfig:
     monotonicity_enabled: bool = DEFAULT_MONOTONICITY_ENABLED
     monotonicity: float = DEFAULT_LAMBDA_MONOTONICITY
     diversity: float = DEFAULT_LAMBDA_DIVERSITY
+    # See ``head_score_variance``. Subtracted from loss (same sign
+    # convention as ``salience_entropy``) so positive λ pushes per-head
+    # variance UP, preventing the dead-head pattern. 0.0 = legacy.
+    head_variance: float = DEFAULT_LAMBDA_HEAD_VARIANCE
 
     @classmethod
     def from_default(cls) -> "RegularizerConfig":
@@ -345,6 +398,11 @@ class RegularizerConfig:
             monotonicity_enabled=bool(mono_block["enabled"]),
             monotonicity=float(mono_block["lambda"]),
             diversity=float(reg["diversity"]),
+            # head_variance is optional in YAML — missing key falls back to
+            # the dataclass default (0.0) so legacy configs keep working.
+            head_variance=float(
+                reg.get("head_variance", DEFAULT_LAMBDA_HEAD_VARIANCE)
+            ),
         )
 
 
@@ -404,6 +462,11 @@ def combined_regularizer(
     div = outcome_diversity(E)
 
     total = cfg.weight_l2 * wl2 - cfg.salience_entropy * ent + cfg.diversity * div
+
+    # Anti-dead-head pull on per-head score variance (subtract to maximize).
+    # Cheap (no extra forward), gradient flows through ``intermediates.A``.
+    if cfg.head_variance != 0.0:
+        total = total - cfg.head_variance * head_score_variance(intermediates.A)
 
     if cfg.monotonicity_enabled and prices is not None:
         mono = price_monotonicity(model.heads, E, prices)
