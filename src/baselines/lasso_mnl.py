@@ -262,6 +262,21 @@ class LassoMnl:
         val_exp, _ = expand_batch(val, self.include_interactions)
         n_features = len(feature_names)
 
+        # Per-feature standardization (train-fit only). The expanded pool mixes
+        # raw, signed-log1p, signed-square, and pairwise-interaction columns
+        # whose magnitudes span eight orders (sq_popularity_rank reaches ~1.3e8
+        # on Amazon). Without this, FISTA finds weight vectors that push per-
+        # event logits past 1e5, overwhelming the post-hoc temperature cap
+        # (t_hi=1000) and pathologizing test NLL while top-k stays correct.
+        # Softmax is scale-homogeneous across alts, so dividing each event's
+        # design matrix by the train-fit std preserves MNL ranking exactly.
+        # The scale is absorbed back into the weights after FISTA so the
+        # FittedBaseline / score_events contract on unscaled features holds.
+        train_stack = np.vstack(train_exp)
+        feature_scale = np.maximum(train_stack.std(axis=0), 1e-8)
+        train_exp = [X / feature_scale for X in train_exp]
+        val_exp = [X / feature_scale for X in val_exp]
+
         best_alpha = None
         best_val_nll = np.inf
         best_w = None
@@ -298,6 +313,12 @@ class LassoMnl:
         # Dividing logits by a learned T > 0 recalibrates without changing top-k.
         val_logits_list = [X_e @ best_w for X_e in val_exp]
         temperature = _fit_temperature(val_logits_list, val.chosen_indices)
+
+        # Absorb the per-feature scale into the weight vector so that
+        # ``feats @ weights`` on the *unscaled* expanded pool reproduces
+        # ``(feats / feature_scale) @ best_w`` exactly. Keeps the fitted
+        # object contract (feature_names, n_params, description) unchanged.
+        best_w = best_w / feature_scale
 
         return LassoMnlFitted(
             name=self.name,

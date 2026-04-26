@@ -307,6 +307,18 @@ class BayesianARD:
         val: BaselineEventBatch,
     ) -> BayesianARDFitted:
         train_exp, feature_names = expand_batch(train, self.include_interactions)
+
+        # Per-feature standardization (train-fit only). The expanded pool's
+        # sq_* and interaction columns can reach ~1e8 magnitude (Amazon),
+        # which makes the ARD prior poorly conditioned and lets SVI find
+        # weight vectors that produce per-event logits past 1e5, overwhelming
+        # the post-hoc temperature cap. Scaling is MNL-ranking-invariant
+        # (softmax is scale-homogeneous across alts); the scale is absorbed
+        # back into the final weights so score_events' unscaled contract holds.
+        train_stack = np.vstack(train_exp)
+        feature_scale = np.maximum(train_stack.std(axis=0), 1e-8)
+        train_exp = [X / feature_scale for X in train_exp]
+
         X_np, y_np = _build_stacked_design(train_exp, train.chosen_indices)
 
         import jax
@@ -381,8 +393,14 @@ class BayesianARD:
         # argmax stays correct. Dividing logits by learned T > 0 recalibrates
         # without changing top-k.
         val_exp, _ = expand_batch(val, self.include_interactions)
+        val_exp = [X / feature_scale for X in val_exp]
         val_logits_list = [X_e @ pruned for X_e in val_exp]
         temperature = _fit_temperature(val_logits_list, list(val.chosen_indices))
+
+        # Absorb the per-feature scale into the weight vector so that
+        # ``feats @ posterior_mean_weights`` on the *unscaled* expanded pool
+        # reproduces ``(feats / feature_scale) @ pruned`` exactly.
+        pruned = pruned / feature_scale
 
         return BayesianARDFitted(
             name=self.name,
