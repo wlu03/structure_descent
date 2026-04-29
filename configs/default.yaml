@@ -38,11 +38,16 @@ model:
       - price
       - log1p_price
       - price_rank
-      - popularity_rank          # added: dense numeric popularity (encoder
-      - log1p_popularity_rank    #         only sees coarse band in prompt)
-      - is_repeat                # added: 1 if customer bought this ASIN
-                                 #         before; the encoder has no path
-                                 #         to this signal
+      # Dense numeric popularity (raw count from train) — coarse-band
+      # popularity_rank string the LLM prompt uses is too coarse for
+      # the residual; popularity_count is the per-ASIN integer the
+      # encoder cannot recover from the band label.
+      - popularity_count
+      - log1p_popularity_count
+      # Customer-ASIN binary repeat signal: 1 if the customer has
+      # bought this ASIN in train history, else 0. (Graded variant
+      # log1p_purchase_count added in a follow-up commit.)
+      - is_repeat
 
 data:
   split: temporal      # reuses v2.0 split artifact

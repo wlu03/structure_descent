@@ -75,18 +75,35 @@ DEFAULT_TABULAR_FEATURE_NAMES: tuple[str, ...] = (
 )
 
 
+# Mapping from band-label popularity_rank strings (what the adapter emits
+# for the LLM prompt) to a coarse [0, 1] numeric. Used as a fallback when
+# popularity_rank is requested as a tabular feature; the *dense* signal
+# the residual really wants is popularity_count below.
+_POPULARITY_BAND_TO_NUMBER: dict[str, float] = {
+    "top 5%": 0.95,
+    "top 25%": 0.75,
+    "top 50%": 0.5,
+    "bottom 50%": 0.25,
+}
+
+
 SUPPORTED_TABULAR_FEATURES: tuple[str, ...] = (
     # Price-family (computed from prices_np alone, no record lookup needed).
     "price",
     "log1p_price",
     "price_rank",
     # Per-alt fields read from rec["alt_texts"][j]. Sifringer L-MNL: only
-    # add features the encoder genuinely cannot see (popularity_rank is
-    # rendered in the prompt as a coarse band, but the dense numeric value
-    # is a stronger signal that the frozen sentence-transformer struggles
-    # to extract from band labels alone).
+    # add features the encoder genuinely cannot see.
+    #
+    # popularity_rank: band-label string ("top 5%" etc.) — mapped to a
+    # numeric via _POPULARITY_BAND_TO_NUMBER; numeric values pass through.
+    # Coarser than popularity_count; kept for back-compat.
     "popularity_rank",
     "log1p_popularity_rank",
+    # popularity_count: raw integer popularity (train-only count). Dense
+    # numeric the encoder cannot extract from a coarse band label.
+    "popularity_count",
+    "log1p_popularity_count",
     "is_repeat",
 )
 
@@ -107,14 +124,26 @@ def _build_x_tab_matrix(
                              ``[0, 1]``; constant within events of size 1.
 
     Record-family (read from ``records[i]["alt_texts"][j]``):
-        * ``popularity_rank``       — numeric rank as written by
-                                      ``state_features.attach_train_popularity``.
-                                      Missing keys → 0.0 (a sentinel for
-                                      "ASIN unseen in train"; matches the
-                                      contract for unseen-popularity rows).
-        * ``log1p_popularity_rank`` — derived from popularity_rank.
-        * ``is_repeat``             — 1.0 / 0.0; missing → 0.0.
-
+        * ``popularity_rank``       — band-label string from the adapter
+                                      (``"top 5%"``, ``"top 25%"``,
+                                      ``"top 50%"``, ``"bottom 50%"``)
+                                      mapped to a coarse numeric via
+                                      ``_POPULARITY_BAND_TO_NUMBER``.
+                                      Numeric values pass through.
+                                      Unknown / missing → 0.0.
+        * ``log1p_popularity_rank`` — log1p of the band-mapped numeric.
+        * ``popularity_count``      — raw integer popularity (train-only
+                                      count); the dense numeric the
+                                      encoder cannot extract from the
+                                      coarse band label.
+        * ``log1p_popularity_count``— log1p(popularity_count).
+        * ``is_repeat``             — 1.0 if the customer has bought
+                                      this ASIN in train history, else
+                                      0.0. Read from
+                                      ``alt_texts[j]["is_repeat"]``
+                                      (per-alt train-history map);
+                                      falls back to legacy chosen-only
+                                      ``metadata["is_repeat"]``.
     Adding a record-family feature requires non-None ``records``; passing
     ``records=None`` while requesting one raises ``ValueError`` at the
     caller's boundary so a typo in YAML surfaces here rather than as a
@@ -131,7 +160,9 @@ def _build_x_tab_matrix(
     # Record-family features need rec["alt_texts"][j].<key>. Validate up
     # front so a typo or stale records list doesn't silently produce zeros.
     record_features = {
-        "popularity_rank", "log1p_popularity_rank", "is_repeat",
+        "popularity_rank", "log1p_popularity_rank",
+        "popularity_count", "log1p_popularity_count",
+        "is_repeat",
     }
     needs_records = any(name in record_features for name in feature_names)
     if needs_records and records is None:
@@ -157,6 +188,63 @@ def _build_x_tab_matrix(
             return float(v)
         except (TypeError, ValueError):
             return 0.0
+
+    def _alt_popularity_rank(rec: dict, j: int) -> float:
+        """popularity_rank is a band-label string in production
+        ("top 5%" / "top 25%" / "top 50%" / "bottom 50%") emitted by the
+        adapter for the LLM prompt. Map it to a coarse numeric via
+        _POPULARITY_BAND_TO_NUMBER. Numeric values (legacy / synthetic
+        fixtures) pass through unchanged. Unknown strings -> 0.0.
+        """
+        try:
+            alts = rec.get("alt_texts") or []
+            if j >= len(alts):
+                return 0.0
+            v = alts[j].get("popularity_rank")
+            if v is None:
+                return 0.0
+            if isinstance(v, str):
+                key = v.strip().lower()
+                for band_key, band_val in _POPULARITY_BAND_TO_NUMBER.items():
+                    if key == band_key.lower():
+                        return float(band_val)
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return 0.0
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _record_is_repeat(rec: dict, j: int) -> float:
+        """Read is_repeat for alt j.
+
+        Preferred path: rec["alt_texts"][j]["is_repeat"], populated by
+        choice_sets per-(customer, asin) train-history map. Fallback:
+        rec.get("alt_is_repeat_per_alt"). Final fallback: legacy
+        chosen-only rec["metadata"]["is_repeat"] when j is the chosen
+        index. Else 0.0.
+        """
+        try:
+            alts = rec.get("alt_texts") or []
+            if j < len(alts):
+                v = alts[j].get("is_repeat")
+                if v is not None:
+                    return float(bool(v)) if isinstance(v, bool) else float(v)
+            per_alt = rec.get("alt_is_repeat_per_alt")
+            if per_alt is not None and j < len(per_alt):
+                vv = per_alt[j]
+                return float(bool(vv)) if isinstance(vv, bool) else float(vv)
+            chosen_idx = rec.get("chosen_idx")
+            if isinstance(chosen_idx, int) and j == chosen_idx:
+                meta = rec.get("metadata") or {}
+                v = meta.get("is_repeat")
+                if v is not None:
+                    return float(bool(v)) if isinstance(v, bool) else float(v)
+            return 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
 
     for f, name in enumerate(feature_names):
         if name == "price":
@@ -184,16 +272,25 @@ def _build_x_tab_matrix(
         elif name == "popularity_rank":
             for i, rec in enumerate(records):
                 for j in range(J):
-                    out[i, j, f] = _alt_field(rec, j, "popularity_rank")
+                    out[i, j, f] = _alt_popularity_rank(rec, j)
         elif name == "log1p_popularity_rank":
             for i, rec in enumerate(records):
                 for j in range(J):
-                    pr = _alt_field(rec, j, "popularity_rank")
+                    pr = _alt_popularity_rank(rec, j)
                     out[i, j, f] = float(np.log1p(max(pr, 0.0)))
+        elif name == "popularity_count":
+            for i, rec in enumerate(records):
+                for j in range(J):
+                    out[i, j, f] = _alt_field(rec, j, "popularity_count")
+        elif name == "log1p_popularity_count":
+            for i, rec in enumerate(records):
+                for j in range(J):
+                    pc = _alt_field(rec, j, "popularity_count")
+                    out[i, j, f] = float(np.log1p(max(pc, 0.0)))
         elif name == "is_repeat":
             for i, rec in enumerate(records):
                 for j in range(J):
-                    out[i, j, f] = _alt_field(rec, j, "is_repeat")
+                    out[i, j, f] = _record_is_repeat(rec, j)
         else:
             raise ValueError(
                 f"Unsupported tabular feature {name!r}; supported: "

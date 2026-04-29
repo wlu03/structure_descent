@@ -239,10 +239,13 @@ def test_alt_text_with_percentile_fn():
 
 
 # --------------------------------------------------------------------------- #
-# alt_text — 5-key per-alternative schema (title, category, price,
-# popularity_rank, brand). state and is_repeat were removed because they
-# are per-customer (or per-customer-per-ASIN) signals that, when rendered
-# per-alt, leaked the chosen position to the encoder/LLM.
+# alt_text — 6-key per-alternative schema (title, category, price,
+# popularity_rank, popularity_count, brand). state and is_repeat were
+# removed because they are per-customer (or per-customer-per-ASIN)
+# signals that, when rendered per-alt, leaked the chosen position to
+# the encoder/LLM. popularity_count is dense numeric (per-ASIN), used
+# by the Sifringer L-MNL residual; popularity_rank string still feeds
+# the LLM prompt verbatim.
 # --------------------------------------------------------------------------- #
 
 
@@ -251,6 +254,7 @@ _FIVE_KEYS = {
     "category",
     "price",
     "popularity_rank",
+    "popularity_count",
     "brand",
 }
 

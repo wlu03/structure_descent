@@ -135,6 +135,7 @@ _ALT_KEYS: tuple[str, ...] = (
     "category",
     "price",
     "popularity_rank",
+    "popularity_count",
     "brand",
 )
 
@@ -268,9 +269,9 @@ class YamlAdapter:
     def alt_text(self, event_row: Mapping[str, Any]) -> dict[str, Any]:
         """Render the LLM-generator-visible alternative metadata.
 
-        Returns a dict with five keys: the four canonical §3.2 fields
+        Returns a dict with six keys: the four canonical §3.2 fields
         (``title``, ``category``, ``price``, ``popularity_rank``) plus
-        ``brand``. ``popularity_rank`` uses
+        ``brand`` and ``popularity_count``. ``popularity_rank`` uses
         ``self._popularity_percentile_fn(popularity)`` when that callable
         has been wired by Wave 10; until then it is a stub
         ``"popularity score N"`` string (a DEBUG log records the
@@ -323,6 +324,11 @@ class YamlAdapter:
             "category": category,
             "price": price,
             "popularity_rank": popularity_rank,
+            # Dense numeric popularity for the Sifringer L-MNL residual.
+            # The band-label string above is what the LLM prompt sees;
+            # the integer count below is what x_tab consumes (band labels
+            # collapsed every cell to 0.0 because float() raised on them).
+            "popularity_count": popularity,
             "brand": brand,
         }
 
