@@ -561,6 +561,22 @@ def _sanitize_model_id(model_id: str) -> str:
     return str(model_id).strip().replace("/", "_").lower()
 
 
+def build_cache_prompt_version(
+    prompt_version: str, K: int, model_id: str, c_d: str
+) -> str:
+    """Build the composite cache_prompt_version string.
+
+    Public helper so cache-cascade logic (e.g. in
+    :func:`src.data.batching.assemble_batch`) can compute the same composite
+    key that :func:`generate_outcomes` writes under, without going through
+    the full generation path. Mirrors lines 681-685 of
+    :func:`generate_outcomes` exactly — keep these two in sync.
+    """
+    model_id_tag = _sanitize_model_id(model_id)
+    cd_hash = hashlib.sha256(c_d.encode("utf-8")).hexdigest()[:16]
+    return f"{prompt_version}-K{int(K)}-{model_id_tag}-cd{cd_hash}"
+
+
 def generate_outcomes(
     customer_id: str,
     asin: str,
@@ -678,11 +694,16 @@ def generate_outcomes(
     # Sanitisation (``_sanitize_model_id``): strip whitespace, lower,
     # replace ``/`` → ``_``. Keeps the composite safe as a cache/fs
     # fragment regardless of provider namespacing convention.
+    cache_prompt_version = build_cache_prompt_version(
+        prompt_version=prompt_version,
+        K=K,
+        model_id=getattr(client, "model_id", "unknown"),
+        c_d=c_d,
+    )
+    # Re-derive the components for the debug log so the message is
+    # unchanged from the pre-refactor era.
     model_id_tag = _sanitize_model_id(getattr(client, "model_id", "unknown"))
     cd_hash = hashlib.sha256(c_d.encode("utf-8")).hexdigest()[:16]
-    cache_prompt_version = (
-        f"{prompt_version}-K{int(K)}-{model_id_tag}-cd{cd_hash}"
-    )
     logger.debug(
         "generate_outcomes cache composite prompt_version=%r "
         "(base=%r K=%d model_id=%r cd_hash=%s)",

@@ -239,24 +239,24 @@ def test_alt_text_with_percentile_fn():
 
 
 # --------------------------------------------------------------------------- #
-# alt_text — 7-key extended schema (brand / is_repeat / state)
+# alt_text — 5-key per-alternative schema (title, category, price,
+# popularity_rank, brand). state and is_repeat were removed because they
+# are per-customer (or per-customer-per-ASIN) signals that, when rendered
+# per-alt, leaked the chosen position to the encoder/LLM.
 # --------------------------------------------------------------------------- #
 
 
-_SEVEN_KEYS = {
+_FIVE_KEYS = {
     "title",
     "category",
     "price",
     "popularity_rank",
     "brand",
-    "is_repeat",
-    "state",
 }
 
 
-def test_alt_text_returns_seven_keys():
-    """Full event-row (post-state_features) produces all 7 keys with the
-    caller-supplied values flowing through untouched."""
+def test_alt_text_returns_five_keys():
+    """Full event-row produces exactly the 5 per-ASIN-constant keys."""
     adapter = AmazonAdapter()
     row = {
         "title": "Widget Deluxe",
@@ -264,23 +264,22 @@ def test_alt_text_returns_seven_keys():
         "price": 19.99,
         "popularity": 42,
         "brand": "Acme",
+        # The following are deliberately ignored by alt_text now:
         "routine": 2,
         "state": "CA",
     }
     out = adapter.alt_text(row)
-    assert set(out.keys()) == _SEVEN_KEYS
+    assert set(out.keys()) == _FIVE_KEYS
     assert out["title"] == "Widget Deluxe"
     assert out["category"] == "Home"
     assert out["price"] == 19.99
     assert out["popularity_rank"] == "popularity score 42"
     assert out["brand"] == "Acme"
-    assert out["is_repeat"] is True
-    assert out["state"] == "CA"
 
 
 def test_alt_text_handles_missing_fields():
-    """A minimal row with only the 4 canonical fields still returns 7 keys
-    — the 3 extras fall back to documented defaults rather than raising."""
+    """A minimal row with only the 4 canonical fields still returns 5 keys
+    — brand falls back to the documented sentinel rather than raising."""
     adapter = AmazonAdapter()
     row = {
         "title": "X",
@@ -289,10 +288,8 @@ def test_alt_text_handles_missing_fields():
         "popularity": 99,
     }
     out = adapter.alt_text(row)
-    assert set(out.keys()) == _SEVEN_KEYS
+    assert set(out.keys()) == _FIVE_KEYS
     assert out["brand"] == "unknown_brand"
-    assert out["is_repeat"] is False
-    assert out["state"] == ""
 
 
 def test_alt_text_brand_fallback():
@@ -313,54 +310,26 @@ def test_alt_text_brand_fallback():
     assert adapter.alt_text({**base, "brand": "Acme"})["brand"] == "Acme"
 
 
-def test_alt_text_is_repeat_from_routine():
-    """``routine`` > 0 ⇒ is_repeat=True; 0 or missing ⇒ False. An explicit
-    ``is_repeat`` key (if the caller wants to override for negatives) wins."""
+def test_alt_text_ignores_state_and_routine_keys():
+    """Per-customer fields in the input dict must not leak into the output.
+
+    Regression guard for the per-alternative leakage fix: a row carrying
+    ``state`` / ``routine`` / ``is_repeat`` (e.g. the chosen-alt
+    event_row) must produce the same dict as a minimal per-ASIN row, so
+    the encoder cannot distinguish chosen from negative on these fields.
+    """
     adapter = AmazonAdapter()
-    base = {"title": "t", "category": "c", "price": 1.0, "popularity": 0}
-
-    # routine semantics (the pathway exercised by the CHOSEN alternative).
-    assert adapter.alt_text({**base, "routine": 0})["is_repeat"] is False
-    assert adapter.alt_text({**base, "routine": 1})["is_repeat"] is True
-    assert adapter.alt_text({**base, "routine": 7})["is_repeat"] is True
-    # Missing routine defaults to False.
-    assert adapter.alt_text(base)["is_repeat"] is False
-
-    # Explicit ``is_repeat`` overrides routine (pathway for upstream callers
-    # that want negatives to always show is_repeat=False regardless of the
-    # row they happened to pull from the asin_lookup).
-    assert (
-        adapter.alt_text({**base, "routine": 5, "is_repeat": False})["is_repeat"]
-        is False
-    )
-    assert (
-        adapter.alt_text({**base, "routine": 0, "is_repeat": True})["is_repeat"]
-        is True
-    )
-
-
-def test_alt_text_state_passthrough():
-    """Non-empty state code passes through; missing / empty -> ''."""
-    adapter = AmazonAdapter()
-    base = {"title": "t", "category": "c", "price": 1.0, "popularity": 0}
-
-    assert adapter.alt_text({**base, "state": "CA"})["state"] == "CA"
-    assert adapter.alt_text({**base, "state": "NY"})["state"] == "NY"
-    # Missing and empty both collapse to the empty-string default.
-    assert adapter.alt_text(base)["state"] == ""
-    assert adapter.alt_text({**base, "state": ""})["state"] == ""
+    base = {"title": "t", "category": "c", "price": 1.0, "popularity": 5,
+            "brand": "Acme"}
+    chosen_row = {**base, "routine": 3, "state": "CA", "is_repeat": True}
+    negative_row = base
+    assert adapter.alt_text(chosen_row) == adapter.alt_text(negative_row)
 
 
 def test_alt_text_amazon_fixture_end_to_end(tmp_path):
-    """Load the Amazon fixture, run clean_events + compute_state_features,
-    pull one cleaned event row, and verify all 7 alt_text keys are
-    populated with sensible values.
-
-    Post-F4 (leakage fix) the ``brand`` column is no longer produced by
-    ``compute_state_features`` — it is attached by the post-split helper
-    ``attach_train_brand_map``. This test now runs the full pre-split
-    state-features pass + a temporal split + the brand map attach to
-    mirror the runner pipelines.
+    """Load the Amazon fixture, run the full pre-split + split + brand-map
+    pipeline, pull one cleaned event row, and verify alt_text returns
+    exactly the 5 per-ASIN-constant keys.
     """
     from src.data import state_features
     from src.data.clean import clean_events
@@ -376,14 +345,16 @@ def test_alt_text_amazon_fixture_end_to_end(tmp_path):
     split_df = temporal_split(featured, adapter.schema)
     featured = state_features.attach_train_brand_map(split_df)
 
-    # Sanity: the post-attach frame carries the 3 new source columns.
+    # Sanity: the post-attach frame still carries the source columns the
+    # rest of the pipeline reads (brand, routine, state) — we just no
+    # longer expose routine/state through alt_text.
     for col in ("brand", "routine", "state"):
         assert col in featured.columns, f"pipeline did not emit {col!r}"
 
     # Pick the first event row and render alt_text.
     row = featured.iloc[0].to_dict()
     out = adapter.alt_text(row)
-    assert set(out.keys()) == _SEVEN_KEYS
+    assert set(out.keys()) == _FIVE_KEYS
 
     # The canonical four still match what the row carries.
     assert out["title"] == row["title"]
@@ -393,14 +364,6 @@ def test_alt_text_amazon_fixture_end_to_end(tmp_path):
     # brand: either the real cleaned brand, or the documented fallback.
     assert isinstance(out["brand"], str)
     assert out["brand"] != ""  # the adapter promises a non-empty string
-
-    # is_repeat: boolean.
-    assert isinstance(out["is_repeat"], bool)
-    # First row per (customer, asin) after sort has routine == 0 => False.
-    assert out["is_repeat"] == (int(row.get("routine", 0) or 0) > 0)
-
-    # state: whatever the row carries (US state code) as a string.
-    assert isinstance(out["state"], str)
 
 
 # --------------------------------------------------------------------------- #

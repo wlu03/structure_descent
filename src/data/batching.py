@@ -37,7 +37,7 @@ import concurrent.futures
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, List, Sequence
+from typing import Any, Callable, Iterator, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -75,31 +75,88 @@ DEFAULT_TABULAR_FEATURE_NAMES: tuple[str, ...] = (
 )
 
 
+SUPPORTED_TABULAR_FEATURES: tuple[str, ...] = (
+    # Price-family (computed from prices_np alone, no record lookup needed).
+    "price",
+    "log1p_price",
+    "price_rank",
+    # Per-alt fields read from rec["alt_texts"][j]. Sifringer L-MNL: only
+    # add features the encoder genuinely cannot see (popularity_rank is
+    # rendered in the prompt as a coarse band, but the dense numeric value
+    # is a stronger signal that the frozen sentence-transformer struggles
+    # to extract from band labels alone).
+    "popularity_rank",
+    "log1p_popularity_rank",
+    "is_repeat",
+)
+
+
 def _build_x_tab_matrix(
     prices_np: np.ndarray,
     feature_names: tuple[str, ...],
+    records: list[dict] | None = None,
 ) -> np.ndarray:
-    """Build the per-event ``(N, J, F)`` tabular tensor from a price matrix.
+    """Build the per-event ``(N, J, F)`` tabular tensor.
 
-    Mirrors ``src/baselines/data_adapter._build_feature_matrix`` for the
-    three supported columns:
+    Supported columns (see :data:`SUPPORTED_TABULAR_FEATURES`):
 
-    * ``price``        — pass-through (already non-negative).
-    * ``log1p_price``  — ``log1p(max(price, 0))``.
-    * ``price_rank``   — within-event dense rank of ``price`` scaled to
-                         ``[0, 1]``; constant within events of size 1.
+    Price-family (computed from ``prices_np``):
+        * ``price``        — pass-through (already non-negative).
+        * ``log1p_price``  — ``log1p(max(price, 0))``.
+        * ``price_rank``   — within-event dense rank of ``price`` scaled to
+                             ``[0, 1]``; constant within events of size 1.
 
-    Any unrecognised column name raises ``ValueError`` at the caller's
-    boundary so a typo in YAML surfaces here rather than as a silent
-    column of zeros down in the optimizer.
+    Record-family (read from ``records[i]["alt_texts"][j]``):
+        * ``popularity_rank``       — numeric rank as written by
+                                      ``state_features.attach_train_popularity``.
+                                      Missing keys → 0.0 (a sentinel for
+                                      "ASIN unseen in train"; matches the
+                                      contract for unseen-popularity rows).
+        * ``log1p_popularity_rank`` — derived from popularity_rank.
+        * ``is_repeat``             — 1.0 / 0.0; missing → 0.0.
+
+    Adding a record-family feature requires non-None ``records``; passing
+    ``records=None`` while requesting one raises ``ValueError`` at the
+    caller's boundary so a typo in YAML surfaces here rather than as a
+    silent column of zeros downstream.
     """
     N, J = prices_np.shape
     F = len(feature_names)
     out = np.zeros((N, J, F), dtype=np.float32)
 
-    # Pre-compute price_rank lazily; only some configs request it.
+    # Pre-compute price-derived columns lazily.
     log1p_prices: np.ndarray | None = None
     price_ranks: np.ndarray | None = None
+
+    # Record-family features need rec["alt_texts"][j].<key>. Validate up
+    # front so a typo or stale records list doesn't silently produce zeros.
+    record_features = {
+        "popularity_rank", "log1p_popularity_rank", "is_repeat",
+    }
+    needs_records = any(name in record_features for name in feature_names)
+    if needs_records and records is None:
+        raise ValueError(
+            "tabular feature(s) "
+            + ", ".join(repr(n) for n in feature_names if n in record_features)
+            + " require ``records`` to be passed; got None."
+        )
+    if needs_records and len(records) != N:
+        raise ValueError(
+            f"records length ({len(records)}) does not match prices N ({N})."
+        )
+
+    def _alt_field(rec: dict, j: int, key: str) -> float:
+        """Extract a numeric per-alt field from rec['alt_texts'][j]; 0 on miss."""
+        try:
+            alts = rec.get("alt_texts") or []
+            if j >= len(alts):
+                return 0.0
+            v = alts[j].get(key)
+            if v is None:
+                return 0.0
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
 
     for f, name in enumerate(feature_names):
         if name == "price":
@@ -124,10 +181,23 @@ def _build_x_tab_matrix(
                 # else: J=1 leaves the column at zero, which is the
                 # documented behaviour of _price_rank in data_adapter.
             out[:, :, f] = price_ranks
+        elif name == "popularity_rank":
+            for i, rec in enumerate(records):
+                for j in range(J):
+                    out[i, j, f] = _alt_field(rec, j, "popularity_rank")
+        elif name == "log1p_popularity_rank":
+            for i, rec in enumerate(records):
+                for j in range(J):
+                    pr = _alt_field(rec, j, "popularity_rank")
+                    out[i, j, f] = float(np.log1p(max(pr, 0.0)))
+        elif name == "is_repeat":
+            for i, rec in enumerate(records):
+                for j in range(J):
+                    out[i, j, f] = _alt_field(rec, j, "is_repeat")
         else:
             raise ValueError(
                 f"Unsupported tabular feature {name!r}; supported: "
-                f"price, log1p_price, price_rank."
+                + ", ".join(SUPPORTED_TABULAR_FEATURES) + "."
             )
 
     return out
@@ -326,6 +396,7 @@ def assemble_batch(
     K: int = 3,
     seed: int = 0,
     prompt_version: str = "v1",
+    prompt_version_cascade: Sequence[str] | None = None,
     diversity_filter: Callable[[list[str]], tuple[list[str], bool]] | None = None,
     omega: np.ndarray | None = None,
     progress: bool = False,
@@ -496,8 +567,60 @@ def assemble_batch(
     # whether a stub-origin outcome is contamination or expected.
     caller_is_stub = _is_stub_client(llm_client)
 
+    # Curriculum-refinement cascade: when ``prompt_version_cascade`` is
+    # provided, prefer cache hits under earlier versions (e.g. "v2_refined")
+    # and only fall through to ``generate_outcomes`` (which may LLM-call)
+    # under the LAST version. This lets the third PO-LEU training round
+    # pick up refined outcomes for failure events while reusing the v1
+    # cache for everything else — no surprise regeneration cost.
+    cascade: tuple[str, ...] = (
+        tuple(prompt_version_cascade)
+        if prompt_version_cascade
+        else (prompt_version,)
+    )
+    # The version under which generate_outcomes is allowed to write a NEW
+    # entry on full miss. Always the last in the cascade.
+    fallback_pv = cascade[-1]
+
+    def _try_cache_only(
+        rec: dict, j: int, pv: str
+    ) -> Optional[list[str]]:
+        """Cache-only lookup for one (event, alt, prompt_version)."""
+        if thread_safe_cache is None:
+            return None
+        from src.outcomes.generate import build_cache_prompt_version
+        cache_pv = build_cache_prompt_version(
+            prompt_version=pv,
+            K=K,
+            model_id=getattr(llm_client, "model_id", "unknown"),
+            c_d=rec["c_d"],
+        )
+        cached = thread_safe_cache.get_outcomes(
+            str(rec["customer_id"]),
+            str(rec["choice_asins"][j]),
+            seed,
+            cache_pv,
+        )
+        if cached is None:
+            return None
+        outs = list(cached.get("outcomes", []))
+        if len(outs) != int(K):
+            return None  # legacy K mismatch — let generate_outcomes regen
+        return outs
+
     def _generate_one(i: int, j: int) -> tuple[int, int, list[str]]:
         rec = records[i]
+        # Try every preferred version in the cascade FIRST; only the last
+        # version is permitted to actually call the LLM.
+        for pv_pref in cascade[:-1]:
+            preferred = _try_cache_only(rec, j, pv_pref)
+            if preferred is not None:
+                if len(preferred) != K:
+                    raise AssertionError(
+                        f"cascade hit at {pv_pref!r} for records[{i}] alt[{j}] "
+                        f"returned {len(preferred)} outcomes, expected K={K}"
+                    )
+                return (i, j, preferred)
         payload = generate_outcomes(
             customer_id=str(rec["customer_id"]),
             asin=str(rec["choice_asins"][j]),
@@ -505,7 +628,7 @@ def assemble_batch(
             alt=rec["alt_texts"][j],
             K=K,
             seed=seed,
-            prompt_version=prompt_version,
+            prompt_version=fallback_pv,
             client=llm_client,
             cache=thread_safe_cache,
             diversity_filter=diversity_filter,
@@ -644,7 +767,7 @@ def assemble_batch(
     if tabular_feature_names is not None:
         tab_names = tuple(tabular_feature_names)
         if tab_names:  # empty tuple => skip silently (config off-switch)
-            x_tab_np = _build_x_tab_matrix(prices_np, tab_names)
+            x_tab_np = _build_x_tab_matrix(prices_np, tab_names, records)
             x_tab_t = torch.from_numpy(x_tab_np).to(torch.float32)
             if x_tab_t.shape != (N, J, len(tab_names)):
                 raise AssertionError(

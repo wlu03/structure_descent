@@ -20,7 +20,6 @@ from src.baselines import BaselineEventBatch, FittedBaseline
 from src.baselines.st_mlp_ablation import (
     STMLPChoice,
     STMLPFitted,
-    _is_repeat_one_hot_on_chosen,
     _mlp_param_count,
     _render_alt_text,
 )
@@ -39,18 +38,20 @@ def _default_alt(
     price: float = 9.99,
     popularity_rank: Any = "popularity score 100",
     brand: str = "Acme",
-    is_repeat: bool = False,
-    state: str = "CA",
 ) -> Dict[str, Any]:
-    """7-key alt dict matching :func:`src.data.adapter.alt_text`'s contract."""
+    """5-key alt dict matching :func:`src.data.adapter.alt_text`'s contract.
+
+    ``state`` and ``is_repeat`` were intentionally removed from the
+    adapter contract because they are per-customer signals that, when
+    rendered per-alternative, leaked the chosen position to the
+    encoder. See :func:`src.data.adapter.YamlAdapter.alt_text`.
+    """
     return {
         "title": title,
         "category": category,
         "price": price,
         "popularity_rank": popularity_rank,
         "brand": brand,
-        "is_repeat": is_repeat,
-        "state": state,
     }
 
 
@@ -106,7 +107,6 @@ def _planted_signal_batch(
     J: int,
     keyword: str,
     seed: int,
-    leak_is_repeat: bool = False,
 ) -> BaselineEventBatch:
     """Construct a batch with a **constant** signal on the chosen alt.
 
@@ -133,7 +133,6 @@ def _planted_signal_batch(
             alts.append(
                 _default_alt(
                     title=title,
-                    is_repeat=(leak_is_repeat and j == chosen),
                     popularity_rank="popularity score 50",
                 )
             )
@@ -152,15 +151,13 @@ def _planted_signal_batch(
 
 
 def test_render_alt_text_format():
-    """All 7 fields render; no ``None`` / ``nan`` substrings."""
+    """All 5 fields render; no ``None`` / ``nan`` substrings."""
     alt = _default_alt(
         title="Hydro Flask 32oz",
         category="Drinkware",
         price=44.95,
         popularity_rank="popularity score 7",
         brand="Hydro Flask",
-        is_repeat=True,
-        state="NY",
     )
     out = _render_alt_text(alt)
     assert "Hydro Flask 32oz" in out
@@ -168,8 +165,9 @@ def test_render_alt_text_format():
     assert "Brand: Hydro Flask" in out
     assert "Price: $44.9" in out or "Price: $45.0" in out  # {:.1f} round
     assert "Popularity: popularity score 7" in out
-    assert "Repeat purchase: True" in out
-    assert "State: NY" in out
+    # Per-customer fields must NOT appear in per-alt text (leak fix).
+    assert "Repeat purchase" not in out
+    assert "State" not in out
     assert "None" not in out
     assert "nan" not in out.lower()
 
@@ -183,7 +181,6 @@ def test_render_alt_text_missing_fields_fall_back():
             "price": None,
             "popularity_rank": None,
             "brand": None,
-            "state": None,
         }
     )
     assert "unknown title" in out
@@ -198,18 +195,24 @@ def test_render_alt_text_stable_across_calls():
     """Same dict → byte-identical string (cache-key stability)."""
     alt = _default_alt()
     assert _render_alt_text(alt) == _render_alt_text(alt)
-    assert _render_alt_text(alt, drop_is_repeat=True) == _render_alt_text(
-        alt, drop_is_repeat=True
+    assert _render_alt_text(alt, drop_popularity=True) == _render_alt_text(
+        alt, drop_popularity=True
     )
 
 
-def test_render_alt_text_drop_is_repeat_omits_sentence():
-    """``drop_is_repeat=True`` omits the Repeat-purchase sentence entirely."""
-    alt = _default_alt(is_repeat=True)
-    with_repeat = _render_alt_text(alt, drop_is_repeat=False)
-    without_repeat = _render_alt_text(alt, drop_is_repeat=True)
-    assert "Repeat purchase" in with_repeat
-    assert "Repeat purchase" not in without_repeat
+def test_render_alt_text_ignores_legacy_state_and_is_repeat_keys():
+    """Legacy 7-key dicts must render identically to canonical 5-key dicts.
+
+    Regression guard for the per-alternative leakage fix: if a caller
+    accidentally passes a dict still carrying ``state`` / ``is_repeat``
+    (e.g. from a stale cache or out-of-tree adapter), the renderer must
+    ignore those keys so chosen and negative still encode identically.
+    """
+    canonical = _default_alt()
+    legacy = dict(canonical)
+    legacy["state"] = "CA"
+    legacy["is_repeat"] = True
+    assert _render_alt_text(canonical) == _render_alt_text(legacy)
 
 
 def test_render_alt_text_price_coerces_nonnumeric():
@@ -335,76 +338,6 @@ def test_fit_learns_synthetic_signal():
     truth = np.asarray(val.chosen_indices)
     top1 = float((preds == truth).mean())
     assert top1 > 1.0 / J + 0.1, f"top1={top1:.3f} should beat chance 1/J={1/J:.3f}"
-
-
-# ---------------------------------------------------------------------------
-# is_repeat auto-drop
-# ---------------------------------------------------------------------------
-
-
-def test_is_repeat_auto_drop_when_one_hot_on_chosen():
-    """1-hot ``is_repeat`` pattern → fitted model drops the sentence."""
-    encoder = StubEncoder(d_e=16)
-    batch = _planted_signal_batch(
-        n_events=10, J=3, keyword="epsilon", seed=5, leak_is_repeat=True
-    )
-    # Sanity: the detector sees the pattern.
-    alt_texts = [ev["alt_texts"] for ev in batch.raw_events]  # type: ignore[index]
-    assert _is_repeat_one_hot_on_chosen(alt_texts, batch.chosen_indices) is True
-
-    fitted = STMLPChoice(
-        hidden_dim=8,
-        n_epochs=1,
-        batch_size=4,
-        patience=1,
-        encoder=encoder,
-        seed=0,
-        drop_is_repeat="auto",
-    ).fit(batch, batch)
-    assert fitted.drop_is_repeat is True
-
-    # And the rendered string used for scoring omits the sentence.
-    sample = _render_alt_text(
-        batch.raw_events[0]["alt_texts"][0],  # type: ignore[index]
-        drop_is_repeat=fitted.drop_is_repeat,
-    )
-    assert "Repeat purchase" not in sample
-
-
-def test_is_repeat_auto_keeps_sentence_when_not_leaking():
-    """Non-leak pattern (all False) → ``drop_is_repeat`` stays False."""
-    encoder = StubEncoder(d_e=16)
-    batch = _planted_signal_batch(
-        n_events=10, J=3, keyword="zeta", seed=6, leak_is_repeat=False
-    )
-    fitted = STMLPChoice(
-        hidden_dim=8,
-        n_epochs=1,
-        batch_size=4,
-        patience=1,
-        encoder=encoder,
-        seed=0,
-        drop_is_repeat="auto",
-    ).fit(batch, batch)
-    assert fitted.drop_is_repeat is False
-
-
-def test_is_repeat_explicit_false_overrides_auto_detection():
-    """``drop_is_repeat=False`` keeps the sentence even if the pattern trips."""
-    encoder = StubEncoder(d_e=16)
-    batch = _planted_signal_batch(
-        n_events=10, J=3, keyword="eta", seed=8, leak_is_repeat=True
-    )
-    fitted = STMLPChoice(
-        hidden_dim=8,
-        n_epochs=1,
-        batch_size=4,
-        patience=1,
-        encoder=encoder,
-        seed=0,
-        drop_is_repeat=False,
-    ).fit(batch, batch)
-    assert fitted.drop_is_repeat is False
 
 
 # ---------------------------------------------------------------------------

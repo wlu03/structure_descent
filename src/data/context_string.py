@@ -43,6 +43,7 @@ __all__ = [
     "DEFAULT_PHRASINGS",
     "build_context_string",
     "extract_extra_fields_from_row",
+    "compute_customer_aggregates",
     "paraphrase_rules_check",
 ]
 
@@ -455,6 +456,39 @@ def build_context_string(
     if extras.get("amazon_frequency"):
         lines.append(f"- Shops on Amazon {extras['amazon_frequency']}.")
 
+    # Customer-aggregate enrichment (opt-in via YAML
+    # ``data.enrich_customer_context``; ignored when fields are absent).
+    # The encoder cannot otherwise see brand affinity / category density
+    # / typical price tier — these clauses give it that signal.
+    if extras.get("top_brand"):
+        lines.append(
+            f"- Most-purchased brand in their history: {extras['top_brand']}."
+        )
+    if extras.get("top_categories"):
+        cats = extras["top_categories"]
+        if isinstance(cats, (list, tuple)) and cats:
+            joined = ", ".join(str(c) for c in cats[:3])
+            lines.append(f"- Top categories they shop: {joined}.")
+    if extras.get("avg_price") is not None:
+        try:
+            ap = float(extras["avg_price"])
+            if ap > 0.0:
+                lines.append(
+                    f"- Typical purchase price: about ${ap:.0f}."
+                )
+        except (TypeError, ValueError):
+            pass
+    if extras.get("repeat_rate") is not None:
+        try:
+            rr = float(extras["repeat_rate"])
+            if 0.0 <= rr <= 1.0:
+                lines.append(
+                    f"- About {int(round(100 * rr))}% of their purchases "
+                    f"are repeats of items they have bought before."
+                )
+        except (TypeError, ValueError):
+            pass
+
     # --- optional lines --------------------------------------------------
     if recent_purchases:
         joined = ", ".join(str(p) for p in recent_purchases)
@@ -466,18 +500,19 @@ def build_context_string(
     text = "\n".join(lines)
     paraphrase_rules_check(text, row)
 
-    # Relaxed floor: 2-12 non-empty lines. The paper's "5-8 short lines"
+    # Relaxed floor: 2-16 non-empty lines. The paper's "5-8 short lines"
     # target still stands as an intent; we WARN rather than hard-fail
     # below 5 so adapter-driven sentinel suppression (Amazon: has_kids,
     # city_size, health_rating, risk_tolerance) doesn't block rendering.
-    # The Wave-11 ``extra_fields`` kwarg can push the count upward —
-    # gender rides inline so adds 0 lines, life_event adds 1,
-    # amazon_frequency adds 1, and the two optional lines (recent /
-    # current_time) add up to 2 more — hence the relaxed ceiling of 12.
+    # The ``extra_fields`` kwarg can push the count upward — gender rides
+    # inline so adds 0 lines, life_event +1, amazon_frequency +1, the
+    # customer-aggregate enrichment (top_brand, top_categories,
+    # avg_price, repeat_rate) +4, and the two optional lines (recent /
+    # current_time) +2 — hence the relaxed ceiling of 16.
     n_lines = sum(1 for ln in text.split("\n") if ln.strip())
-    if not 2 <= n_lines <= 12:
+    if not 2 <= n_lines <= 16:
         raise AssertionError(
-            f"context string has {n_lines} non-empty lines; expected 2-12"
+            f"context string has {n_lines} non-empty lines; expected 2-16"
         )
     if n_lines < 5:
         logger.warning(
@@ -535,7 +570,7 @@ def _is_missing(value: Any) -> bool:
 
 def _normalize_extra_fields(
     extra_fields: Mapping[str, Any] | None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Return a dict of already-paraphrased extra-field phrases.
 
     Missing / unrecognized entries are silently dropped (so callers can
@@ -550,7 +585,7 @@ def _normalize_extra_fields(
       a known survey option; otherwise dropped (never passed through, to
       avoid leaking "More than 10 times per month" verbatim).
     """
-    out: dict[str, str] = {}
+    out: dict[str, Any] = {}
     if extra_fields is None:
         return out
 
@@ -584,6 +619,17 @@ def _normalize_extra_fields(
         # else: unknown freq → drop silently (never leak raw "10 times"
         # through; paraphrase_rules_check wouldn't block it, but the
         # Wave-11 test asserts the raw form is absent).
+
+    # Customer-aggregate enrichment keys (opt-in via
+    # ``data.enrich_customer_context`` in run_dataset.py). These are
+    # already-paraphrased / numeric values; pass through unchanged when
+    # present and non-missing. The renderer guards against bad numerics
+    # itself (e.g. negative avg_price → skipped clause), so we don't
+    # need to re-validate here.
+    for key in ("top_brand", "top_categories", "avg_price", "repeat_rate"):
+        val = extra_fields.get(key)
+        if not _is_missing(val):
+            out[key] = val
 
     return out
 
@@ -665,6 +711,68 @@ def extract_extra_fields_from_row(
 # ---------------------------------------------------------------------------
 # Guard
 # ---------------------------------------------------------------------------
+
+def compute_customer_aggregates(events_df, *, train_only: bool = True) -> dict:
+    """Compute per-customer history aggregates for c_d enrichment.
+
+    For each customer, returns a dict with the keys consumed by the
+    ``extra_fields`` hook of :func:`build_context_string`:
+
+    * ``top_brand``       — most-frequent brand string (excluding empty)
+    * ``top_categories``  — list[str] of top-3 categories by purchase count
+    * ``avg_price``       — float, mean purchase price
+    * ``repeat_rate``     — float in [0, 1], fraction of events with
+                            ``routine > 0`` (a repeat purchase)
+
+    ``train_only=True`` filters by ``events_df["split"] == "train"`` when
+    that column is present, preventing val/test leakage when the
+    aggregates are used to render c_d for held-out customer-events. When
+    the column is absent (synthetic / pre-split inputs), the full frame
+    is used and a debug log is emitted.
+
+    Returns
+    -------
+    dict[str, dict[str, Any]]
+        Maps ``customer_id`` -> aggregate dict. Customers absent from
+        ``events_df`` (after the split filter) do not appear in the
+        output. Callers should fall back gracefully on missing keys.
+    """
+    import pandas as pd  # local import keeps this module light-weight
+
+    df = events_df
+    if train_only and "split" in df.columns:
+        df = df[df["split"] == "train"]
+    if df.empty:
+        return {}
+
+    out: dict[str, dict] = {}
+
+    has_brand = "brand" in df.columns
+    has_price = "price" in df.columns
+    has_routine = "routine" in df.columns
+
+    for cid, group in df.groupby("customer_id", sort=False):
+        agg: dict = {}
+        if has_brand:
+            brands = group["brand"].astype(str)
+            brands = brands[
+                brands.notna() & (brands != "") & (brands != "nan")
+            ]
+            if not brands.empty:
+                agg["top_brand"] = brands.mode().iloc[0]
+        if "category" in group.columns:
+            cat_counts = group["category"].astype(str).value_counts()
+            agg["top_categories"] = cat_counts.head(3).index.tolist()
+        if has_price:
+            prices = pd.to_numeric(group["price"], errors="coerce")
+            prices = prices[prices > 0]
+            if not prices.empty:
+                agg["avg_price"] = float(prices.mean())
+        if has_routine:
+            agg["repeat_rate"] = float((group["routine"] > 0).mean())
+        out[cid] = agg
+    return out
+
 
 def paraphrase_rules_check(text: str, row: Mapping[str, Any]) -> None:
     """Assert the rendered text obeys the paraphrase rules of §2.2.

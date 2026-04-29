@@ -33,12 +33,31 @@ model:
   # already renders a popularity band, so adding it numerically
   # creates an identifiability fight (see src/model/po_leu.py).
   tabular_residual:
-    enabled: false
-    features: [price, log1p_price, price_rank]
+    enabled: true
+    features:
+      - price
+      - log1p_price
+      - price_rank
+      - popularity_rank          # added: dense numeric popularity (encoder
+      - log1p_popularity_rank    #         only sees coarse band in prompt)
+      - is_repeat                # added: 1 if customer bought this ASIN
+                                 #         before; the encoder has no path
+                                 #         to this signal
 
 data:
   split: temporal      # reuses v2.0 split artifact
   choice_set_size: 10  # J
+  # Hard-negative sampling: replace some random negatives with
+  # same-category + price-similar ASINs (rate of n_negatives, price within
+  # ±band of chosen). Forces PO-LEU to discriminate on subtle signals
+  # instead of obvious distractors. 0.0 = legacy half-cat / half-random.
+  hard_negative_rate: 0.3
+  hard_negative_price_band: 0.5
+  # Customer-aggregate c_d enrichment: adds top_brand / top_categories /
+  # avg_price / repeat_rate clauses to the customer context string the
+  # LLM sees during outcome generation. Train-only aggregates (no
+  # val/test leakage). false = legacy c_d.
+  enrich_customer_context: true
 
 outcomes:
   K: 3

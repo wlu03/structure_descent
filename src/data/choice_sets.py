@@ -137,6 +137,8 @@ def build_choice_sets(
     recent_purchases_window_days: int = 30,
     max_recent_purchases: int = 5,
     drop_pool_starved: bool = False,
+    hard_negative_rate: float = 0.0,
+    hard_negative_price_band: float = 0.5,
 ) -> list[dict]:
     """Return per-event choice-set records with ``z_d`` and ``c_d`` attached.
 
@@ -352,6 +354,11 @@ def build_choice_sets(
         ref_df.sort_values("order_date", kind="mergesort")
         .drop_duplicates(subset=["asin"], keep="first")
     )
+    # ``brand`` is per-ASIN (set by attach_train_brand_map; broadcast to
+    # every row of the same ASIN), so reading it from first_seen_rows
+    # gives the same value the chosen path reads from df["brand"]. Adding
+    # it here closes the chosen-vs-negative leak where negatives used to
+    # render as "unknown_brand" while the chosen carried the real brand.
     asin_lookup: dict = {
         row["asin"]: {
             "title": row.get("title", "") if "title" in first_seen_rows.columns else "",
@@ -361,6 +368,11 @@ def build_choice_sets(
                 int(row.get("popularity", 0) or 0)
                 if "popularity" in first_seen_rows.columns
                 else 0
+            ),
+            "brand": (
+                str(row.get("brand", "") or "")
+                if "brand" in first_seen_rows.columns
+                else ""
             ),
         }
         for _, row in first_seen_rows.iterrows()
@@ -373,6 +385,7 @@ def build_choice_sets(
         "category": "",
         "price": 0.0,
         "popularity": 0,
+        "brand": "",
     }
 
     # --------------------------------------------------------------- #
@@ -403,8 +416,20 @@ def build_choice_sets(
         n_negatives,
     )
 
-    n_cat_neg = n_negatives // 2
-    n_rand_neg = n_negatives - n_cat_neg
+    # Hard-negative budget: when ``hard_negative_rate`` > 0, ``n_hard_neg``
+    # negatives per event come from the same-category, price-band-similar
+    # sampler. The remaining slots split between same-category (without
+    # price band) and popularity-weighted random, preserving the existing
+    # ratio. Default rate=0 reproduces the prior n_cat_neg / n_rand_neg
+    # allocation bit-identically.
+    if not (0.0 <= float(hard_negative_rate) <= 1.0):
+        raise ValueError(
+            f"hard_negative_rate must be in [0, 1]; got {hard_negative_rate!r}"
+        )
+    n_hard_neg = int(round(float(hard_negative_rate) * n_negatives))
+    n_remaining = n_negatives - n_hard_neg
+    n_cat_neg = n_remaining // 2
+    n_rand_neg = n_remaining - n_cat_neg
 
     order_dates_ns = (
         pd.to_datetime(df["order_date"]).to_numpy().astype("datetime64[ns]")
@@ -450,11 +475,23 @@ def build_choice_sets(
         pop_by_code = np.ones(n_catalog, dtype=np.float64)
     pop_by_code = pop_by_code + 1e-6
 
+    # Per-ASIN price (used by hard-negative sampling). Pulled from
+    # asin_lookup which itself reads from the train-only ``ref_df`` first-
+    # seen row, so under cold-start splits this stays leakage-safe.
+    # ASINs missing from the lookup get 0.0; the hard-neg sampler treats
+    # 0-priced rows as "no price info" and falls back to the cat-only
+    # filter for those events.
+    price_by_code = np.array(
+        [float(asin_lookup.get(catalog[c], _DEFAULT_ALT)["price"]) for c in range(n_catalog)],
+        dtype=np.float64,
+    )
+
     # Sort catalog by first-seen date so we can binary-search the
     # available prefix at each event's order_date.
     sort_by_first = np.argsort(first_seen_by_code, kind="stable")
     sorted_first_seen = first_seen_by_code[sort_by_first]
     sorted_pop = pop_by_code[sort_by_first]
+    sorted_price = price_by_code[sort_by_first]
     asin_to_cat_code = (
         pd.DataFrame({"a": asin_cat.codes, "c": cat_codes})
         .groupby("a")["c"]
@@ -478,6 +515,7 @@ def build_choice_sets(
         [np.empty(0, dtype="datetime64[ns]")] * n_cats
     )
     cat_to_sorted_pop: List[np.ndarray] = [np.empty(0, dtype=np.float64)] * n_cats
+    cat_to_sorted_price: List[np.ndarray] = [np.empty(0, dtype=np.float64)] * n_cats
     for c in range(n_cats):
         if c == unknown_cat_code:
             continue
@@ -485,6 +523,7 @@ def build_choice_sets(
         cat_to_sorted_idxs[c] = sort_by_first[mask]
         cat_to_sorted_first_seen[c] = sorted_first_seen[mask]
         cat_to_sorted_pop[c] = sorted_pop[mask]
+        cat_to_sorted_price[c] = sorted_price[mask]
 
     def _sample_random(
         avail_len: int, chosen_code: int, k: int, local_rng
@@ -513,6 +552,57 @@ def build_choice_sets(
     ) -> np.ndarray:
         prefix = int(np.searchsorted(sorted_first_seen, event_date, side="left"))
         return _sample_random(prefix, chosen_code, k, local_rng)
+
+    def _sample_hard_neg_for_event(
+        cat_code: int,
+        event_date,
+        chosen_code: int,
+        chosen_price: float,
+        k: int,
+        local_rng,
+        price_band: float,
+    ) -> np.ndarray:
+        """Sample ``k`` negatives that are same-category AND price-similar.
+
+        ``price_band`` is the symmetric multiplicative width: e.g. 0.5
+        accepts ASINs with price in ``[0.5*chosen_price, 1.5*chosen_price]``.
+        Falls back to :func:`_sample_same_cat` when the chosen price is
+        zero / missing or when fewer than 2 ASINs survive the band filter
+        (the band restriction would otherwise collapse to a single ASIN
+        which we can't deduplicate).
+        """
+        if chosen_price <= 0.0 or cat_code < 0 or cat_code == unknown_cat_code:
+            return _sample_same_cat(cat_code, event_date, chosen_code, k, local_rng)
+        sub_first = cat_to_sorted_first_seen[cat_code]
+        if sub_first.size == 0:
+            return _sample_same_cat(cat_code, event_date, chosen_code, k, local_rng)
+        prefix = int(np.searchsorted(sub_first, event_date, side="left"))
+        if prefix <= 1:
+            return _sample_same_cat(cat_code, event_date, chosen_code, k, local_rng)
+        sub_idx = cat_to_sorted_idxs[cat_code][:prefix]
+        sub_pop = cat_to_sorted_pop[cat_code][:prefix]
+        sub_price = cat_to_sorted_price[cat_code][:prefix]
+        lo = chosen_price * (1.0 - price_band)
+        hi = chosen_price * (1.0 + price_band)
+        band_mask = (sub_price >= lo) & (sub_price <= hi) & (sub_price > 0.0)
+        n_in_band = int(band_mask.sum())
+        if n_in_band < 2:
+            return _sample_same_cat(cat_code, event_date, chosen_code, k, local_rng)
+        b_idx = sub_idx[band_mask]
+        b_pop = sub_pop[band_mask]
+        p_sum = b_pop.sum()
+        if p_sum <= 0:
+            picks = local_rng.integers(0, n_in_band, size=k)
+        else:
+            picks = local_rng.choice(
+                n_in_band, size=k, replace=True, p=b_pop / p_sum
+            )
+        sampled = b_idx[picks]
+        coll = sampled == chosen_code
+        if coll.any():
+            bumped = np.where(coll, b_idx[(picks + 1) % n_in_band], sampled)
+            sampled = bumped
+        return sampled.astype(np.int64)
 
     def _sample_same_cat(
         cat_code: int, event_date, chosen_code: int, k: int, local_rng
@@ -723,13 +813,29 @@ def build_choice_sets(
                     ev_date, chosen_code, n_negatives, local_rng
                 )
             else:
-                cat_negs = _sample_same_cat(
-                    ev_cat_code, ev_date, chosen_code, n_cat_neg, local_rng
+                pieces: list[np.ndarray] = []
+                if n_hard_neg > 0:
+                    chosen_price_i = float(prices[i]) if i < len(prices) else 0.0
+                    hard_negs = _sample_hard_neg_for_event(
+                        ev_cat_code, ev_date, chosen_code, chosen_price_i,
+                        n_hard_neg, local_rng,
+                        price_band=float(hard_negative_price_band),
+                    )
+                    pieces.append(hard_negs)
+                if n_cat_neg > 0:
+                    cat_negs = _sample_same_cat(
+                        ev_cat_code, ev_date, chosen_code, n_cat_neg, local_rng
+                    )
+                    pieces.append(cat_negs)
+                if n_rand_neg > 0:
+                    rand_negs = _sample_random_for_event_avail(
+                        ev_date, chosen_code, n_rand_neg, local_rng
+                    )
+                    pieces.append(rand_negs)
+                negs = (
+                    np.concatenate(pieces) if pieces
+                    else np.empty(0, dtype=np.int64)
                 )
-                rand_negs = _sample_random_for_event_avail(
-                    ev_date, chosen_code, n_rand_neg, local_rng
-                )
-                negs = np.concatenate([cat_negs, rand_negs])
 
             # --- Dedup guard (Wave 11 post-dryrun fix) ----------------- #
             # The popularity-weighted samplers draw with replacement and
@@ -808,21 +914,22 @@ def build_choice_sets(
             dedup_fallback_per_k.append(dedup_fallback)
 
         # Build the chosen-alt dict from the event's own row (policy: the
-        # chosen item IS the event, no lookup needed). V3-B1 fix:
-        # thread routine/brand/state so ``adapter.alt_text`` can derive
-        # ``is_repeat`` (from routine > 0) and populate brand/state on
-        # the chosen alternative — previously these were dropped, so
-        # every CHOSEN alt silently rendered ``is_repeat=False`` and
-        # ``brand="unknown_brand"`` regardless of ground truth.
+        # chosen item IS the event). Only per-ASIN-constant fields are
+        # included, so the chosen and negative paths render to identical
+        # alt_text dicts for the same ASIN. ``state``/``routine``/
+        # ``is_repeat`` were intentionally removed — those are
+        # per-customer (or per-customer-per-ASIN) signals that, when
+        # rendered per-alternative, leaked the chosen position to the
+        # encoder/LLM (only the chosen alt carried the real value;
+        # negatives fell back to defaults). Per-customer signal belongs
+        # in z_d, not here.
         chosen_asin = catalog[chosen_code]
         event_row_alt = {
             "title": str(titles_arr[i] or ""),
             "category": ev_cat_name,
             "price": float(prices[i] or 0.0),
             "popularity": int(popularity_train_arr[i] or 0),
-            "routine": int(routines[i] or 0),
             "brand": str(brand_arr[i] or ""),
-            "state": str(state_arr[i] or ""),
         }
 
         if n_resamples == 1:

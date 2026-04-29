@@ -1,6 +1,6 @@
 """ST+MLP Ablation — "PO-LEU minus narratives".
 
-Embeds the 7-key alt metadata dict with the same frozen encoder PO-LEU
+Embeds the 5-key alt metadata dict with the same frozen encoder PO-LEU
 uses (``sentence-transformers/all-mpnet-base-v2``) and trains a small
 MLP ``(d_e -> 64 -> 1)``. The resulting per-alt scalar is softmaxed
 across ``J`` alternatives and trained against ``c_star`` under
@@ -59,26 +59,32 @@ from .base import BaselineEventBatch, FittedBaseline
 def _render_alt_text(
     alt: Mapping[str, Any],
     *,
-    drop_is_repeat: bool = False,
+    drop_popularity: bool = False,
 ) -> str:
-    """Render a 7-key ``alt_texts`` dict into a single sentence.
+    """Render a 5-key ``alt_texts`` dict into a single sentence.
 
     Canonical key ordering; every event uses the same template so the
     frozen encoder sees a stationary prompt. Missing / ``None`` values
     collapse to sensible literals so the output is always non-empty and
     contains no ``None`` / ``nan`` substrings.
 
+    Per-alternative leakage policy: every key consumed here is per-ASIN
+    constant, so the same ASIN renders identically whether it appears as
+    the chosen alt or as a sampled negative. ``state`` and ``is_repeat``
+    are NOT rendered (they were per-customer / per-customer-per-ASIN
+    fields whose chosen-vs-negative asymmetry leaked the chosen position
+    to the encoder); see :mod:`src.data.adapter.YamlAdapter.alt_text`.
+
     Parameters
     ----------
     alt:
-        Mapping with (a subset of) the canonical keys
-        ``title, category, price, popularity_rank, brand, is_repeat,
-        state``. Produced by :func:`src.data.adapter.alt_text`.
-    drop_is_repeat:
-        If ``True`` the ``is_repeat`` sentence is omitted. Used at
-        runtime when the training batch exhibits the "is_repeat=True
-        only on the chosen alt" label-leak pattern — see §12.4 of the
-        design doc and :class:`STMLPChoice._auto_detect_is_repeat_leak`.
+        Mapping with the canonical keys
+        ``title, category, price, popularity_rank, brand``. Produced by
+        :func:`src.data.adapter.alt_text`.
+    drop_popularity:
+        If ``True`` the popularity rank is replaced with the literal
+        ``"unknown"`` so the encoder cannot read its numeric value.
+        Diagnostic for suspected popularity-as-text leakage.
 
     Notes
     -----
@@ -97,14 +103,14 @@ def _render_alt_text(
     except (TypeError, ValueError):
         price = 0.0
 
-    pop_raw = alt.get("popularity_rank", 0)
-    if pop_raw is None:
-        pop_str = "popularity score 0"
+    if drop_popularity:
+        pop_str = "unknown"
     else:
-        pop_str = str(pop_raw).strip() or "popularity score 0"
-
-    state_raw = alt.get("state")
-    state = str(state_raw).strip() if state_raw is not None else ""
+        pop_raw = alt.get("popularity_rank", 0)
+        if pop_raw is None:
+            pop_str = "popularity score 0"
+        else:
+            pop_str = str(pop_raw).strip() or "popularity score 0"
 
     parts: List[str] = [
         f"{title}.",
@@ -113,9 +119,6 @@ def _render_alt_text(
         f"Price: ${price:.1f}.",
         f"Popularity: {pop_str}.",
     ]
-    if not drop_is_repeat:
-        parts.append(f"Repeat purchase: {bool(alt.get('is_repeat', False))}.")
-    parts.append(f"State: {state}.")
     return " ".join(parts)
 
 
@@ -246,9 +249,9 @@ class STMLPFitted:
         Optional project-global :class:`EmbeddingsCache` forwarded to
         :func:`encode_batch` so scoring-time encodes hit the same cache
         PO-LEU uses.
-    drop_is_repeat
-        Whether the ``is_repeat`` sentence was dropped during training
-        (see §12.4). Scoring respects the same decision.
+    drop_popularity
+        Whether the popularity field was rendered as ``"unknown"``
+        during training. Scoring respects the same decision.
     n_params_total
         Count returned by :attr:`n_params`.
     train_nll, val_nll
@@ -264,7 +267,7 @@ class STMLPFitted:
     dropout: float
     encoder: EncoderClient
     embeddings_cache: Optional[EmbeddingsCache]
-    drop_is_repeat: bool
+    drop_popularity: bool
     n_params_total: int
     train_nll: float
     val_nll: float
@@ -294,7 +297,7 @@ class STMLPFitted:
         J = len(alt_texts_per_event[0])
 
         texts = [
-            _render_alt_text(alt, drop_is_repeat=self.drop_is_repeat)
+            _render_alt_text(alt, drop_popularity=self.drop_popularity)
             for alts in alt_texts_per_event
             for alt in alts
         ]
@@ -329,7 +332,7 @@ class STMLPFitted:
     def description(self) -> str:
         return (
             f"ST+MLP d_e={self.d_e} hidden={self.hidden} "
-            f"dropout={self.dropout:g} drop_is_repeat={self.drop_is_repeat} "
+            f"dropout={self.dropout:g} drop_popularity={self.drop_popularity} "
             f"params={self.n_params_total} "
             f"train_nll={self.train_nll:.3f} val_nll={self.val_nll:.3f}"
         )
@@ -387,36 +390,6 @@ def _encode_with_local_cache(
 
 
 # ---------------------------------------------------------------------------
-# is_repeat leak detector (design doc §12.4)
-# ---------------------------------------------------------------------------
-
-
-def _is_repeat_one_hot_on_chosen(
-    alt_texts_per_event: Sequence[Sequence[Mapping[str, Any]]],
-    chosen_indices: Sequence[int],
-) -> bool:
-    """Return ``True`` iff every event has exactly one ``is_repeat=True``
-    alt and that alt is the chosen one.
-
-    This is the label-leak pattern flagged in §12.4: ``alt_text`` returns
-    ``is_repeat=False`` for every negative (negatives come from the ASIN
-    lookup, which carries no per-customer routine), which can make
-    ``is_repeat`` 1-hot on the chosen alt and trivially solvable. The
-    guard is conservative — we require the pattern on **every** event to
-    trip it.
-    """
-    if not alt_texts_per_event:
-        return False
-    for alts, chosen in zip(alt_texts_per_event, chosen_indices):
-        flags = [bool(a.get("is_repeat", False)) for a in alts]
-        if sum(flags) != 1:
-            return False
-        if not flags[int(chosen)]:
-            return False
-    return True
-
-
-# ---------------------------------------------------------------------------
 # Fit-time class (design doc §7, §8)
 # ---------------------------------------------------------------------------
 
@@ -424,7 +397,7 @@ def _is_repeat_one_hot_on_chosen(
 class STMLPChoice:
     """ST+MLP ablation — "PO-LEU minus narratives".
 
-    Embeds the 7-key alt metadata dict with the same frozen encoder
+    Embeds the 5-key alt metadata dict with the same frozen encoder
     PO-LEU uses and trains a small MLP ``(d_e -> 64 -> 1)``. See module
     docstring for the full comparison note (design doc §11).
 
@@ -457,10 +430,13 @@ class STMLPChoice:
         Optional project-global :class:`EmbeddingsCache`. Shared with
         PO-LEU by design — the sentence format differs from narratives
         so keys do not collide.
-    drop_is_repeat
-        ``"auto"`` (default) auto-detects the §12.4 label-leak pattern
-        at fit time and drops the ``is_repeat`` sentence if triggered.
-        ``True`` / ``False`` force the behaviour.
+    drop_popularity
+        Diagnostic for popularity-as-text leakage. ``False`` (default)
+        renders the popularity rank in the encoded text. ``True``
+        replaces it with ``"unknown"`` so the encoder cannot read its
+        numeric value. Toggle this and re-fit to test whether the
+        encoder is exploiting popularity rather than learning
+        preference structure.
     """
 
     name: str = "ST+MLP"
@@ -478,7 +454,7 @@ class STMLPChoice:
         seed: int = 7,
         encoder: Optional[EncoderClient] = None,
         embeddings_cache: Optional[EmbeddingsCache] = None,
-        drop_is_repeat: Any = "auto",
+        drop_popularity: bool = False,
     ) -> None:
         if hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be positive, got {hidden_dim!r}")
@@ -492,10 +468,6 @@ class STMLPChoice:
             raise ValueError(f"n_epochs must be positive, got {n_epochs!r}")
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size!r}")
-        if drop_is_repeat not in (True, False, "auto"):
-            raise ValueError(
-                f"drop_is_repeat must be True/False/'auto', got {drop_is_repeat!r}"
-            )
 
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
@@ -507,7 +479,7 @@ class STMLPChoice:
         self.seed = int(seed)
         self.encoder = encoder
         self.embeddings_cache = embeddings_cache
-        self.drop_is_repeat = drop_is_repeat
+        self.drop_popularity = bool(drop_popularity)
 
     # ------------------------------------------------------------------
     # fit
@@ -520,9 +492,7 @@ class STMLPChoice:
     ) -> STMLPFitted:
         """Fit the MLP on ``train`` with optional early-stopping on ``val``.
 
-        The encoder is frozen throughout. If ``drop_is_repeat == 'auto'``
-        the §12.4 label-leak detector runs on the training batch before
-        any text is rendered.
+        The encoder is frozen throughout.
         """
         try:
             import torch
@@ -545,14 +515,7 @@ class STMLPChoice:
             encoder = SentenceTransformersEncoder()
         d_e = int(encoder.d_e)
 
-        # ---- label-leak guard (§12.4) ---------------------------------
         train_alt_texts = _extract_alt_texts(train)
-        if self.drop_is_repeat == "auto":
-            drop_is_repeat = _is_repeat_one_hot_on_chosen(
-                train_alt_texts, train.chosen_indices
-            )
-        else:
-            drop_is_repeat = bool(self.drop_is_repeat)
 
         # ---- seeding (§7) ----------------------------------------------
         torch.manual_seed(self.seed)
@@ -567,7 +530,7 @@ class STMLPChoice:
             train_alt_texts,
             encoder=encoder,
             local_cache=local_cache,
-            drop_is_repeat=drop_is_repeat,
+            drop_popularity=self.drop_popularity,
             d_e=d_e,
         )
         y_train_np = np.asarray(train.chosen_indices, dtype=np.int64)
@@ -579,7 +542,7 @@ class STMLPChoice:
                 val_alt_texts,
                 encoder=encoder,
                 local_cache=local_cache,
-                drop_is_repeat=drop_is_repeat,
+                drop_popularity=self.drop_popularity,
                 d_e=d_e,
             )
             y_val_np = np.asarray(val.chosen_indices, dtype=np.int64)
@@ -693,7 +656,7 @@ class STMLPChoice:
             dropout=self.dropout,
             encoder=encoder,
             embeddings_cache=self.embeddings_cache,
-            drop_is_repeat=bool(drop_is_repeat),
+            drop_popularity=self.drop_popularity,
             n_params_total=_mlp_param_count(d_e, self.hidden_dim),
             train_nll=float(train_nll),
             val_nll=float(val_nll),
@@ -710,7 +673,7 @@ class STMLPChoice:
         *,
         encoder: EncoderClient,
         local_cache: Dict[str, np.ndarray],
-        drop_is_repeat: bool,
+        drop_popularity: bool,
         d_e: int,
     ) -> np.ndarray:
         """Render + encode a batch into ``(N, J, d_e)`` float32."""
@@ -719,7 +682,7 @@ class STMLPChoice:
             return np.zeros((0, 0, d_e), dtype=np.float32)
         J = len(alt_texts_per_event[0])
         texts = [
-            _render_alt_text(alt, drop_is_repeat=drop_is_repeat)
+            _render_alt_text(alt, drop_popularity=drop_popularity)
             for alts in alt_texts_per_event
             for alt in alts
         ]

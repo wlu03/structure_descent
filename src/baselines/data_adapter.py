@@ -10,12 +10,15 @@ The current pipeline's event record schema (see
         "chosen_idx":       int in [0, J),
         "z_d":              np.ndarray (p,),       # person-only
         "c_d":              str,                   # context string
-        "alt_texts":        list[dict] (length J), # 7-key dicts from
+        "alt_texts":        list[dict] (length J), # 5-key dicts from
                                                     # adapter.alt_text
         "chosen_features":  dict,                  # chosen-alt-only
         "order_date":       pd.Timestamp,
         "category":         str,
         "metadata":         dict,                  # is_repeat, price, routine
+                                                    # (per-event labels for
+                                                    # stratification only —
+                                                    # NOT per-alt features)
     }
 
 The baseline suite's :class:`BaselineEventBatch` (see
@@ -32,7 +35,7 @@ negatives.
 
 Rather than fabricate zeros for negatives (which would artifactually
 inflate PO-LEU's relative win), this adapter exposes a **restricted,
-per-alt-verified** feature set derived purely from the 7-key
+per-alt-verified** feature set derived purely from the 5-key
 ``alt_texts`` dict + the per-record ``metadata``:
 
     - ``price``            (float)           — from ``alt_texts[j]["price"]``
@@ -47,12 +50,14 @@ per-alt-verified** feature set derived purely from the 7-key
     Two earlier candidate columns were REMOVED after an audit caught them
     leaking the label:
 
-    - ``is_repeat``:  ``alt_text()`` sets it True only on the chosen alt
-      when ``routine > 0``; every negative gets False because the ASIN
-      lookup carries no per-customer routine info. The column is
-      effectively a 1-hot indicator of "this is the chosen alt" on repeat-
-      purchase events. See ``src/baselines/st_mlp_ablation.py``'s
-      ``drop_is_repeat='auto'`` guard for the analysis.
+    - ``is_repeat``: when consumed as a per-alt feature, only the chosen
+      alt could ever be True (negatives come from a per-ASIN lookup
+      with no customer history), making it a 1-hot tell of the chosen
+      position on repeat-purchase events. The full leak audit drove a
+      separate fix: :meth:`src.data.adapter.YamlAdapter.alt_text` no
+      longer returns ``is_repeat`` (or ``state``) at all. The per-event
+      ``metadata["is_repeat"]`` field that survives is for downstream
+      stratification only and is never exposed as a per-alt feature.
     - ``brand_known``: defined as 1 iff the alt's brand matches the
       CHOSEN alt's brand. Using ``chosen_idx`` to define a per-alt
       feature is direct label leakage — at test time we don't know which
