@@ -55,6 +55,81 @@ USER_BLOCK_TEMPLATE: str = (
 
 PROMPT_VERSION: str = "v2"
 
+# ---------------------------------------------------------------------------
+# Curriculum refinement prompts (commit: critique-and-revise loop). Used by
+# :mod:`src.outcomes.refine` to fix outcomes for events the model fails on.
+# Bump :data:`REFINED_PROMPT_VERSION` when either template changes — it is
+# folded into the cache key so prior refined entries are not silently reused.
+# ---------------------------------------------------------------------------
+
+REFINED_PROMPT_VERSION: str = "v2_refined"
+
+CRITIC_SYSTEM_PROMPT: str = (
+    "You are a careful critic of first-person outcome narratives. You receive "
+    "K candidate outcomes that another model wrote for a person considering "
+    "an alternative. Score them on two axes:\n"
+    "  - plausibility (1-5): does each outcome describe something that could "
+    "realistically happen to THIS person given THIS alternative? "
+    "Penalize generic or off-topic claims.\n"
+    "  - diversity (1-5): do the K outcomes cover *different types* of "
+    "consequences (financial, health, convenience, emotional, social) — or "
+    "are they paraphrases of each other?\n"
+    "Return STRICT JSON with this schema and nothing else:\n"
+    "  {\"plausibility\": <int 1-5>, \"diversity\": <int 1-5>, "
+    "\"notes\": \"<one short sentence per weak outcome, naming the issue>\"}"
+)
+
+CRITIC_USER_TEMPLATE: str = (
+    "PERSON CONTEXT:\n"
+    "{c_d}\n"
+    "\n"
+    "ALTERNATIVE:\n"
+    "- Name/title: {title}\n"
+    "- Category: {category}\n"
+    "- Price: ${price}\n"
+    "- Popularity: {popularity_rank}\n"
+    "{optional_fields}"
+    "\n"
+    "CANDIDATE OUTCOMES (K={K}):\n"
+    "{outcomes_block}\n"
+    "\n"
+    "Return STRICT JSON only."
+)
+
+REVISER_SYSTEM_PROMPT: str = (
+    "You rewrite first-person outcome narratives based on a critic's feedback. "
+    "Produce exactly {K} sentences, each 10-25 words, each describing a "
+    "*different type* of consequence (financial, health/physical, "
+    "convenience/time, emotional/identity, social/relational). Sentences are "
+    "first-person, present or near-future tense, and grounded in the person's "
+    "specific context. Do not describe the product. Do not number sentences; "
+    "separate them with newlines. Address the critic's concerns directly: if "
+    "the critic flagged genericness, get specific; if the critic flagged "
+    "redundancy, replace duplicate consequence types."
+)
+
+REVISER_USER_TEMPLATE: str = (
+    "PERSON CONTEXT:\n"
+    "{c_d}\n"
+    "\n"
+    "ALTERNATIVE:\n"
+    "- Name/title: {title}\n"
+    "- Category: {category}\n"
+    "- Price: ${price}\n"
+    "- Popularity: {popularity_rank}\n"
+    "{optional_fields}"
+    "\n"
+    "PRIOR OUTCOMES (to be improved):\n"
+    "{outcomes_block}\n"
+    "\n"
+    "CRITIC FEEDBACK:\n"
+    "- plausibility: {plausibility}/5\n"
+    "- diversity: {diversity}/5\n"
+    "- notes: {notes}\n"
+    "\n"
+    "Generate K={K} revised outcome sentences."
+)
+
 # Required keys for the ``alt`` mapping passed to :func:`build_user_block`.
 _REQUIRED_ALT_FIELDS: tuple[str, ...] = (
     "title",
@@ -193,6 +268,103 @@ def build_messages(
         alt=alt,
         K=K,
         optional_fields=optional_fields,
+    )
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Curriculum-refinement prompt builders (parallel to build_messages)
+# ---------------------------------------------------------------------------
+
+
+def _render_outcomes_block(outcomes: list[str]) -> str:
+    """Render K candidate outcomes as a numbered block for the critic/revise."""
+    return "\n".join(f"{i + 1}. {s}" for i, s in enumerate(outcomes))
+
+
+def build_critic_messages(
+    c_d: str,
+    alt: Mapping[str, Any],
+    outcomes: list[str],
+    K: int,
+    optional_fields: Mapping[str, Any] | None = None,
+) -> list[dict]:
+    """Build the chat messages that score K candidate outcomes."""
+    if not isinstance(K, int) or isinstance(K, bool) or K <= 0:
+        raise ValueError(f"K must be a positive int, got {K!r}")
+    if len(outcomes) != K:
+        raise ValueError(
+            f"build_critic_messages: got {len(outcomes)} outcomes, expected K={K}"
+        )
+    missing = [field for field in _REQUIRED_ALT_FIELDS if field not in alt]
+    if missing:
+        raise ValueError(
+            "alt is missing required field(s): " + ", ".join(missing)
+        )
+    extras = {
+        k: alt[k] for k in alt.keys() if k not in _REQUIRED_ALT_FIELDS
+    }
+    if optional_fields:
+        extras.update(dict(optional_fields))
+    user_content = CRITIC_USER_TEMPLATE.format(
+        c_d=c_d,
+        title=alt["title"],
+        category=alt["category"],
+        price=alt["price"],
+        popularity_rank=alt["popularity_rank"],
+        optional_fields=_render_optional_fields(extras),
+        K=K,
+        outcomes_block=_render_outcomes_block(outcomes),
+    )
+    return [
+        {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def build_reviser_messages(
+    c_d: str,
+    alt: Mapping[str, Any],
+    outcomes: list[str],
+    K: int,
+    plausibility: int,
+    diversity: int,
+    notes: str,
+    optional_fields: Mapping[str, Any] | None = None,
+) -> list[dict]:
+    """Build the chat messages that rewrite K outcomes given critic feedback."""
+    if not isinstance(K, int) or isinstance(K, bool) or K <= 0:
+        raise ValueError(f"K must be a positive int, got {K!r}")
+    if len(outcomes) != K:
+        raise ValueError(
+            f"build_reviser_messages: got {len(outcomes)} outcomes, expected K={K}"
+        )
+    missing = [field for field in _REQUIRED_ALT_FIELDS if field not in alt]
+    if missing:
+        raise ValueError(
+            "alt is missing required field(s): " + ", ".join(missing)
+        )
+    extras = {
+        k: alt[k] for k in alt.keys() if k not in _REQUIRED_ALT_FIELDS
+    }
+    if optional_fields:
+        extras.update(dict(optional_fields))
+    system_content = REVISER_SYSTEM_PROMPT.format(K=K)
+    user_content = REVISER_USER_TEMPLATE.format(
+        c_d=c_d,
+        title=alt["title"],
+        category=alt["category"],
+        price=alt["price"],
+        popularity_rank=alt["popularity_rank"],
+        optional_fields=_render_optional_fields(extras),
+        K=K,
+        outcomes_block=_render_outcomes_block(outcomes),
+        plausibility=int(plausibility),
+        diversity=int(diversity),
+        notes=str(notes),
     )
     return [
         {"role": "system", "content": system_content},
