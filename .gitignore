@@ -33,7 +33,17 @@ embeddings_cache/*.sqlite-wal
 embeddings_cache/*.sqlite-shm
 embeddings_cache/*.sqlite.corrupt.bak
 embeddings_cache/*.parquet
+# Per-seed cache subdirs (e.g. outcomes_cache/seed7/outcomes.sqlite)
+outcomes_cache/seed*/
+embeddings_cache/seed*/
 checkpoints/*
 !checkpoints/.gitkeep
 reports/*
 !reports/.gitkeep
+
+# Run output (large, regeneratable)
+results_data/
+# Working scratch dir
+tmp/
+# Editor / IDE / agent state
+.claude/
