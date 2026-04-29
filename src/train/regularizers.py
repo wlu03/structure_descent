@@ -150,6 +150,7 @@ def price_monotonicity(
     prices: torch.Tensor,
     *,
     financial_head_idx: int = DEFAULT_FINANCIAL_HEAD_IDX,
+    sigma_d: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Alt-level price-monotonicity penalty for the financial head.
 
@@ -224,7 +225,27 @@ def price_monotonicity(
     # are zeroed out afterwards.
     dp_safe = torch.where(valid, dp, torch.ones_like(dp))
     slope = du / dp_safe                                    # (B, J-1)
-    penalty = torch.clamp(slope, min=0.0) ** 2              # (B, J-1)
+
+    # Group-2: per-customer signed prior. sigma_d=None reproduces the
+    # legacy global +1 ("lower price preferred"). sigma_d=+1 → penalty
+    # fires on rising-price-rising-utility pairs (legacy behaviour).
+    # sigma_d=-1 → penalty fires on falling-price-rising-utility pairs
+    # ("high-end shopper" prior). sigma_d ∈ (-1, +1) interpolates.
+    if sigma_d is not None:
+        if sigma_d.dim() != 1:
+            raise ValueError(
+                f"sigma_d must be 1-D (B,); got shape {tuple(sigma_d.shape)}."
+            )
+        if sigma_d.shape[0] != slope.shape[0]:
+            raise ValueError(
+                f"sigma_d batch dim {sigma_d.shape[0]} does not match "
+                f"slope batch dim {slope.shape[0]}."
+            )
+        signed = sigma_d.unsqueeze(-1).to(slope.dtype) * slope
+    else:
+        signed = slope
+
+    penalty = torch.clamp(signed, min=0.0) ** 2             # (B, J-1)
     penalty = torch.where(valid, penalty, torch.zeros_like(penalty))
 
     n_valid = valid.sum()
@@ -370,6 +391,12 @@ class RegularizerConfig:
     # convention as ``salience_entropy``) so positive λ pushes per-head
     # variance UP, preventing the dead-head pattern. 0.0 = legacy.
     head_variance: float = DEFAULT_LAMBDA_HEAD_VARIANCE
+    # Group-2: replace global "lower price = higher utility" prior with a
+    # per-customer learnable σ(z_d) ∈ [-1, +1] via tanh. The MonoSignNet
+    # MLP lives on the model side; this dataclass only carries the
+    # gating flag and its hidden width.
+    mono_sign_per_customer: bool = False
+    mono_sign_hidden: int = 16
 
     @classmethod
     def from_default(cls) -> "RegularizerConfig":
@@ -403,6 +430,13 @@ class RegularizerConfig:
             head_variance=float(
                 reg.get("head_variance", DEFAULT_LAMBDA_HEAD_VARIANCE)
             ),
+            # Group-2: monotonicity sign knobs (optional in YAML).
+            mono_sign_per_customer=bool(
+                mono_block.get("per_customer", False)
+            ),
+            mono_sign_hidden=int(
+                mono_block.get("sign_hidden", 16)
+            ),
         )
 
 
@@ -416,6 +450,7 @@ def combined_regularizer(
     E: torch.Tensor,
     prices: Optional[torch.Tensor] = None,
     cfg: Optional[RegularizerConfig] = None,
+    z_d: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Sum the four §9.2 regularizers, signed correctly.
 
@@ -469,7 +504,20 @@ def combined_regularizer(
         total = total - cfg.head_variance * head_score_variance(intermediates.A)
 
     if cfg.monotonicity_enabled and prices is not None:
-        mono = price_monotonicity(model.heads, E, prices)
+        # Group-2: per-customer signed monotonicity. When the model has
+        # a MonoSignNet head AND z_d is threaded through, we produce
+        # sigma_d = MonoSignNet(z_d) ∈ (-1, +1) per event; otherwise
+        # sigma_d=None preserves the legacy global +1 prior.
+        sigma_d: Optional[torch.Tensor] = None
+        if (
+            cfg.mono_sign_per_customer
+            and z_d is not None
+            and getattr(model, "mono_sign_net", None) is not None
+        ):
+            sigma_d = model.mono_sign_net(z_d).squeeze(-1)
+        mono = price_monotonicity(
+            model.heads, E, prices, sigma_d=sigma_d
+        )
         total = total + cfg.monotonicity * mono
 
     return total

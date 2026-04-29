@@ -134,6 +134,39 @@ class POLEUIntermediates:
         return out
 
 
+class MonoSignNet(nn.Module):
+    """Per-customer monotonicity-sign head ``σ(z_d) ∈ [-1, +1]`` (Group-2 fix).
+
+    Two-Linear MLP with a tanh on the output:
+
+        Linear(p -> hidden) -> ReLU -> Linear(hidden -> 1) -> tanh
+
+    Used by :func:`src.train.regularizers.price_monotonicity` to flip the
+    monotonicity prior per customer: σ ≈ +1 reproduces the legacy "lower
+    price = higher utility" penalty; σ ≈ -1 inverts it (high-end
+    shopper); σ ∈ (-1, +1) interpolates smoothly.
+
+    Output shape: ``(B, 1)``; the regularizer squeezes the trailing dim.
+    Xavier-uniform init on weights, zero bias — at step 0 σ ≈ 0, so the
+    monotonicity penalty is initially near-zero regardless of price
+    pattern. Gradients then push σ toward +1 or -1 per customer as the
+    data dictates.
+    """
+
+    def __init__(self, p: int, hidden: int = 16) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(p, hidden)
+        self.fc2 = nn.Linear(hidden, 1)
+        self.act = nn.ReLU()
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, z_d: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self.fc2(self.act(self.fc1(z_d))))
+
+
 class POLEU(nn.Module):
     """End-to-end PO-LEU model (§8, §9.4, Appendix A).
 
@@ -203,6 +236,8 @@ class POLEU(nn.Module):
         tabular_features: Sequence[str] = DEFAULT_TABULAR_FEATURES,
         n_categories: int = 1,
         d_cat: int = 8,
+        mono_sign_per_customer: bool = False,
+        mono_sign_hidden: int = 16,
     ) -> None:
         super().__init__()
 
@@ -282,6 +317,21 @@ class POLEU(nn.Module):
             self.register_parameter("beta_tab", None)
             self.register_buffer("x_tab_mean", None)
             self.register_buffer("x_tab_std", None)
+
+        # ----- Group-2 per-customer monotonicity sign --------------------
+        # Optional MLP head that predicts σ(z_d) ∈ [-1, +1] for the §9.2
+        # price-monotonicity regularizer. Off by default — the
+        # `combined_regularizer` only consults this head when
+        # ``cfg.mono_sign_per_customer=True``, so leaving it None on
+        # legacy runs is bit-safe (no extra params, no extra forward).
+        self.mono_sign_per_customer = bool(mono_sign_per_customer)
+        self.mono_sign_hidden = int(mono_sign_hidden)
+        if self.mono_sign_per_customer:
+            self.mono_sign_net: Optional[nn.Module] = MonoSignNet(
+                p=self.p, hidden=self.mono_sign_hidden
+            )
+        else:
+            self.mono_sign_net = None
 
     # --- helpers --------------------------------------------------------
     def set_tabular_feature_stats(

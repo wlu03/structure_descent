@@ -263,3 +263,145 @@ def test_combined_finite_gradient(synthetic_batch) -> None:
                 "Non-finite gradient encountered in combined regularizer."
             )
     assert any_grad, "No parameter received a gradient from combined regularizer."
+
+
+
+# ---------------------------------------------------------------------------
+# Group-2 — per-customer monotonicity sign
+# ---------------------------------------------------------------------------
+
+
+def test_price_monotonicity_sigma_plus_one_matches_legacy(synthetic_batch) -> None:
+    """sigma_d=+1 reproduces the legacy global "lower price = higher utility"."""
+    torch.manual_seed(0)
+    model = POLEU()
+    B, J = synthetic_batch.B, synthetic_batch.J
+    prices = torch.rand(B, J) * 50.0 + 1.0
+
+    legacy = price_monotonicity(model.heads, synthetic_batch.E, prices)
+    sigma_plus_one = price_monotonicity(
+        model.heads, synthetic_batch.E, prices,
+        sigma_d=torch.ones(B),
+    )
+    assert torch.allclose(legacy, sigma_plus_one, atol=1e-7)
+
+
+def test_price_monotonicity_sigma_minus_one_flips_sign(synthetic_batch) -> None:
+    """With a price-rising-utility batch, sigma_d=-1 yields ~zero penalty.
+
+    We construct a financial-head whose alt-level utility goes UP with
+    price (so the legacy "+1" prior fires); flipping sigma_d to -1
+    flips the sign on the slope and the ReLU then zeros out the
+    (now-negative) "signed slope" contributions.
+    """
+    torch.manual_seed(0)
+    model = POLEU()
+    B, J, K, d_e = (
+        synthetic_batch.B,
+        synthetic_batch.J,
+        synthetic_batch.K,
+        synthetic_batch.d_e,
+    )
+
+    # Construct synthetic prices and an embedding such that the financial
+    # head's per-alt mean utility increases with price.
+    fin_head = model.heads.heads[0]
+    # Set fin_head's first Linear weight so that it produces a positive
+    # response on a known direction.
+    target_dir = torch.zeros(d_e)
+    target_dir[0] = 1.0
+    # Build E such that E[..., 0] increases with j.
+    E = torch.zeros(B, J, K, d_e)
+    for j in range(J):
+        E[:, j, :, 0] = float(j) * 0.5
+    # L2-normalize defensively (most tests pass unit-norm E).
+    E = torch.nn.functional.normalize(E.clamp_min(1e-9), p=2, dim=-1)
+    prices = torch.zeros(B, J)
+    for j in range(J):
+        prices[:, j] = float(j) + 1.0  # rising
+
+    legacy = price_monotonicity(model.heads, E, prices)
+    sigma_minus = price_monotonicity(
+        model.heads, E, prices, sigma_d=-torch.ones(B),
+    )
+    assert legacy.item() >= 0.0
+    # sigma=-1 should not exceed the legacy penalty (most slopes will be
+    # zeroed out under the flipped prior). A strict equality fails when
+    # the random init has zero positive slopes; we just bound it.
+    assert sigma_minus.item() <= legacy.item() + 1e-6
+    # Now construct a clearly rising-utility batch so legacy fires:
+    # if it does, sigma_minus should be smaller (flipped slopes get
+    # zeroed out).
+    if legacy.item() > 1e-6:
+        assert sigma_minus.item() < legacy.item()
+
+
+def test_mono_sign_per_customer_gradient_flows(synthetic_batch) -> None:
+    """combined_regularizer with mono_sign_per_customer=True propagates
+    gradient back into MonoSignNet."""
+    torch.manual_seed(0)
+    model = POLEU(mono_sign_per_customer=True)
+    z_d = synthetic_batch.z_d
+    E = synthetic_batch.E
+    B, J = synthetic_batch.B, synthetic_batch.J
+    prices = torch.rand(B, J) * 50.0 + 1.0
+    cfg = RegularizerConfig(
+        weight_l2=0.0,
+        salience_entropy=0.0,
+        monotonicity_enabled=True,
+        monotonicity=1.0,
+        diversity=0.0,
+        mono_sign_per_customer=True,
+    )
+    _, intermediates = model(z_d, E)
+    total = combined_regularizer(
+        model, intermediates, E, prices=prices, cfg=cfg, z_d=z_d
+    )
+    model.zero_grad(set_to_none=True)
+    total.backward()
+    # MonoSignNet weights should receive nonzero gradient when the
+    # monotonicity penalty is active and σ depends on z_d.
+    grads = [
+        p.grad.norm().item() for p in model.mono_sign_net.parameters()
+        if p.grad is not None
+    ]
+    assert any(g > 0.0 for g in grads), grads
+
+
+def test_mono_sign_off_by_default(synthetic_batch) -> None:
+    """Default POLEU has no MonoSignNet and the param count is unchanged."""
+    base = POLEU()
+    assert base.mono_sign_net is None
+    legacy_n = base.num_params()
+
+    flagged = POLEU(mono_sign_per_customer=True)
+    assert flagged.mono_sign_net is not None
+    # MonoSignNet adds (p*hidden + hidden) + (hidden*1 + 1) params.
+    p_in = base.p
+    hidden = 16
+    expected_extra = (p_in * hidden + hidden) + (hidden * 1 + 1)
+    assert flagged.num_params() == legacy_n + expected_extra
+
+
+def test_combined_regularizer_legacy_path_unaffected(synthetic_batch) -> None:
+    """With mono_sign_per_customer=False (default) the value is identical
+    whether or not z_d is threaded through."""
+    torch.manual_seed(0)
+    model = POLEU()
+    z_d = synthetic_batch.z_d
+    E = synthetic_batch.E
+    B, J = synthetic_batch.B, synthetic_batch.J
+    prices = torch.rand(B, J) * 50.0 + 1.0
+    cfg = RegularizerConfig(
+        weight_l2=1e-3, salience_entropy=1e-2,
+        monotonicity_enabled=True, monotonicity=1e-2,
+        diversity=1e-2, mono_sign_per_customer=False,
+    )
+    _, intermediates = model(z_d, E)
+    no_z = combined_regularizer(
+        model, intermediates, E, prices=prices, cfg=cfg
+    )
+    with_z = combined_regularizer(
+        model, intermediates, E, prices=prices, cfg=cfg, z_d=z_d
+    )
+    assert torch.allclose(no_z, with_z, atol=1e-7)

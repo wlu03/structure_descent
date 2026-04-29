@@ -475,7 +475,12 @@ def _compute_batch_loss(
     loss = cross_entropy_loss(logits, c_star, omega)
 
     if reg_cfg is not None:
-        reg_term = combined_regularizer(model, intermediates, E, prices, reg_cfg)
+        # Group-2: thread z_d through so combined_regularizer can build
+        # σ(z_d) for the per-customer monotonicity prior. Existing path
+        # (sigma off) ignores z_d, so this is a no-op for legacy runs.
+        reg_term = combined_regularizer(
+            model, intermediates, E, prices, reg_cfg, z_d=z_d
+        )
         loss = loss + reg_term
 
     return loss

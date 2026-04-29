@@ -111,6 +111,10 @@ regularizers:
     enabled: true            # Amazon purchase events: domain prior holds (§9.2). Override per-dataset when inappropriate.
     lambda: 1.0e-3
     price_key: "price"
+    # Group-2: replace the global +1 prior with σ(z_d) ∈ [-1, +1] per
+    # customer. false = legacy global +1 ("lower price preferred").
+    per_customer: false
+    sign_hidden: 16
   diversity: 1.0e-4          # §9.2 λ_div
   head_variance: 1.0e-2      # anti-dead-head pull on per-head score variance (subtract to maximize). 0.0 = legacy.
 

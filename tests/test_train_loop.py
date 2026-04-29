@@ -455,7 +455,8 @@ def test_regularizers_integrate(monkeypatch):
     # differentiable term so we exercise the integration code path.
     call_count = {"n": 0}
 
-    def stub_reg(model, intermediates, E, prices, reg_cfg):
+    def stub_reg(model, intermediates, E, prices, reg_cfg, **kwargs):
+        # Group-2 added z_d as a kwarg; absorb any future kwargs too.
         call_count["n"] += 1
         # Small L2 on the weight-net parameters for gradient flow.
         term = sum((p * p).sum() for p in model.weight_net.parameters())
