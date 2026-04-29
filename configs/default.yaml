@@ -86,6 +86,12 @@ outcomes:
     outcomes_path: "outcomes_cache/outcomes.sqlite"
     embeddings_path: "embeddings_cache/embeddings.sqlite"
 
+# Opt-in K=5 anchored prompts (one outcome per M=5 head axis). Requires cache regen via scripts/run_dataset.py --prompt-version-cascade v3_anchored v2.
+outcomes_anchored:
+  enabled: false
+  K: 5
+  prompt_version: "v3_anchored"
+
 train:
   batch_size: 128            # §9.3
   lr: 1.0e-3

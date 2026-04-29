@@ -1,0 +1,117 @@
+# PO-LEU anchored K=5 override (Group-3 fix).
+# Standalone file — copy of configs/default.yaml with outcomes.K=5 and
+# outcomes.generator.prompt_version="v3_anchored" so the LLM produces
+# exactly one outcome per M=5 head axis (financial, health, convenience,
+# emotional, social) in canonical order. Addresses starved-heads diagnosis
+# (m0 near-zero variance, m3 runaway scale = random-walk fingerprints) at K=3.
+# Cache regen via:
+#   scripts/run_dataset.py --prompt-version-cascade v3_anchored v2
+
+ablation:
+  id: "v3_anchored"
+  description: "Anchored K=5 prompts: one outcome per M=5 head axis."
+
+seed: 0
+
+model:
+  M: 5
+  K: 5                 # anchored override: K must equal M
+  J: 10
+  d_e: 768
+  p: 26
+
+  attribute_heads:
+    hidden: 128
+    activation: relu
+  weight_net:
+    hidden: 32
+    normalization: softmax
+  salience_net:
+    hidden: 64
+  temperature: 1.0
+  person_dependent_heads: false
+  uniform_salience: false
+
+  tabular_residual:
+    enabled: true
+    features:
+      - price
+      - log1p_price
+      - price_rank
+      - popularity_count
+      - log1p_popularity_count
+      - is_repeat
+      - log1p_purchase_count
+
+data:
+  split: temporal
+  choice_set_size: 10
+  hard_negative_rate: 0.3
+  hard_negative_price_band: 0.5
+  enrich_customer_context: true
+
+outcomes:
+  K: 5                              # anchored override
+  generator:
+    model_id: "stub"
+    temperature: 0.8
+    top_p: 0.95
+    max_tokens: 180
+    prompt_version: "v3_anchored"   # anchored override
+  encoder:
+    model_id: "sentence-transformers/all-mpnet-base-v2"
+    pooling: mean
+    l2_normalize: true
+    max_length: 64
+  diversity_filter:
+    enabled: true
+    cos_sim_threshold: 0.9
+    max_retries: 2
+  cache:
+    outcomes_path: "outcomes_cache/outcomes.sqlite"
+    embeddings_path: "embeddings_cache/embeddings.sqlite"
+
+train:
+  batch_size: 128
+  lr: 1.0e-3
+  lr_min: 1.0e-4
+  optimizer: adam
+  beta1: 0.9
+  beta2: 0.999
+  max_epochs: 30
+  early_stopping_patience: 9999
+  grad_clip: 1.0
+  seeds: [0, 1, 2]
+
+regularizers:
+  weight_l2: 1.0e-4
+  salience_entropy: 1.0e-3
+  monotonicity:
+    enabled: true
+    lambda: 1.0e-3
+    price_key: "price"
+  diversity: 1.0e-4
+  head_variance: 1.0e-2
+
+eval:
+  top_k_list: [1, 5]
+  strata:
+    - category
+    - repeat_or_novel
+    - activity_tertile
+    - time_of_day
+    - dominant_attribute
+
+subsample:
+  enabled: true
+  method: random
+  n_customers: 100
+  n_pca_components: 20
+  min_per_category_cluster: 2
+  seed: 42
+
+paths:
+  outcomes_cache: "outcomes_cache/"
+  embeddings_cache: "embeddings_cache/"
+  checkpoints: "checkpoints/"
+  reports: "reports/"

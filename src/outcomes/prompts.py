@@ -56,6 +56,34 @@ USER_BLOCK_TEMPLATE: str = (
 PROMPT_VERSION: str = "v2"
 
 # ---------------------------------------------------------------------------
+# Anchored K=5 prompt (Group 3 fix). Forces one outcome per named axis in the
+# canonical order matching the M=5 attribute heads' post-hoc labels in
+# src/eval/interpret.py. Addresses starved-heads diagnosis (m0 near-zero
+# variance, m3 runaway scale = random-walk fingerprints) where K=3 left two
+# heads with no aligned outcome signal.
+# ---------------------------------------------------------------------------
+
+PROMPT_VERSION_ANCHORED: str = "v3_anchored"
+
+# matches the M=5 attribute heads' post-hoc axis labels in src/eval/interpret.py head naming order
+ANCHORED_AXES: tuple[str, ...] = (
+    "financial",
+    "health",
+    "convenience",
+    "emotional",
+    "social",
+)
+
+SYSTEM_PROMPT_ANCHORED: str = (
+    "Generate exactly K=5 outcomes, one per axis, in this canonical order: "
+    "financial, health, convenience, emotional, social. Each outcome describes "
+    "a plausible consequence FOR THIS PERSON considering THIS alternative, "
+    "scored along ITS axis. If an axis is genuinely irrelevant for this "
+    "category, write a brief honest acknowledgement; the salience layer will "
+    "down-weight irrelevant axes. Use first-person 'I' narration."
+)
+
+# ---------------------------------------------------------------------------
 # Curriculum refinement prompts (commit: critique-and-revise loop). Used by
 # :mod:`src.outcomes.refine` to fix outcomes for events the model fails on.
 # Bump :data:`REFINED_PROMPT_VERSION` when either template changes — it is
@@ -275,6 +303,35 @@ def build_messages(
     ]
 
 
+def build_messages_anchored(
+    c_d: str,
+    alt: Mapping[str, Any],
+    K: int,
+    optional_fields: Mapping[str, Any] | None = None,
+) -> list[dict]:
+    """Anchored variant of :func:`build_messages` (Group-3 fix).
+
+    Forces ``K == len(ANCHORED_AXES) == 5`` and uses
+    :data:`SYSTEM_PROMPT_ANCHORED` so the LLM produces exactly one outcome per
+    named axis in canonical order. Each outcome aligns 1:1 with one of the
+    M=5 attribute heads, eliminating the starved-head failure mode at K=3.
+    """
+    if K != len(ANCHORED_AXES):
+        raise ValueError(
+            f"expected K=5 to match ANCHORED_AXES; got K={K}"
+        )
+    user_content = build_user_block(
+        c_d=c_d,
+        alt=alt,
+        K=K,
+        optional_fields=optional_fields,
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT_ANCHORED},
+        {"role": "user", "content": user_content},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Curriculum-refinement prompt builders (parallel to build_messages)
 # ---------------------------------------------------------------------------
@@ -376,7 +433,11 @@ __all__ = [
     "SYSTEM_PROMPT",
     "USER_BLOCK_TEMPLATE",
     "PROMPT_VERSION",
+    "PROMPT_VERSION_ANCHORED",
+    "ANCHORED_AXES",
+    "SYSTEM_PROMPT_ANCHORED",
     "build_system_prompt",
     "build_user_block",
     "build_messages",
+    "build_messages_anchored",
 ]

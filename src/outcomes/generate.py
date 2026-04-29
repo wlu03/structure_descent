@@ -47,7 +47,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
-from src.outcomes.prompts import build_messages
+from src.outcomes.prompts import build_messages, build_messages_anchored
 
 logger = logging.getLogger(__name__)
 
@@ -729,7 +729,13 @@ def generate_outcomes(
                 )
 
     # ---- 2. build messages ---------------------------------------------
-    messages = build_messages(c_d=c_d, alt=alt, K=K)
+    # Anchored K=5 path (Group-3 fix): when prompt_version starts with
+    # "v3_anchored", use the axis-anchored system prompt that forces one
+    # outcome per M=5 head axis in canonical order.
+    if str(prompt_version).startswith("v3_anchored"):
+        messages = build_messages_anchored(c_d=c_d, alt=alt, K=K)
+    else:
+        messages = build_messages(c_d=c_d, alt=alt, K=K)
 
     # ---- 3. call + parse + diversity loop ------------------------------
     merged_kwargs: dict[str, Any] = {**_DEFAULT_GEN_KWARGS}
