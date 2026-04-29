@@ -113,7 +113,7 @@ class BaselineReport:
     Standardized output of evaluate_baseline.
 
     metrics keys (always present):
-        top1, top5, mrr, test_nll, aic, bic, n_events
+        top1, top3, top5, mrr, test_nll, brier, aic, bic, n_events
 
     Additional per-event / per-customer fields (populated iff the
     baseline completes evaluation successfully; see
@@ -148,9 +148,11 @@ class BaselineReport:
         return (
             f"[{self.name}] "
             f"top1={m['top1']:.1%}  "
+            f"top3={m['top3']:.1%}  "
             f"top5={m['top5']:.1%}  "
             f"MRR={m['mrr']:.4f}  "
             f"NLL={m['test_nll']:.4f}  "
+            f"Brier={m['brier']:.4f}  "
             f"AIC={m['aic']:.1f}  "
             f"BIC={m['bic']:.1f}  "
             f"params={self.n_params}  "

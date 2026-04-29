@@ -341,6 +341,47 @@ def test_fit_runs_without_crashing():
     assert state.epoch == cfg.max_epochs - 1  # 2 epochs → last index is 1.
 
 
+def test_a1_reload_fires_without_early_stop() -> None:
+    """A.1 best-checkpoint reload must fire even when patience is huge.
+
+    Regression for the bug observed in the Apr-27 sweep: the reload was
+    gated on ``state.stopped_early=True``, so with the production default
+    ``early_stopping_patience=9999`` the reload never fired and runs
+    silently kept their final-epoch (worse) weights. After the fix, the
+    reload fires whenever a best snapshot exists and the final-epoch val
+    NLL is worse than the best.
+    """
+    torch.manual_seed(0)
+    data = _make_synthetic(N=16, seed=0)
+    model = _make_model()
+    cfg = TrainConfig(
+        batch_size=8,
+        lr=5e-3,                       # nonzero updates → val NLL moves around
+        lr_min=1e-6,
+        max_epochs=4,
+        early_stopping_patience=9999,  # disabled, like production
+        grad_clip=1.0,
+    )
+    total_steps = cfg.max_epochs * (data["N"] // cfg.batch_size)
+    state = fit(
+        model,
+        train_batches_fn=_batches_fn(data, cfg.batch_size),
+        val_batches_fn=_batches_fn(data, cfg.batch_size),
+        train_cfg=cfg,
+        reg_cfg=None,
+        total_steps=total_steps,
+        seed=0,
+    )
+    # Did NOT stop early (the patience gate is huge).
+    assert not state.stopped_early
+    # If the loop ever saw an improvement, A.1 should have fired and the
+    # final val_nll should equal best_val_nll up to floating slack.
+    if state.best_val_nll < float("inf") and state.best_val_nll < state.val_nll + 1e-9:
+        # ``state.val_nll`` after reload should match ``best_val_nll`` exactly
+        # (we re-evaluate to be defensive but on a fixed batch it matches).
+        assert state.reloaded_best_checkpoint or state.val_nll == state.best_val_nll
+
+
 def test_fit_early_stopping_triggers():
     """With patience=1 and val that never improves after epoch 1, stop early."""
     torch.manual_seed(0)

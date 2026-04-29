@@ -1,9 +1,10 @@
 """Evaluation metrics for PO-LEU (redesign.md §13).
 
 Pure, stateless functions computing the headline numbers reported on the
-held-out test split: Top-1 accuracy, Top-5 accuracy, MRR, NLL, AIC, BIC,
-McFadden's pseudo-R², and top-1 Expected Calibration Error. All functions
-accept either a ``torch.Tensor`` or a ``numpy.ndarray`` for the logits and
+held-out test split: Top-1 / Top-3 / Top-5 accuracy, MRR, NLL, multi-class
+Brier (the proper-scoring-rule MSE on probabilities), AIC, BIC, McFadden's
+pseudo-R², and top-1 Expected Calibration Error. All functions accept
+either a ``torch.Tensor`` or a ``numpy.ndarray`` for the logits and
 ``c*`` labels — inputs are converted with ``torch.as_tensor`` internally.
 
 Conventions (§13 + orchestrator notes)
@@ -171,6 +172,40 @@ def nll(logits: ArrayLike, c_star: ArrayLike) -> float:
     return float(F.cross_entropy(t, y, reduction="mean").item())
 
 
+def brier(logits: ArrayLike, c_star: ArrayLike) -> float:
+    """Multi-class Brier score — the proper scoring rule analog of MSE.
+
+    Shape contract:
+        logits: (N, J)
+        c_star: (N,)
+        out:    Python float, range ``[0, 2]``. Lower is better; 0 only
+                when the model puts all mass on c* every event, 2 only
+                when it puts all mass on a single wrong class every event.
+
+    For event ``i`` with softmax probabilities ``p`` and one-hot label
+    ``y``, the per-event Brier contribution is ``Σ_j (p_j - y_j)²``.
+    The reported value is the mean across events. Equivalent to
+    ``mean((softmax(logits) - one_hot(c*))**2) * J`` because the mean
+    inside torch.mean averages over both N and J (we want the sum over
+    J, mean over N).
+
+    This is the standard MSE-on-probability metric for discrete-choice
+    problems (Brier 1950): symmetric in over- and under-confidence,
+    bounded, and finite even when ``p[c*] == 0`` (unlike NLL).
+    """
+    t = _as_logits(logits)
+    N, J = t.shape
+    y = _as_labels(c_star, n=N, num_classes=J)
+
+    if N == 0:
+        return 0.0
+
+    probs = F.softmax(t, dim=-1).to(torch.float64)
+    one_hot = F.one_hot(y, num_classes=J).to(torch.float64)
+    sq_err = (probs - one_hot).pow(2).sum(dim=-1)  # (N,) — sum over J
+    return float(sq_err.mean().item())
+
+
 def aic(nll_val: float, k: int, n_train: int) -> float:
     """AIC from a pre-computed NLL: ``2k + 2 * n_train * nll_val`` (§13).
 
@@ -263,16 +298,19 @@ def ece(
 
 @dataclass
 class EvalMetrics:
-    """All §13 headline numbers plus McFadden pseudo-R² and top-1 ECE.
+    """All §13 headline numbers plus McFadden pseudo-R², top-1 ECE, Brier.
 
     Attributes
     ----------
-    top1, top5:
+    top1, top3, top5:
         Top-k accuracies in ``[0, 1]``.
     mrr_val:
         Mean Reciprocal Rank, ``1 / (rank + 1)`` convention.
     nll_val:
         Mean per-event NLL (natural log).
+    brier_val:
+        Multi-class Brier score (proper-scoring-rule MSE on probabilities).
+        Range ``[0, 2]``; lower is better. See :func:`brier`.
     aic_val, bic_val:
         ``2k + 2 n_train * NLL`` and ``k log n_train + 2 n_train * NLL``.
     pseudo_r2:
@@ -287,9 +325,11 @@ class EvalMetrics:
     """
 
     top1: float
+    top3: float
     top5: float
     mrr_val: float
     nll_val: float
+    brier_val: float
     aic_val: float
     bic_val: float
     pseudo_r2: float
@@ -309,7 +349,7 @@ def compute_all(
     n_params: int,
     n_train: int,
 ) -> EvalMetrics:
-    """Compute all §13 numbers (plus pseudo-R² and ECE) in one pass.
+    """Compute all §13 numbers (plus pseudo-R², ECE, Brier) in one pass.
 
     Shape contract:
         logits:    (N, J)
@@ -319,17 +359,20 @@ def compute_all(
         n_train:   int, size of the training split.
         out:       :class:`EvalMetrics`.
 
-    Top-k list is fixed to ``[1, 5]`` per Appendix B / §13. ECE uses the
-    default 15 equal-width bins (Guo et al. 2017).
+    Top-k list is fixed to ``[1, 3, 5]`` (Top-3 added alongside the §13
+    pair). ECE uses the default 15 equal-width bins (Guo et al. 2017).
+    Brier is the multi-class proper-scoring-rule MSE — see :func:`brier`.
     """
     t = _as_logits(logits)
     N, J = t.shape
     y = _as_labels(c_star, n=N, num_classes=J)
 
     top1 = topk_accuracy(t, y, k=1)
+    top3 = topk_accuracy(t, y, k=3)
     top5 = topk_accuracy(t, y, k=5)
     mrr_v = mrr(t, y)
     nll_v = nll(t, y)
+    brier_v = brier(t, y)
     aic_v = aic(nll_v, k=n_params, n_train=n_train)
     bic_v = bic(nll_v, k=n_params, n_train=n_train)
     pseudo_r2_v = mcfadden_pseudo_r2(nll_v, J=J)
@@ -337,9 +380,11 @@ def compute_all(
 
     return EvalMetrics(
         top1=top1,
+        top3=top3,
         top5=top5,
         mrr_val=mrr_v,
         nll_val=nll_v,
+        brier_val=brier_v,
         aic_val=aic_v,
         bic_val=bic_v,
         pseudo_r2=pseudo_r2_v,

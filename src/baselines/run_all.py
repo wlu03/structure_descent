@@ -119,15 +119,21 @@ _LLM_MODEL_SWEEP_FULL: List[Tuple[str, Callable[[], Any]]] = [
 
 def _apply_llm_sweep_filter(
     full: List[Tuple[str, Callable[[], Any]]],
+    *,
+    env_var: str = "LLM_SWEEP",
+    fallback_env_var: str | None = None,
 ) -> List[Tuple[str, Callable[[], Any]]]:
-    """Filter ``_LLM_MODEL_SWEEP_FULL`` by the ``LLM_SWEEP`` env var.
+    """Filter ``_LLM_MODEL_SWEEP_FULL`` by the named env var.
 
-    ``LLM_SWEEP`` is a comma-separated allowlist of display suffixes
+    ``env_var`` is a comma-separated allowlist of display suffixes
     (case-insensitive). Unrecognized names raise at import time so a
     typo doesn't silently drop to the full sweep and run a $400 bill.
-    Empty / unset returns the full list unchanged.
+    Empty / unset on ``env_var`` falls back to ``fallback_env_var`` if
+    given, then to the full list unchanged.
     """
-    raw = os.environ.get("LLM_SWEEP", "").strip()
+    raw = os.environ.get(env_var, "").strip()
+    if not raw and fallback_env_var:
+        raw = os.environ.get(fallback_env_var, "").strip()
     if not raw:
         return full
     wanted = {s.strip().lower() for s in raw.split(",") if s.strip()}
@@ -135,18 +141,40 @@ def _apply_llm_sweep_filter(
     unknown = wanted - allowed
     if unknown:
         raise ValueError(
-            f"LLM_SWEEP contains unknown model suffixes {sorted(unknown)}; "
+            f"{env_var} contains unknown model suffixes {sorted(unknown)}; "
             f"expected any of {sorted(allowed)}."
         )
     filtered = [(s, f) for s, f in full if s.lower() in wanted]
     if not filtered:  # defensive: shouldn't happen given the unknown check
-        raise ValueError(f"LLM_SWEEP={raw!r} resolved to an empty filter.")
+        raise ValueError(f"{env_var}={raw!r} resolved to an empty filter.")
     return filtered
 
 
+# Default LLM sweep — used by ZeroShot + FewShot-ICL (the "generative"
+# architectures, where the LLM directly answers the choice prompt).
 LLM_MODEL_SWEEP: List[Tuple[str, Callable[[], Any]]] = _apply_llm_sweep_filter(
-    _LLM_MODEL_SWEEP_FULL
+    _LLM_MODEL_SWEEP_FULL,
+    env_var="LLM_SWEEP",
 )
+
+# Symbolic-architecture LLM sweep — used by LLM-SR + LaSR (formula search /
+# symbolic regression, which iterates so each row costs more API spend).
+# Defaults to ``LLM_SYMBOLIC_SWEEP`` when set; falls back to ``LLM_SWEEP``
+# when not, so existing scripts keep their behaviour. Lets you cut symbolic
+# rows down to a single cheap model (e.g. Sonnet-only) without restricting
+# the generative rows.
+LLM_MODEL_SWEEP_SYMBOLIC: List[Tuple[str, Callable[[], Any]]] = (
+    _apply_llm_sweep_filter(
+        _LLM_MODEL_SWEEP_FULL,
+        env_var="LLM_SYMBOLIC_SWEEP",
+        fallback_env_var="LLM_SWEEP",
+    )
+)
+
+# Architecture prefixes that go through symbolic search (more API calls per
+# row). These pull from LLM_MODEL_SWEEP_SYMBOLIC; everything else uses
+# LLM_MODEL_SWEEP. Add new symbolic baselines here.
+_SYMBOLIC_LLM_PREFIXES: frozenset[str] = frozenset({"LLM-SR", "LaSR"})
 
 # LLM-backed baselines in the base registry. For each entry below, the
 # expansion machinery appends one ``(<prefix>-<model>, module, class)`` row
@@ -188,11 +216,19 @@ def _build_registry() -> List[Tuple[str, str, str]]:
         # sentence encoder PO-LEU uses and trains a small MLP.
         ("ST-MLP",           "src.baselines.st_mlp_ablation", "STMLPChoice"),
     ]
-    # Expand every LLM baseline across all models in LLM_MODEL_SWEEP.
-    # Register each expansion's factory so run_all_baselines can inject
-    # the right llm_client at construction time.
+    # Expand every LLM baseline across the appropriate model sweep.
+    # Symbolic architectures (LLM-SR, LaSR) iterate during fit and so cost
+    # ~3-10× the API spend per row vs ZeroShot / FewShot. They pull from
+    # LLM_MODEL_SWEEP_SYMBOLIC, which can be narrowed independently via
+    # the LLM_SYMBOLIC_SWEEP env var. Generative architectures stay on
+    # the broader LLM_MODEL_SWEEP (controlled by LLM_SWEEP).
     for prefix, module_path, class_name in _LLM_BASELINE_BASES:
-        for model_suffix, factory in LLM_MODEL_SWEEP:
+        sweep = (
+            LLM_MODEL_SWEEP_SYMBOLIC
+            if prefix in _SYMBOLIC_LLM_PREFIXES
+            else LLM_MODEL_SWEEP
+        )
+        for model_suffix, factory in sweep:
             name = f"{prefix}-{model_suffix}"
             registry.append((name, module_path, class_name))
             LLM_CLIENT_FACTORIES[name] = factory
@@ -369,9 +405,11 @@ def run_all_baselines(
             "name": display_name,
             "status": "ok",
             "top1": m["top1"],
+            "top3": m["top3"],
             "top5": m["top5"],
             "mrr": m["mrr"],
             "test_nll": m["test_nll"],
+            "brier": m["brier"],
             "aic": m["aic"],
             "bic": m["bic"],
             "n_params": report.n_params,
@@ -444,9 +482,11 @@ def format_table(rows: List[Dict[str, object]]) -> str:
         ("name", 32),
         ("status", 11),
         ("top1", 8),
+        ("top3", 8),
         ("top5", 8),
         ("mrr", 8),
         ("test_nll", 9),
+        ("brier", 8),
         ("aic", 11),
         ("bic", 11),
         ("n_params", 9),
@@ -469,9 +509,9 @@ def format_table(rows: List[Dict[str, object]]) -> str:
                 else:
                     cells.append(f"{'-':<{w}}")
                 continue
-            if name in ("top1", "top5"):
+            if name in ("top1", "top3", "top5"):
                 cells.append(f"{v:<{w}.1%}")
-            elif name in ("mrr", "test_nll"):
+            elif name in ("mrr", "test_nll", "brier"):
                 cells.append(f"{v:<{w}.4f}")
             elif name in ("aic", "bic", "fit_seconds"):
                 cells.append(f"{v:<{w}.1f}")

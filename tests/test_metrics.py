@@ -19,6 +19,7 @@ from src.eval.metrics import (
     EvalMetrics,
     aic,
     bic,
+    brier,
     compute_all,
     ece,
     mcfadden_pseudo_r2,
@@ -60,6 +61,38 @@ def test_top5_strictly_ge_top1() -> None:
     t1 = topk_accuracy(logits, c_star, k=1)
     t5 = topk_accuracy(logits, c_star, k=5)
     assert t5 >= t1
+
+
+def test_top3_monotone_between_top1_and_top5() -> None:
+    """Top-1 ≤ Top-3 ≤ Top-5 by definition of top-k."""
+    N, J = 64, 10
+    torch.manual_seed(11)
+    logits = torch.randn(N, J)
+    c_star = torch.randint(0, J, (N,))
+    t1 = topk_accuracy(logits, c_star, k=1)
+    t3 = topk_accuracy(logits, c_star, k=3)
+    t5 = topk_accuracy(logits, c_star, k=5)
+    assert t1 <= t3 <= t5
+
+
+def test_top3_hand_calc() -> None:
+    """Hand-built logits — c* is rank 0/2/3/9 across 4 events; top-3 = 3/4."""
+    # Event 0: c* at top → in top-3.       (rank 0)
+    # Event 1: c* at rank 2 → in top-3.    (rank 2)
+    # Event 2: c* at rank 3 → NOT in top-3.(rank 3)
+    # Event 3: c* at rank 9 → NOT in top-3.(rank 9)
+    # Expected top-3 = 2/4 = 0.5.
+    logits = torch.tensor(
+        [
+            [9, 1, 2, 3, 4, 5, 6, 7, 8, 0],   # argmax=0; c*=0 (rank 0)
+            [9, 8, 7, 1, 2, 3, 4, 5, 6, 0],   # ranking: 0,1,2 → c*=2 (rank 2)
+            [9, 8, 7, 6, 1, 2, 3, 4, 5, 0],   # top-3 = {0,1,2}; c*=3 (rank 3)
+            [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],   # top-3 = {0,1,2}; c*=9 (rank 9)
+        ],
+        dtype=torch.float32,
+    )
+    c_star = torch.tensor([0, 2, 3, 9])
+    assert topk_accuracy(logits, c_star, k=3) == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +148,59 @@ def test_nll_matches_torch_cross_entropy() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Brier (multi-class MSE on softmax probabilities)
+# ---------------------------------------------------------------------------
+
+
+def test_brier_perfect_prediction_is_zero() -> None:
+    """All mass on c* every event → Brier == 0 (lower bound)."""
+    # Build logits where the c*-th column is +inf-ish — softmax becomes
+    # one-hot at c*, identical to the label, so (p - y)² == 0 everywhere.
+    N, J = 8, 5
+    torch.manual_seed(20)
+    c_star = torch.randint(0, J, (N,))
+    logits = torch.full((N, J), -100.0)
+    logits.scatter_(1, c_star.unsqueeze(-1), 100.0)
+    assert brier(logits, c_star) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_brier_uniform_prediction() -> None:
+    """Uniform softmax (all-equal logits) → Brier == 1 - 1/J.
+
+    Closed form: with p_j = 1/J for every j, the per-event sum
+    Σ_j (p_j - y_j)² = (J-1) · (1/J)² + (1 - 1/J)² = 1 - 1/J.
+    """
+    N, J = 16, 4
+    logits = torch.zeros(N, J)
+    c_star = torch.randint(0, J, (N,))
+    expected = 1.0 - 1.0 / J  # = 0.75 at J=4
+    assert brier(logits, c_star) == pytest.approx(expected, rel=1e-6)
+
+
+def test_brier_all_mass_on_one_wrong_class() -> None:
+    """All mass on the same wrong class every event → Brier == 2 (upper bound)."""
+    # Put +inf-ish weight on column 0 for every event; pick c* = J-1 so it
+    # never coincides. Per-event sum = (1-0)² + (0-1)² = 2.
+    N, J = 6, 5
+    logits = torch.full((N, J), -100.0)
+    logits[:, 0] = 100.0
+    c_star = torch.full((N,), J - 1, dtype=torch.int64)
+    assert brier(logits, c_star) == pytest.approx(2.0, abs=1e-6)
+
+
+def test_brier_matches_manual_computation() -> None:
+    """Cross-check against an explicit (softmax → one-hot → MSE) loop."""
+    N, J = 10, 6
+    torch.manual_seed(21)
+    logits = torch.randn(N, J)
+    c_star = torch.randint(0, J, (N,))
+    probs = F.softmax(logits, dim=-1).to(torch.float64)
+    one_hot = F.one_hot(c_star, num_classes=J).to(torch.float64)
+    expected = (probs - one_hot).pow(2).sum(dim=-1).mean().item()
+    assert brier(logits, c_star) == pytest.approx(expected, rel=1e-9, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
 # AIC / BIC
 # ---------------------------------------------------------------------------
 
@@ -149,7 +235,7 @@ def test_compute_all_populates() -> None:
 
     # Populated (non-None) and of the right Python types.
     for field in (
-        "top1", "top5", "mrr_val", "nll_val",
+        "top1", "top3", "top5", "mrr_val", "nll_val", "brier_val",
         "aic_val", "bic_val", "pseudo_r2", "ece_val",
     ):
         assert isinstance(getattr(em, field), float), field
@@ -158,16 +244,18 @@ def test_compute_all_populates() -> None:
 
     d = em.to_dict()
     assert set(d.keys()) == {
-        "top1", "top5", "mrr_val", "nll_val",
+        "top1", "top3", "top5", "mrr_val", "nll_val", "brier_val",
         "aic_val", "bic_val", "pseudo_r2", "ece_val",
         "n_params", "n_train",
     }
 
     # Cross-check via individual functions.
     assert d["top1"] == pytest.approx(topk_accuracy(logits, c_star, k=1))
+    assert d["top3"] == pytest.approx(topk_accuracy(logits, c_star, k=3))
     assert d["top5"] == pytest.approx(topk_accuracy(logits, c_star, k=5))
     assert d["mrr_val"] == pytest.approx(mrr(logits, c_star))
     assert d["nll_val"] == pytest.approx(nll(logits, c_star))
+    assert d["brier_val"] == pytest.approx(brier(logits, c_star))
     assert d["aic_val"] == pytest.approx(
         aic(d["nll_val"], k=544_779, n_train=10_000)
     )

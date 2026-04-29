@@ -30,6 +30,7 @@ import numpy as np
 from src.eval.metrics import (
     aic as _aic,
     bic as _bic,
+    brier as _brier,
     ece as _ece,
     mcfadden_pseudo_r2 as _pseudo_r2,
     mrr as _mrr,
@@ -117,9 +118,11 @@ def evaluate_baseline(
 
     # --- core metrics (delegated to src.eval.metrics for parity) -------
     top1 = topk_accuracy(logits, c_star, k=1)
+    top3 = topk_accuracy(logits, c_star, k=3)
     top5 = topk_accuracy(logits, c_star, k=5)
     mrr_val = _mrr(logits, c_star)
     nll_val = _nll(logits, c_star)
+    brier_val = _brier(logits, c_star)
 
     # --- per-event NLL + top-1 (paper-grade instrumentation) ----------
     # Compute log-softmax rows directly so the mean matches ``nll_val``
@@ -188,9 +191,11 @@ def evaluate_baseline(
 
     metrics = {
         "top1": float(top1),
+        "top3": float(top3),
         "top5": float(top5),
         "mrr": float(mrr_val),
         "test_nll": float(nll_val),
+        "brier": float(brier_val),
         "pseudo_r2": float(pseudo_r2_val),
         "aic": float(aic_val),
         "bic": float(bic_val),

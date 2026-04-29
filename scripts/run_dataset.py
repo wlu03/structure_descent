@@ -154,6 +154,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Seed for the cold-start partition. Defaults to --seed.",
     )
+    parser.add_argument(
+        "--tabular-residual",
+        choices=["yaml", "true", "false"],
+        default="yaml",
+        help=(
+            "Override configs/default.yaml model.tabular_residual.enabled. "
+            "'yaml' (default) honors the YAML; 'true' / 'false' force the "
+            "Sifringer feature-partition residual on / off. Used by "
+            "run_full_evaluation.sh to drive the PO-LEU vs PO-LEU-RESIDUAL "
+            "leaderboard pair from a single YAML."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-version-cascade",
+        nargs="+",
+        default=None,
+        metavar="VERSION",
+        help=(
+            "Curriculum-refinement cascade. When set, assemble_batch first "
+            "tries each version's outcomes_cache for a hit; only the LAST "
+            "version is allowed to call the LLM on a full miss. Use "
+            "`--prompt-version-cascade v2_refined v2` to fold refined "
+            "outcomes (round-3) into a PO-LEU-REFINED training run while "
+            "reusing the v2 cache for non-failure events. When unset, "
+            "assemble_batch uses the legacy single prompt_version path."
+        ),
+    )
     return parser
 
 
@@ -346,6 +373,21 @@ def main(args: argparse.Namespace) -> int:
     if not config_path.exists():
         raise SystemExit(f"config not found: {config_path}")
     config = _load_yaml(config_path)
+
+    # ``getattr`` default keeps in-process callers (e.g. smoke tests that
+    # build a Namespace by hand) working without listing every CLI flag.
+    tabular_residual_choice = getattr(args, "tabular_residual", "yaml")
+    if tabular_residual_choice != "yaml":
+        forced = tabular_residual_choice == "true"
+        model_block = config.setdefault("model", {})
+        tab_block = model_block.setdefault("tabular_residual", {})
+        tab_block["enabled"] = forced
+        logger.info(
+            "CLI override: model.tabular_residual.enabled = %s "
+            "(--tabular-residual %s)",
+            forced,
+            tabular_residual_choice,
+        )
 
     dataset_yaml = _resolve_dataset_config(args)
     if not dataset_yaml.exists():
@@ -693,7 +735,46 @@ def main(args: argparse.Namespace) -> int:
             len(survivors),
         )
 
+    # Customer-aggregate c_d enrichment: opt-in via YAML
+    # ``data.enrich_customer_context`` (default false). When true, per-
+    # customer summaries (top brand, top categories, average price,
+    # repeat rate) are merged into ``customer_to_extras`` and rendered
+    # into c_d by the new clauses in build_context_string. Keeps existing
+    # Wave-11 fields (gender / life_event / amazon_frequency) — agg keys
+    # use distinct names so they cannot collide.
+    data_cfg = (config.get("data") or {})
+    enrich_ctx = bool(data_cfg.get("enrich_customer_context", False))
+    if enrich_ctx:
+        from src.data.context_string import compute_customer_aggregates
+        aggs = compute_customer_aggregates(events_subset, train_only=True)
+        n_enriched = 0
+        for cid, agg in aggs.items():
+            if not agg:
+                continue
+            existing = customer_to_extras.get(str(cid), {}) or {}
+            existing.update(agg)
+            customer_to_extras[str(cid)] = existing
+            n_enriched += 1
+        logger.info(
+            "c_d enrichment (customer aggregates): populated extras for "
+            "%d / %d customers (top_brand / top_categories / avg_price / "
+            "repeat_rate)",
+            n_enriched, len(aggs),
+        )
+
+    # Hard-negative sampling rate: opt-in via YAML ``data.hard_negative_rate``
+    # (default 0.0 — preserves the legacy half-cat / half-random sampler).
+    # When > 0, that fraction of n_negatives is drawn from same-category +
+    # price-band-similar ASINs, forcing PO-LEU to discriminate on subtle
+    # signals instead of obvious distractors.
+    hard_neg_rate = float(data_cfg.get("hard_negative_rate", 0.0) or 0.0)
+    hard_neg_band = float(data_cfg.get("hard_negative_price_band", 0.5) or 0.5)
     logger.info("stage: build_choice_sets (train+val+test rows together)")
+    if hard_neg_rate > 0.0:
+        logger.info(
+            "hard-negative sampling: rate=%.2f, price_band=%.2f",
+            hard_neg_rate, hard_neg_band,
+        )
     records_all = build_choice_sets(
         events_subset,
         persons_canonical,
@@ -703,6 +784,8 @@ def main(args: argparse.Namespace) -> int:
         n_negatives=int(adapter.schema.choice_set_size) - 1,
         customer_to_extras=customer_to_extras or None,
         drop_pool_starved=bool(getattr(args, "drop_pool_starved_events", False)),
+        hard_negative_rate=hard_neg_rate,
+        hard_negative_price_band=hard_neg_band,
     )
 
     # Split records by the split label embedded in each record. Needed
@@ -770,15 +853,26 @@ def main(args: argparse.Namespace) -> int:
 
     llm_client, encoder = _build_llm_and_encoder(args, config)
 
-    # Caches live at repo-root defaults unless overridden in config.
+    # Caches live at repo-root defaults unless overridden in config or
+    # via the ``OUTCOMES_CACHE_PATH`` / ``EMBEDDINGS_CACHE_PATH`` env
+    # vars. Env vars take highest precedence — they let parallel
+    # tmux sessions point each seed at its own SQLite DB so the WAL-mode
+    # write contention you'd otherwise see across processes goes away
+    # entirely. Different seeds NEVER share cache entries (seed is
+    # folded into the composite key) so per-seed DBs don't change
+    # any LLM cost; the only effect is removing lock contention.
     paths_cfg = config.get("paths") or {}
     cache_cfg = (config.get("outcomes") or {}).get("cache") or {}
+    env_outcomes = os.environ.get("OUTCOMES_CACHE_PATH", "").strip()
+    env_embeddings = os.environ.get("EMBEDDINGS_CACHE_PATH", "").strip()
     outcomes_cache_path = Path(
+        env_outcomes or
         cache_cfg.get("outcomes_path",
                       (paths_cfg.get("outcomes_cache", "outcomes_cache/")
                        + "outcomes.sqlite"))
     )
     embeddings_cache_path = Path(
+        env_embeddings or
         cache_cfg.get("embeddings_path",
                       (paths_cfg.get("embeddings_cache", "embeddings_cache/")
                        + "embeddings.sqlite"))
@@ -790,6 +884,11 @@ def main(args: argparse.Namespace) -> int:
         embeddings_cache_path = REPO_ROOT / embeddings_cache_path
     outcomes_cache_path.parent.mkdir(parents=True, exist_ok=True)
     embeddings_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if env_outcomes or env_embeddings:
+        logger.info(
+            "cache paths overridden via env: outcomes=%s, embeddings=%s",
+            outcomes_cache_path, embeddings_cache_path,
+        )
 
     from src.outcomes.cache import EmbeddingsCache, OutcomesCache
     from src.outcomes.diversity_filter import diversity_filter as _default_div_filter
@@ -820,6 +919,21 @@ def main(args: argparse.Namespace) -> int:
             tab_names,
         )
 
+    # Curriculum-refinement cascade: when set, assemble_batch tries each
+    # version's cache before falling through to the LAST version's
+    # generate_outcomes (the only version permitted to LLM-call on miss).
+    # ``getattr`` keeps in-process callers (smoke tests building a
+    # Namespace by hand) working without listing every CLI flag.
+    cascade_arg = getattr(args, "prompt_version_cascade", None)
+    prompt_version_cascade = (
+        tuple(cascade_arg) if cascade_arg else None
+    )
+    if prompt_version_cascade:
+        logger.info(
+            "prompt_version cascade active: %s (last entry is the LLM-fallback)",
+            list(prompt_version_cascade),
+        )
+
     logger.info("stage: assemble_batch (train)")
     batch_train = assemble_batch(
         records_train,
@@ -830,6 +944,7 @@ def main(args: argparse.Namespace) -> int:
         embeddings_cache=embeddings_cache,
         K=K,
         seed=int(args.seed),
+        prompt_version_cascade=prompt_version_cascade,
         diversity_filter=_default_div_filter,
         omega=train_event_weights_aligned,
         tabular_feature_names=tab_names,
@@ -851,6 +966,7 @@ def main(args: argparse.Namespace) -> int:
             embeddings_cache=embeddings_cache,
             K=K,
             seed=int(args.seed),
+            prompt_version_cascade=prompt_version_cascade,
             diversity_filter=_default_div_filter,
             omega=None,
             tabular_feature_names=tab_names,
@@ -877,6 +993,7 @@ def main(args: argparse.Namespace) -> int:
             embeddings_cache=embeddings_cache,
             K=K,
             seed=int(args.seed),
+            prompt_version_cascade=prompt_version_cascade,
             diversity_filter=_default_div_filter,
             omega=None,
             tabular_feature_names=tab_names,
@@ -1078,6 +1195,80 @@ def main(args: argparse.Namespace) -> int:
     (out_dir / "metrics_test.json").write_text(
         json.dumps(test_metrics_payload, indent=2)
     )
+
+    # ---- 12b. per-event NLL sidecars (val + test) ---------------------
+    # The curriculum-refinement loop (scripts/identify_failure_events.py)
+    # consumes ``val_per_event.json`` to pick the worst val events to
+    # regenerate outcomes for. The test sidecar is for diagnostics only —
+    # never use it to choose what to refine (test-set leakage). Schema
+    # mirrors src/baselines/evaluate.py:130-139 so downstream tooling
+    # can join PO-LEU and baseline rows by event_idx.
+    def _write_per_event_sidecar(
+        path: Path,
+        logits_t: torch.Tensor,
+        records: list[dict],
+        c_star_t: torch.Tensor,
+    ) -> None:
+        logits_np = logits_t.detach().cpu().numpy().astype("float64")
+        c_star_np = c_star_t.detach().cpu().numpy().astype("int64")
+        # Stable log-softmax: shift by row max before exp.
+        row_max = logits_np.max(axis=1, keepdims=True)
+        shifted = logits_np - row_max
+        log_z = np.log(np.exp(shifted).sum(axis=1, keepdims=True))
+        log_probs = shifted - log_z
+        N = logits_np.shape[0]
+        rows = []
+        for i in range(N):
+            ci = int(c_star_np[i])
+            rec = records[i] if i < len(records) else {}
+            rows.append({
+                "event_idx": i,
+                "customer_id": str(rec.get("customer_id", "")),
+                "asin_chosen": str(
+                    rec.get("choice_asins", [""] * (ci + 1))[ci]
+                    if rec.get("choice_asins") else ""
+                ),
+                "c_star": ci,
+                "p_chosen": float(np.exp(log_probs[i, ci])),
+                "nll": float(-log_probs[i, ci]),
+                "top1_correct": bool(int(np.argmax(logits_np[i])) == ci),
+            })
+        path.write_text(json.dumps(
+            {"per_event": rows, "n_events": N},
+            indent=2,
+        ))
+
+    _write_per_event_sidecar(
+        out_dir / "val_per_event.json",
+        logits_val,
+        records_val if records_val else records_train,
+        batch_val.c_star,
+    )
+    _write_per_event_sidecar(
+        out_dir / "test_per_event.json",
+        logits_test,
+        records_test if records_test else (records_val or records_train),
+        batch_test.c_star,
+    )
+    logger.info(
+        "wrote per-event sidecars: %s, %s",
+        out_dir / "val_per_event.json",
+        out_dir / "test_per_event.json",
+    )
+
+    # ---- 12c. emit test_logits.npz for the leaderboard ----------------
+    # Schema matches scripts/run_interpretability_tax.py and is consumed
+    # by scripts/run_baselines.py via --external-logits / --poleu-logits.
+    # Lets run_full_evaluation.sh fold this PO-LEU run (residual on or off)
+    # into the leaderboard as a named row.
+    logits_path = out_dir / "test_logits.npz"
+    np.savez(
+        logits_path,
+        logits=logits_test.detach().cpu().numpy().astype("float32"),
+        c_star=batch_test.c_star.detach().cpu().numpy().astype("int64"),
+        n_params=np.array(int(model.num_params()), dtype=np.int64),
+    )
+    logger.info("wrote %s", logits_path)
 
     # ---- 13. §12 reports (interpretability) ---------------------------
     from src.eval.interpret import run_all_reports

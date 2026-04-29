@@ -8,8 +8,9 @@ metric formulas and tie-breaking as :mod:`src.eval.metrics`.
 This script is PO-LEU-free on purpose: it only consumes the *records*
 produced by :func:`src.data.choice_sets.build_choice_sets`, so it can
 run with or without the LLM-generation stage having been completed.
-When a PO-LEU run artifact is supplied via ``--poleu-logits``, its
-scores are folded into the leaderboard as an additional row.
+When external model artifacts are supplied via ``--external-logits``
+(or the legacy single-model alias ``--poleu-logits``), their scores
+are folded into the leaderboard as additional rows.
 
 CLI
 ---
@@ -17,7 +18,11 @@ CLI
     python -m scripts.run_baselines \\
         --dataset-yaml configs/datasets/amazon.yaml \\
         --n-customers 20 --seed 7 \\
-        [--poleu-logits path/to/poleu_test_logits.npz]
+        [--external-logits PO-LEU=path/to/no_residual/test_logits.npz \\
+         --external-logits PO-LEU-RESIDUAL=path/to/residual/test_logits.npz]
+
+    # legacy single-row form (still supported)
+    python -m scripts.run_baselines ... --poleu-logits path/to/test_logits.npz
 
     # smoke test
     python -m scripts.run_baselines --synthetic
@@ -264,20 +269,25 @@ def _build_records_from_dataset(
     return train_recs, val_recs, test_recs
 
 
-def _poleu_row(
+def _external_row(
+    name: str,
     logits_path: str,
     test_batch,
     train_n_events: int,
 ) -> dict[str, object]:
-    """Compute the PO-LEU leaderboard row from a saved logits artifact.
+    """Compute a leaderboard row from an externally-trained model's logits.
 
-    Expects a ``.npz`` with keys ``logits`` (shape ``(N, J)``),
-    ``c_star`` (shape ``(N,)``), and optionally ``n_params``.
+    Used for PO-LEU and any other model whose scores are produced outside
+    the baselines pipeline. Expects a ``.npz`` with keys ``logits`` (shape
+    ``(N, J)``), ``c_star`` (shape ``(N,)``), and optionally ``n_params``.
+
+    ``name`` is the display name in the leaderboard column (e.g. ``PO-LEU``
+    or ``PO-LEU-RESIDUAL``).
 
     Slice-alignment guard: verifies that the (N, c_star) in the npz match
     ``test_batch``'s (n_events, chosen_indices) exactly. If they don't,
-    PO-LEU was scored on a different test slice than the baselines and
-    folding the row into the leaderboard would be a structurally invalid
+    the external model was scored on a different test slice than the
+    baselines and folding the row in would be a structurally invalid
     apples-to-oranges comparison. Fail loud rather than silently emit
     misleading numbers (the bug we hit pre-records.pkl).
     """
@@ -291,21 +301,22 @@ def _poleu_row(
     # --- slice-alignment guard ----------------------------------------------
     if int(logits.shape[0]) != int(test_batch.n_events):
         raise SystemExit(
-            f"PO-LEU slice mismatch: --poleu-logits has N={logits.shape[0]} "
-            f"but test batch has N={test_batch.n_events}. The two were "
-            f"scored on different test sets; the leaderboard row would be "
-            f"meaningless. Re-run scripts/run_dataset.py against the same "
-            f"records.pkl that produced the baselines, or pass "
-            f"--records-from <run_dir>/records.pkl to scripts/run_baselines.py."
+            f"{name} slice mismatch: logits at {logits_path} have "
+            f"N={logits.shape[0]} but test batch has "
+            f"N={test_batch.n_events}. The two were scored on different "
+            f"test sets; the leaderboard row would be meaningless. Re-run "
+            f"scripts/run_dataset.py against the same records.pkl that "
+            f"produced the baselines, or pass --records-from "
+            f"<run_dir>/records.pkl to scripts/run_baselines.py."
         )
     test_c_star = np.asarray(test_batch.chosen_indices, dtype=np.int64)
     npz_c_star = np.asarray(c_star, dtype=np.int64)
     if not np.array_equal(test_c_star, npz_c_star):
         n_mismatch = int(np.sum(test_c_star != npz_c_star))
         raise SystemExit(
-            f"PO-LEU slice mismatch: chosen_indices disagree on "
+            f"{name} slice mismatch: chosen_indices disagree on "
             f"{n_mismatch}/{len(test_c_star)} test events between "
-            f"--poleu-logits and the test batch. The two were scored on "
+            f"{logits_path} and the test batch. The two were scored on "
             f"different events (or in different order). Re-run "
             f"scripts/run_dataset.py against the same records.pkl that "
             f"produced the baselines, or pass --records-from to "
@@ -316,19 +327,55 @@ def _poleu_row(
         logits, c_star, n_params=n_params, n_train=int(train_n_events)
     )
     return {
-        "name": "PO-LEU",
+        "name": name,
         "status": "ok",
         "top1": em.top1,
+        "top3": em.top3,
         "top5": em.top5,
         "mrr": em.mrr_val,
         "test_nll": em.nll_val,
+        "brier": em.brier_val,
         "aic": em.aic_val,
         "bic": em.bic_val,
         "n_params": em.n_params,
         "fit_seconds": 0.0,
-        "description": f"PO-LEU artifact {Path(logits_path).name}",
+        "description": f"{name} artifact {Path(logits_path).name}",
         "error": None,
     }
+
+
+def _parse_external_logits(
+    pairs: list[str] | None,
+) -> list[tuple[str, str]]:
+    """Parse ``--external-logits NAME=PATH`` repeatable args.
+
+    Rejects empty names / paths and duplicate names. Order is preserved
+    so leaderboard rows appear in the order the user listed them.
+    """
+    if not pairs:
+        return []
+    parsed: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in pairs:
+        if "=" not in raw:
+            raise SystemExit(
+                f"--external-logits expects NAME=PATH (got {raw!r})"
+            )
+        name, path = raw.split("=", 1)
+        name = name.strip()
+        path = path.strip()
+        if not name or not path:
+            raise SystemExit(
+                f"--external-logits expects NAME=PATH with non-empty parts "
+                f"(got {raw!r})"
+            )
+        if name in seen:
+            raise SystemExit(
+                f"--external-logits name {name!r} listed more than once"
+            )
+        seen.add(name)
+        parsed.append((name, path))
+    return parsed
 
 
 def main() -> int:
@@ -346,7 +393,24 @@ def main() -> int:
         "--poleu-logits",
         type=str,
         default=None,
-        help="Path to a .npz carrying PO-LEU's test-set logits / c_star / n_params.",
+        help=(
+            "Path to a .npz carrying PO-LEU's test-set logits / c_star / "
+            "n_params. Equivalent to --external-logits PO-LEU=PATH; kept "
+            "for backwards compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--external-logits",
+        action="append",
+        default=None,
+        metavar="NAME=PATH",
+        help=(
+            "Repeatable. Fold an externally-trained model's logits into "
+            "the leaderboard as a row named NAME. Same .npz schema as "
+            "--poleu-logits (logits, c_star, optional n_params). Use this "
+            "to add e.g. --external-logits PO-LEU=run_a/test_logits.npz "
+            "--external-logits PO-LEU-RESIDUAL=run_b/test_logits.npz."
+        ),
     )
     parser.add_argument(
         "--records-from",
@@ -512,8 +576,19 @@ def main() -> int:
         train, val, test, verbose=True
     )
 
+    external_pairs = _parse_external_logits(args.external_logits)
     if args.poleu_logits:
-        rows.append(_poleu_row(args.poleu_logits, test, train.n_events))
+        # --poleu-logits is the legacy single-model alias. Slot it in as
+        # PO-LEU unless the user already named PO-LEU via --external-logits.
+        legacy_pair = ("PO-LEU", args.poleu_logits)
+        if any(name == "PO-LEU" for name, _ in external_pairs):
+            raise SystemExit(
+                "--poleu-logits and --external-logits PO-LEU=... both supplied; "
+                "pick one."
+            )
+        external_pairs.append(legacy_pair)
+    for name, path in external_pairs:
+        rows.append(_external_row(name, path, test, train.n_events))
 
     print()
     print(format_table(rows))

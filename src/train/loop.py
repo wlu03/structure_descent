@@ -654,12 +654,23 @@ def fit(
             state.stopped_early = True
             break
 
-    # --- Strategy A.1: reload best checkpoint after early stop --------------
-    # PO-LEU was leaving the final-epoch (worse) weights in place after early
-    # stop, which silently degrades downstream metrics by the gap between
-    # final and best val NLL. Reload only when we *actually* stopped early —
-    # the natural end-of-loop case keeps the weights the loop just produced.
-    if state.stopped_early and best_state is not None:
+    # --- Strategy A.1: reload best checkpoint at end of training -----------
+    # PO-LEU was leaving the final-epoch (worse) weights in place, which
+    # silently degrades downstream metrics by the gap between final and best
+    # val NLL. Originally gated on ``state.stopped_early`` so the reload
+    # only fired when early-stopping triggered. With early-stopping disabled
+    # by default (configs/default.yaml: early_stopping_patience=9999), that
+    # gate prevented the reload from ever firing, and runs silently kept the
+    # final-epoch weights. Now: reload whenever a best snapshot exists and
+    # the current val NLL is worse than that snapshot — covers both early-
+    # stop and natural-end-of-loop. No reload when the final epoch IS the
+    # best (avoids a redundant evaluate_nll pass).
+    needs_reload = (
+        best_state is not None
+        and state.val_nll is not None
+        and float(state.best_val_nll) < float(state.val_nll)
+    )
+    if needs_reload:
         # Re-cast each tensor back to whatever device/dtype the model is
         # currently on. Handles the GPU-mode case where the snapshot lives
         # on CPU but the model lives on cuda.
@@ -671,7 +682,7 @@ def fit(
                 reloaded[k] = v.to(device=tgt.device, dtype=tgt.dtype)
             else:
                 reloaded[k] = v
-        pre_reload = state.val_nll if state.val_nll is not None else float("nan")
+        pre_reload = state.val_nll
         model.load_state_dict(reloaded)
         state.reloaded_best_checkpoint = True
         # Update val_nll to reflect the reloaded weights. We have the value
@@ -680,9 +691,10 @@ def fit(
         state.val_nll = float(evaluate_nll(model, val_batches_fn()))
         logger.info(
             "strategy A.1 fired: reloaded best-val checkpoint "
-            "(final-epoch val_nll=%.4f -> reloaded val_nll=%.4f, "
-            "best_val_nll captured=%.4f)",
+            "(end-of-loop val_nll=%.4f -> reloaded val_nll=%.4f, "
+            "best_val_nll captured=%.4f, stopped_early=%s)",
             pre_reload, state.val_nll, state.best_val_nll,
+            state.stopped_early,
         )
     elif state.stopped_early and best_state is None:
         logger.warning(
