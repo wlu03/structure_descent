@@ -1,0 +1,23 @@
+{
+  "top1": 0.35885167121887207,
+  "top5": 0.8684210777282715,
+  "mrr_val": 0.5570726057568163,
+  "nll_val": 1.8683295249938965,
+  "aic_val": 1101582.0143165588,
+  "bic_val": 4435642.693226477,
+  "pseudo_r2": 0.18859479691822723,
+  "ece_val": 0.177662863186672,
+  "n_params": 544491,
+  "n_train": 3372,
+  "effective_p": 23,
+  "canonical_p": 26,
+  "p_is_dataset_dependent": true,
+  "p_reduction_reason": "city_size vocabulary reduced to 1 label(s) (canonical 4)",
+  "regularizers_active": {
+    "weight_l2": true,
+    "salience_entropy": true,
+    "monotonicity": true,
+    "diversity": true
+  },
+  "n_test_records": 418
+}
