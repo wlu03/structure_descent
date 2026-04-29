@@ -23,9 +23,13 @@ from src.model.po_leu import (
 
 
 def test_param_count_default() -> None:
-    """Orchestrator-reconciled total: 492_805 + 1_029 + 50_945 = 544_779."""
+    """Group-2 total: 492_805 + 1_029 + 51_465 = 545_299.
+
+    Salience grew by 520 parameters (+512 from the d_cat=8 widening of
+    fc1, +8 from the 1-row category embedding).
+    """
     model = POLEU()
-    assert model.num_params() == EXPECTED_PARAM_COUNT_DEFAULT == 544_779
+    assert model.num_params() == EXPECTED_PARAM_COUNT_DEFAULT == 545_299
 
 
 def test_param_count_uniform_salience() -> None:
@@ -452,3 +456,45 @@ def test_residual_intermediates_to_dict(synthetic_batch) -> None:
     _, inter_res = residual(sb.z_d, sb.E, x_tab)
     keys_res = set(inter_res.to_dict().keys())
     assert keys_res == {"A", "w", "U", "S", "V", "V_residual", "V_total"}
+
+
+
+# ---------------------------------------------------------------------------
+# Group-2 SalienceNet category injection plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_forward_accepts_c_none(synthetic_batch) -> None:
+    """Legacy callers that don't pass c still work."""
+    sb = synthetic_batch
+    model = POLEU()
+    logits, inter = model(sb.z_d, sb.E)
+    assert logits.shape == (sb.B, sb.J)
+    logits2, _ = model(sb.z_d, sb.E, c=None)
+    assert torch.equal(logits, logits2)
+
+
+def test_forward_with_int64_c(synthetic_batch) -> None:
+    """Per-event category code threads through SalienceNet."""
+    sb = synthetic_batch
+    model = POLEU(n_categories=5, d_cat=8)
+    c = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    logits, inter = model(sb.z_d, sb.E, c=c)
+    assert logits.shape == (sb.B, sb.J)
+    assert inter.S.shape == (sb.B, sb.J, sb.K)
+
+
+def test_forward_c_changes_output(synthetic_batch) -> None:
+    """Different category codes produce different logits given same (E, z_d)."""
+    sb = synthetic_batch
+    torch.manual_seed(0)
+    model = POLEU(n_categories=4, d_cat=8)
+    E_pair = sb.E[:1].repeat(2, 1, 1, 1)
+    z_pair = sb.z_d[:1].repeat(2, 1)
+    c0 = torch.tensor([0, 0], dtype=torch.long)
+    c1 = torch.tensor([0, 3], dtype=torch.long)
+    with torch.no_grad():
+        logits_a, _ = model(z_pair, E_pair, c=c0)
+        logits_b, _ = model(z_pair, E_pair, c=c1)
+    assert torch.equal(logits_a[0], logits_b[0])
+    assert not torch.allclose(logits_a[1], logits_b[1], atol=1e-7)

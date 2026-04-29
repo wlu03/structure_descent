@@ -69,10 +69,10 @@ DEFAULT_TABULAR_FEATURES: tuple[str, ...] = ("price", "log1p_price", "price_rank
 # attribute_hidden=128, weight_hidden=32, salience_hidden=64):
 #   heads      = 492_805
 #   weight_net =   1_029
-#   salience   =  50_945
-#   total      = 544_779
+#   salience   =  51_465  (Group-2: +520 from category embedding + d_cat input width)
+#   total      = 545_299
 # See NOTES.md "per-head / salience parameter-count reconciliation".
-EXPECTED_PARAM_COUNT_DEFAULT: int = 544_779
+EXPECTED_PARAM_COUNT_DEFAULT: int = 545_299
 
 
 @dataclass
@@ -201,6 +201,8 @@ class POLEU(nn.Module):
         temperature: float = 1.0,
         tabular_residual_enabled: bool = False,
         tabular_features: Sequence[str] = DEFAULT_TABULAR_FEATURES,
+        n_categories: int = 1,
+        d_cat: int = 8,
     ) -> None:
         super().__init__()
 
@@ -214,6 +216,10 @@ class POLEU(nn.Module):
         self.salience_hidden = int(salience_hidden)
         self.weight_normalization = weight_normalization
         self.uniform_salience = bool(uniform_salience)
+        # Group-2: salience category injection. n_categories=1 (default)
+        # collapses to the legacy single-bucket SalienceNet.
+        self.n_categories = int(n_categories)
+        self.d_cat = int(d_cat)
 
         # Temperature is a plain float, not a tensor/parameter/buffer
         # (§8.2, §9.5). A learned τ is explicitly called out as an ablation
@@ -238,6 +244,8 @@ class POLEU(nn.Module):
                 d_e=self.d_e,
                 p=self.p,
                 hidden=self.salience_hidden,
+                n_categories=self.n_categories,
+                d_cat=self.d_cat,
             )
 
         # ----- Strategy B tabular residual ----------------------------------
@@ -343,6 +351,7 @@ class POLEU(nn.Module):
         z_d: torch.Tensor,
         E: torch.Tensor,
         x_tab: Optional[torch.Tensor] = None,
+        c: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, POLEUIntermediates]:
         """Run the Appendix A forward sequence, optionally with the
         Strategy B tabular residual.
@@ -388,7 +397,9 @@ class POLEU(nn.Module):
 
         # (d) Salience — §9.4 step 5 / Appendix A step 4. SalienceNet
         # already applies the softmax-over-K internally (see §7.1).
-        S = self.salience(E, z_d)                          # (B, J, K)
+        # Group-2: ``c`` (per-event category code) goes through to the
+        # category embedding lookup; None falls back to a single bucket.
+        S = self.salience(E, z_d, c)                       # (B, J, K)
 
         # (e) Alternative value — §8.1 / §9.4 step 6 / Appendix A step 5.
         V = (S * U).sum(dim=-1)                            # (B, J)

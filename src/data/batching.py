@@ -469,6 +469,26 @@ class AssembledBatch:
     keeps existing runs bit-identical.
     """
 
+    c: torch.Tensor | None = None
+    """(N,) int64 or ``None``.
+
+    Per-event category code consumed by PO-LEU's SalienceNet
+    category embedding (Group-2 fix). Populated from
+    ``records[i]["category_code"]`` when present; ``None`` when the
+    upstream choice-set builder did not emit category codes (legacy
+    fixtures, hand-crafted records). The training loop reads
+    ``batch.get("c")`` and treats ``None`` as "single-bucket fallback",
+    which preserves bit-identical behaviour for unmodified callers.
+    """
+
+    category_vocab: tuple[str, ...] = ()
+    """Ordered category names parallel to :attr:`c`'s integer codes.
+
+    Empty tuple when records did not carry a ``category_vocab`` key.
+    Length sets ``n_categories`` for the SalienceNet embedding when
+    PO-LEU is constructed downstream of this batch.
+    """
+
     tabular_feature_names: tuple[str, ...] = ()
     """Names of the columns in :attr:`x_tab` (parallel to its last axis).
 
@@ -650,6 +670,20 @@ def assemble_batch(
             # ``alt`` is an adapter-rendered alt-text dict with a
             # "price" key (see DatasetAdapter.alt_text docstring).
             prices_np[i, j] = float(alt.get("price", 0.0) or 0.0)
+
+    # Group-2: per-event category codes for the SalienceNet category
+    # embedding. Falls back to all-zeros when records predate the
+    # build_choice_sets that stashes "category_code" — preserves legacy
+    # single-bucket behaviour.
+    cat_codes_np = np.asarray(
+        [int(rec.get("category_code", 0)) for rec in records],
+        dtype=np.int64,
+    )
+    # Ordered category vocabulary parallel to cat_codes_np. Read off
+    # records[0] (every record carries the same interned tuple); empty
+    # tuple when absent.
+    _vocab_raw = records[0].get("category_vocab", ()) if records else ()
+    category_vocab: tuple[str, ...] = tuple(str(v) for v in _vocab_raw)
 
     # ----- outcome generation (parallel) + flat encode ---------------------
     # Dispatch every (i, j) LLM / cache call to a ThreadPoolExecutor so the
@@ -868,6 +902,13 @@ def assemble_batch(
     c_star_t = torch.from_numpy(c_star_np).to(torch.int64)
     omega_t = torch.from_numpy(omega_np).to(torch.float32)
     prices_t = torch.from_numpy(prices_np).to(torch.float32)
+    # Group-2 category code tensor (None when records carry no codes;
+    # cat_codes_np is always a length-N int64 array, but if the
+    # category_vocab is empty we treat the per-event "0" as legacy
+    # zero-bucket — both downstream and the loop default to that).
+    c_t: torch.Tensor | None = (
+        torch.from_numpy(cat_codes_np).to(torch.int64) if len(records) > 0 else None
+    )
 
     # ----- Strategy B x_tab ------------------------------------------------
     x_tab_t: torch.Tensor | None = None
@@ -962,6 +1003,8 @@ def assemble_batch(
         omega=omega_t,
         prices=prices_t,
         x_tab=x_tab_t,
+        c=c_t,
+        category_vocab=category_vocab,
         tabular_feature_names=tab_names,
         customer_ids=customer_ids,
         chosen_asins=chosen_asins,
@@ -1009,4 +1052,5 @@ def iter_to_torch_batches(
         generator=generator,
         prices=batch.prices,
         x_tab=batch.x_tab,
+        c=batch.c,
     )

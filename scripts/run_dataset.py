@@ -1020,6 +1020,12 @@ def main(args: argparse.Namespace) -> int:
     wnet_cfg = model_cfg.get("weight_net") or {}
     snet_cfg = model_cfg.get("salience_net") or {}
 
+    # Group-2: size SalienceNet's category embedding from the assembled
+    # batch's category vocabulary. Falls back to 1 (legacy single bucket)
+    # when records carry no "category_vocab" key.
+    _vocab = getattr(batch_train, "category_vocab", ())
+    n_categories_runtime = max(1, len(_vocab))
+
     poleu_kwargs: dict[str, Any] = dict(
         M=int(model_cfg.get("M", 5)),
         K=K,
@@ -1032,6 +1038,8 @@ def main(args: argparse.Namespace) -> int:
         weight_normalization=str(wnet_cfg.get("normalization", "softmax")),
         uniform_salience=bool(model_cfg.get("uniform_salience", False)),
         temperature=float(model_cfg.get("temperature", 1.0)),
+        n_categories=n_categories_runtime,
+        d_cat=int(snet_cfg.get("d_cat", 8)),
     )
     # Strategy B: only pass the residual kwargs when actively enabled +
     # x_tab is materialised; otherwise stay on POLEU's default-False

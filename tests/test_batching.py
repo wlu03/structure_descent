@@ -855,3 +855,76 @@ def test_parallel_error_propagates():
             seed=0,
             max_concurrent_llm_calls=4,
         )
+
+
+
+# ---------------------------------------------------------------------------
+# Group-2 — category code plumbing on AssembledBatch
+# ---------------------------------------------------------------------------
+
+
+def test_assembled_batch_has_c_attribute():
+    """AssembledBatch.c populated when records carry category_code."""
+    records = _make_records(N=3, J=4, p=26)
+    # Stash category metadata on every record (simulating what
+    # build_choice_sets now does).
+    for i, rec in enumerate(records):
+        rec["category_code"] = i % 2
+        rec["category_vocab"] = ("electronics", "books")
+    batch = assemble_batch(
+        records,
+        adapter=None,
+        llm_client=StubLLMClient(),
+        encoder=StubEncoder(d_e=768),
+        outcomes_cache=None,
+        embeddings_cache=None,
+        K=3,
+    )
+    assert batch.c is not None
+    assert tuple(batch.c.shape) == (3,)
+    assert batch.c.dtype == torch.int64
+    assert batch.c.tolist() == [0, 1, 0]
+    assert batch.category_vocab == ("electronics", "books")
+
+
+def test_assembled_batch_c_default_zeros_when_missing():
+    """Records without category_code get all-zero c (legacy fallback)."""
+    records = _make_records(N=2, J=3, p=26)
+    batch = assemble_batch(
+        records,
+        adapter=None,
+        llm_client=StubLLMClient(),
+        encoder=StubEncoder(d_e=768),
+        outcomes_cache=None,
+        embeddings_cache=None,
+        K=3,
+    )
+    # Whether c is None or all zeros, semantics match: the loop forwards
+    # batch.get("c") which becomes None or zeros and SalienceNet treats
+    # both the same (single-bucket fallback).
+    assert batch.c is not None
+    assert torch.equal(batch.c, torch.zeros(2, dtype=torch.int64))
+    assert batch.category_vocab == ()
+
+
+def test_iter_to_torch_yields_c_key():
+    """iter_to_torch_batches forwards c when populated on the batch."""
+    records = _make_records(N=4, J=3, p=26)
+    for i, rec in enumerate(records):
+        rec["category_code"] = i % 3
+        rec["category_vocab"] = ("a", "b", "c")
+    batch = assemble_batch(
+        records,
+        adapter=None,
+        llm_client=StubLLMClient(),
+        encoder=StubEncoder(d_e=768),
+        outcomes_cache=None,
+        embeddings_cache=None,
+        K=3,
+    )
+    bs = list(iter_to_torch_batches(batch, batch_size=2, shuffle=False))
+    assert len(bs) == 2
+    for b in bs:
+        assert "c" in b
+        assert b["c"].dtype == torch.int64
+        assert b["c"].shape == (2,)

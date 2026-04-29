@@ -232,6 +232,7 @@ def iter_batches(
     generator: torch.Generator | None = None,
     prices: torch.Tensor | None = None,
     x_tab: torch.Tensor | None = None,
+    c: torch.Tensor | None = None,
 ) -> Iterator[dict[str, torch.Tensor]]:
     """Yield mini-batches of a full-in-memory dataset.
 
@@ -297,6 +298,16 @@ def iter_batches(
                 f"x_tab must be 3-D (N, J, F); got {x_tab.shape=}."
             )
 
+    if c is not None:
+        if c.shape[0] != N:
+            raise ValueError(
+                f"c first dim must equal N={N}; got {c.shape=}."
+            )
+        if c.dim() != 1:
+            raise ValueError(f"c must be 1-D (N,); got {c.shape=}.")
+        if c.dtype != torch.long:
+            raise ValueError(f"c must be int64 (torch.long); got dtype={c.dtype}.")
+
     if shuffle:
         perm = torch.randperm(N, generator=generator)
     else:
@@ -314,6 +325,8 @@ def iter_batches(
             batch["prices"] = prices.index_select(0, idx)
         if x_tab is not None:
             batch["x_tab"] = x_tab.index_select(0, idx)
+        if c is not None:
+            batch["c"] = c.index_select(0, idx)
         yield batch
 
 
@@ -453,11 +466,12 @@ def _compute_batch_loss(
     omega = batch["omega"]
     prices = batch.get("prices")  # optional; None disables monotonicity term
     x_tab = batch.get("x_tab")    # optional; None disables PO-LEU residual
+    c = batch.get("c")            # Group-2: per-event category code; None = legacy
 
     if x_tab is not None:
-        logits, intermediates = model(z_d, E, x_tab)
+        logits, intermediates = model(z_d, E, x_tab, c=c)
     else:
-        logits, intermediates = model(z_d, E)
+        logits, intermediates = model(z_d, E, c=c)
     loss = cross_entropy_loss(logits, c_star, omega)
 
     if reg_cfg is not None:
@@ -541,10 +555,11 @@ def evaluate_nll(
 
     for batch in batches:
         x_tab = batch.get("x_tab")
+        c = batch.get("c")  # Group-2: forward category code when present
         if x_tab is not None:
-            logits, _ = model(batch["z_d"], batch["E"], x_tab)
+            logits, _ = model(batch["z_d"], batch["E"], x_tab, c=c)
         else:
-            logits, _ = model(batch["z_d"], batch["E"])
+            logits, _ = model(batch["z_d"], batch["E"], c=c)
         per_event = torch.nn.functional.cross_entropy(
             logits, batch["c_star"], reduction="none"
         )

@@ -24,14 +24,15 @@ from src.model.salience_net import (
 
 
 def test_param_count_default() -> None:
-    """§7.1 corrected: 794*64 + 64 + 64*1 + 1 = 50_945 trainable parameters.
+    """Group-2: 802*64 + 64 + 64*1 + 1 + 1*8 = 51_465 trainable parameters.
 
-    The spec's printed 50_881 drops the fc1 bias term; §0 mandates biases
-    on every Linear, so the orchestrator override fixes the constant to
-    50_945. See NOTES.md "per-head / salience parameter-count reconciliation".
+    The +520 over the original 50_945 comes from (a) widening fc1's
+    in_dim by d_cat=8 → +512 weights, (b) adding a 1*8 nn.Embedding
+    for the category lookup → +8. With n_categories=1 the embedding
+    behaves as a single-bucket bias, preserving legacy semantics.
     """
     net = SalienceNet()
-    assert net.num_params() == EXPECTED_PARAM_COUNT_DEFAULT == 50_945
+    assert net.num_params() == EXPECTED_PARAM_COUNT_DEFAULT == 51_465
 
 
 def test_xavier_init_and_zero_bias() -> None:
@@ -173,4 +174,106 @@ def test_module_constants() -> None:
     assert DEFAULT_D_E == 768
     assert DEFAULT_P == 26
     assert DEFAULT_HIDDEN == 64
-    assert EXPECTED_PARAM_COUNT_DEFAULT == 794 * 64 + 64 + 64 * 1 + 1
+    # Group-2 in_dim = d_e + p + d_cat = 802; +1*8 for the category emb.
+    assert EXPECTED_PARAM_COUNT_DEFAULT == 802 * 64 + 64 + 64 * 1 + 1 + 1 * 8
+
+
+
+# ---------------------------------------------------------------------------
+# Group-2 category injection
+# ---------------------------------------------------------------------------
+
+
+def test_salience_with_category(synthetic_batch) -> None:
+    """SalienceNet accepts (B,) int64 c and produces a (B,J,K) softmaxed output.
+
+    Same shape contract as the c=None path, but the category embedding
+    contributes a per-event additive feature in the MLP input.
+    """
+    sb = synthetic_batch
+    net = SalienceNet(n_categories=4, d_cat=8)
+    c = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    out = net(sb.E, sb.z_d, c)
+    assert out.shape == (sb.B, sb.J, sb.K)
+    sums = out.sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-6)
+
+
+def test_salience_category_changes_output(synthetic_batch) -> None:
+    """Two events with different c yield different S given the same (E, z_d).
+
+    Drives the embedding lookup parameters; if the embedding had no
+    effect, this test would silently pass on a c-blind net.
+    """
+    sb = synthetic_batch
+    torch.manual_seed(0)
+    net = SalienceNet(n_categories=4, d_cat=8)
+    # Use the same first event's E and z_d for two synthetic batch items.
+    E_pair = sb.E[:1].repeat(2, 1, 1, 1)
+    z_pair = sb.z_d[:1].repeat(2, 1)
+
+    c0 = torch.tensor([0, 0], dtype=torch.long)
+    c1 = torch.tensor([0, 3], dtype=torch.long)
+    out_a = net(E_pair, z_pair, c0)
+    out_b = net(E_pair, z_pair, c1)
+    # Row 0 (c=0 in both) must be identical.
+    assert torch.equal(out_a[0], out_b[0])
+    # Row 1 (c=0 vs c=3) must differ — embedding contributes.
+    assert not torch.allclose(out_a[1], out_b[1], atol=1e-7)
+
+
+def test_salience_category_grad_flows(synthetic_batch) -> None:
+    """Gradient propagates back to cat_emb when c is supplied."""
+    sb = synthetic_batch
+    net = SalienceNet(n_categories=4, d_cat=8)
+    c = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    out = net(sb.E, sb.z_d, c)
+    loss = out.sum()
+    loss.backward()
+    assert net.cat_emb.weight.grad is not None
+    assert torch.isfinite(net.cat_emb.weight.grad).all()
+    assert net.cat_emb.weight.grad.norm().item() > 0.0
+
+
+def test_salience_bad_c_dtype_raises(synthetic_batch) -> None:
+    """Non-int64 c is rejected with a clear ValueError."""
+    sb = synthetic_batch
+    net = SalienceNet(n_categories=4)
+    bad = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    try:
+        net(sb.E, sb.z_d, bad)
+    except ValueError as exc:
+        assert "int64" in str(exc) or "torch.long" in str(exc)
+    else:
+        raise AssertionError("expected ValueError on non-int64 c")
+
+
+def test_salience_bad_c_shape_raises(synthetic_batch) -> None:
+    """Wrong-shape c is rejected."""
+    sb = synthetic_batch
+    net = SalienceNet(n_categories=4)
+    bad_dim = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    try:
+        net(sb.E, sb.z_d, bad_dim)
+    except ValueError as exc:
+        assert "1-D" in str(exc)
+    else:
+        raise AssertionError("expected ValueError on 2-D c")
+    bad_b = torch.tensor([0, 1, 2, 3, 4], dtype=torch.long)
+    try:
+        net(sb.E, sb.z_d, bad_b)
+    except ValueError as exc:
+        assert "Batch mismatch" in str(exc) or "B=" in str(exc)
+    else:
+        raise AssertionError("expected ValueError on wrong B")
+
+
+def test_salience_c_none_uses_zero_bucket(synthetic_batch) -> None:
+    """c=None is equivalent to c=zeros(B,)."""
+    sb = synthetic_batch
+    torch.manual_seed(7)
+    net = SalienceNet(n_categories=3)
+    c_zero = torch.zeros(sb.B, dtype=torch.long)
+    out_none = net(sb.E, sb.z_d, None)
+    out_zero = net(sb.E, sb.z_d, c_zero)
+    assert torch.equal(out_none, out_zero)

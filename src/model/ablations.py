@@ -30,6 +30,8 @@ callers should import ``cross_entropy_loss`` from
 
 from __future__ import annotations
 
+from typing import Optional
+
 from dataclasses import dataclass
 
 import torch
@@ -149,7 +151,11 @@ class ConcatUtility(nn.Module):
         )
 
     def forward(
-        self, z_d: torch.Tensor, E: torch.Tensor
+        self,
+        z_d: torch.Tensor,
+        E: torch.Tensor,
+        x_tab: Optional[torch.Tensor] = None,
+        c: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, ConcatIntermediates]:
         """End-to-end forward pass for A7.
 
@@ -197,8 +203,8 @@ class ConcatUtility(nn.Module):
         # (b) MLP -> per-outcome scalar utility.
         U = self.fc2(self.act(self.fc1(x))).squeeze(-1)  # (B, J, K)
 
-        # (c) salience (§7).
-        S = self.salience(E, z_d)  # (B, J, K)
+        # (c) salience (§7). Group-2: c=None keeps A7 single-bucket.
+        S = self.salience(E, z_d, c=None)  # ablation fallback: single bucket
 
         # (d) alternative value (§8.1).
         V = (S * U).sum(dim=-1)  # (B, J)
@@ -317,7 +323,11 @@ class FiLMUtility(nn.Module):
         return gamma, beta
 
     def forward(
-        self, z_d: torch.Tensor, E: torch.Tensor
+        self,
+        z_d: torch.Tensor,
+        E: torch.Tensor,
+        x_tab: Optional[torch.Tensor] = None,
+        c: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, FiLMIntermediates]:
         """End-to-end forward pass for A8.
 
@@ -371,8 +381,8 @@ class FiLMUtility(nn.Module):
         # (d) scalar utility per outcome.
         U = self.backbone_fc2(h).squeeze(-1)  # (B, J, K)
 
-        # (e) salience + value + logits (§7, §8).
-        S = self.salience(E, z_d)
+        # (e) salience + value + logits (§7, §8). Group-2: c=None keeps A8 single-bucket.
+        S = self.salience(E, z_d, c=None)
         V = (S * U).sum(dim=-1)
         logits = V / self.temperature
 

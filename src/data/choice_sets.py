@@ -816,6 +816,14 @@ def build_choice_sets(
     MAX_RESAMPLE_ROUNDS = 5
     J = n_negatives + 1
 
+    # Group-2 (category injection): freeze the category vocabulary as a
+    # tuple of strings parallel to cat_codes_cat.categories. Stashed on
+    # every per-event record so the downstream batcher can size the
+    # SalienceNet category embedding without re-running pd.Categorical.
+    _category_vocab_tuple: tuple[str, ...] = tuple(
+        str(name) for name in cat_codes_cat.categories.tolist()
+    )
+
     records: List[dict] = []
     dedup_fallback_any = False
     n_dropped_pool_starved = 0
@@ -1099,6 +1107,13 @@ def build_choice_sets(
             # records without zipping against the source frame — needed
             # once drop_pool_starved starts dropping rows from the output.
             "split": str(split_arr[i]) if split_arr[i] is not None else "",
+            # Group-2: per-event category code consumed by SalienceNet's
+            # category embedding (PO-LEU). Int in [0, n_categories).
+            # ``category_vocab`` is the parallel ordered tuple of names
+            # (interned-cheap; lets the batcher size n_categories without
+            # re-running pd.Categorical).
+            "category_code": int(cat_codes[i]),
+            "category_vocab": _category_vocab_tuple,
         }
         records.append(record)
 
