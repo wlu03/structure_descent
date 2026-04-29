@@ -63,7 +63,7 @@ def test_supported_features_includes_price_and_record_families() -> None:
     assert {
         "popularity_rank", "log1p_popularity_rank",
         "popularity_count", "log1p_popularity_count",
-        "is_repeat",
+        "is_repeat", "log1p_purchase_count",
     }.issubset(s)
 
 
@@ -125,6 +125,16 @@ def test_is_repeat_binary_per_alt() -> None:
         x[:, :, 0],
         np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32),
     )
+
+
+def test_log1p_purchase_count() -> None:
+    """log1p of per-(customer, asin) train-history count."""
+    recs = _records()
+    x = _build_x_tab_matrix(
+        _prices(recs), ("log1p_purchase_count",), records=recs,
+    )
+    expected = np.log1p([[2, 0, 0], [0, 3, 0]]).astype(np.float32)
+    np.testing.assert_allclose(x[:, :, 0], expected, rtol=1e-6)
 
 
 def test_combined_columns_preserve_order() -> None:
@@ -302,6 +312,7 @@ def test_assemble_batch_e2e_columns_have_signal() -> None:
 
     feats = (
         "popularity_count", "log1p_popularity_count",
+        "is_repeat", "log1p_purchase_count",
     )
     x = _build_x_tab_matrix(prices_np, feats, records=records)
     for f, name in enumerate(feats):

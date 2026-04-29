@@ -44,10 +44,11 @@ model:
       # encoder cannot recover from the band label.
       - popularity_count
       - log1p_popularity_count
-      # Customer-ASIN binary repeat signal: 1 if the customer has
-      # bought this ASIN in train history, else 0. (Graded variant
-      # log1p_purchase_count added in a follow-up commit.)
+      # Graded customer-ASIN repeat-purchase signal. is_repeat is the
+      # binary ("has the customer ever bought this ASIN in train"),
+      # log1p_purchase_count is the graded version.
       - is_repeat
+      - log1p_purchase_count
 
 data:
   split: temporal      # reuses v2.0 split artifact

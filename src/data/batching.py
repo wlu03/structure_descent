@@ -105,6 +105,7 @@ SUPPORTED_TABULAR_FEATURES: tuple[str, ...] = (
     "popularity_count",
     "log1p_popularity_count",
     "is_repeat",
+    "log1p_purchase_count",
 )
 
 
@@ -144,6 +145,10 @@ def _build_x_tab_matrix(
                                       (per-alt train-history map);
                                       falls back to legacy chosen-only
                                       ``metadata["is_repeat"]``.
+        * ``log1p_purchase_count``  — log1p of per-(customer, asin)
+                                      train-history count from
+                                      ``alt_texts[j]["purchase_count"]``.
+
     Adding a record-family feature requires non-None ``records``; passing
     ``records=None`` while requesting one raises ``ValueError`` at the
     caller's boundary so a typo in YAML surfaces here rather than as a
@@ -163,6 +168,7 @@ def _build_x_tab_matrix(
         "popularity_rank", "log1p_popularity_rank",
         "popularity_count", "log1p_popularity_count",
         "is_repeat",
+        "log1p_purchase_count",
     }
     needs_records = any(name in record_features for name in feature_names)
     if needs_records and records is None:
@@ -291,6 +297,11 @@ def _build_x_tab_matrix(
             for i, rec in enumerate(records):
                 for j in range(J):
                     out[i, j, f] = _record_is_repeat(rec, j)
+        elif name == "log1p_purchase_count":
+            for i, rec in enumerate(records):
+                for j in range(J):
+                    pc = _alt_field(rec, j, "purchase_count")
+                    out[i, j, f] = float(np.log1p(max(pc, 0.0)))
         else:
             raise ValueError(
                 f"Unsupported tabular feature {name!r}; supported: "

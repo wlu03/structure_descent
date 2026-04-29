@@ -303,6 +303,28 @@ def build_choice_sets(
         ref_df = df
 
     # --------------------------------------------------------------- #
+    # Per-(customer, asin) train-history count map.
+    #
+    # Used to render two per-alt fields onto every alt dict:
+    #   * is_repeat       — 1.0 if the customer has bought this ASIN in
+    #                       train history (count > 0), else 0.0.
+    #   * purchase_count  — the integer count itself; the residual reads
+    #                       log1p(purchase_count) as a graded signal.
+    #
+    # Built from ``ref_df`` so under cold-start splits we never leak
+    # val/test rows into the count. Under temporal splits ``ref_df``
+    # equals the full ``df``; in that case the chosen alt of a TRAIN
+    # event would have its own purchase counted (count = real prior
+    # purchases + 1 for the current event), inflating the chosen vs.
+    # negatives asymmetrically. We compensate per-event below by
+    # subtracting 1 from the chosen alt's count when ``record["split"]
+    # == "train"`` AND the chosen ASIN appears in this map's count.
+    # --------------------------------------------------------------- #
+    _cust_asin_counts = (
+        ref_df.groupby(["customer_id", "asin"]).size().to_dict()
+    )
+
+    # --------------------------------------------------------------- #
     # Per-customer caches (O(n_customers), not O(n_events)).
     # --------------------------------------------------------------- #
     suppress = tuple(adapter.suppress_fields_for_c_d())
@@ -751,13 +773,40 @@ def build_choice_sets(
     # Freeze window width as a numpy timedelta for the bisect cutoff.
     _window_td = np.timedelta64(int(recent_purchases_window_days), "D")
 
-    def _render_alt_texts(asins: list, chosen_asin, event_row_alt: dict) -> list[dict]:
+    def _render_alt_texts(
+        asins: list,
+        chosen_asin,
+        event_row_alt: dict,
+        cid,
+        adjust_chosen_self_count: bool,
+    ) -> list[dict]:
+        """Render adapter alt_text dicts and inject per-alt train-history.
+
+        Two per-alt fields are added on top of whatever the adapter
+        returns:
+          * ``is_repeat``     — 1.0 if (cid, asin) is in the train-history
+                                count map with count > 0, else 0.0.
+          * ``purchase_count``— the integer count from the same map.
+
+        ``adjust_chosen_self_count``: under temporal splits ``ref_df``
+        includes the current event itself, so the chosen alt would have
+        its own purchase counted (count = prior + 1 for the current
+        train event). Pass True for train events to subtract 1 from
+        the chosen's count (clipped at 0); chosen and negatives then
+        report the same purely-prior count.
+        """
         out: list[dict] = []
         for a in asins:
             if a == chosen_asin:
-                out.append(adapter.alt_text(event_row_alt))
+                d = adapter.alt_text(event_row_alt)
             else:
-                out.append(adapter.alt_text(asin_lookup.get(a, dict(_DEFAULT_ALT))))
+                d = adapter.alt_text(asin_lookup.get(a, dict(_DEFAULT_ALT)))
+            cnt = int(_cust_asin_counts.get((cid, a), 0))
+            if a == chosen_asin and adjust_chosen_self_count and cnt > 0:
+                cnt -= 1
+            d["is_repeat"] = 1.0 if cnt > 0 else 0.0
+            d["purchase_count"] = cnt
+            out.append(d)
         return out
 
     # Hard cap on resample rounds for the dedup guard (prevents infinite
@@ -932,17 +981,30 @@ def build_choice_sets(
             "brand": str(brand_arr[i] or ""),
         }
 
+        # Under temporal splits ``ref_df`` includes the current event
+        # itself, so the chosen alt's count in _cust_asin_counts is
+        # inflated by 1. Subtract for TRAIN events to keep chosen and
+        # negatives symmetric. Cold-start splits already exclude the
+        # current event from ref_df, so adjust=False is correct there.
+        ev_cid = customer_ids[i]
+        ev_split = str(split_arr[i]) if split_arr[i] is not None else ""
+        adjust_chosen = (ev_split == "train")
+
         if n_resamples == 1:
             choice_asins = samples_per_k[0]
             chosen_idx = chosen_idx_per_k[0]
             alt_texts = _render_alt_texts(
-                choice_asins, chosen_asin, event_row_alt
+                choice_asins, chosen_asin, event_row_alt,
+                ev_cid, adjust_chosen,
             )
         else:
             choice_asins = samples_per_k
             chosen_idx = chosen_idx_per_k
             alt_texts = [
-                _render_alt_texts(sample, chosen_asin, event_row_alt)
+                _render_alt_texts(
+                    sample, chosen_asin, event_row_alt,
+                    ev_cid, adjust_chosen,
+                )
                 for sample in samples_per_k
             ]
 

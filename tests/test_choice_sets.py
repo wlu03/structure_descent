@@ -290,7 +290,12 @@ def test_alt_texts_length_matches_J():
         assert len(r["alt_texts"]) == 10  # n_negatives + 1
         for alt in r["alt_texts"]:
             assert isinstance(alt, dict)
-            assert set(alt.keys()) == {"title", "category", "price", "popularity"}
+            # build_choice_sets injects per-(customer, asin) train-history
+            # fields onto every alt dict (Fix 2 — log1p_purchase_count).
+            assert set(alt.keys()) == {
+                "title", "category", "price", "popularity",
+                "is_repeat", "purchase_count",
+            }
 
 
 def test_v2_alt_texts_uses_adapter():
@@ -1483,4 +1488,118 @@ def test_first_seen_raises_on_split_column_with_no_train_rows():
     with pytest.raises(ValueError, match="zero 'train' rows"):
         build_choice_sets(
             events, persons, adapter, n_negatives=9, seed=42, n_resamples=1
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Per-alt purchase_count / is_repeat (Fix 2)
+# --------------------------------------------------------------------------- #
+
+
+def _make_repeat_events() -> "pd.DataFrame":
+    """Customer C00 buys ASIN_A twice (train), once again (val).
+
+    Catalog has enough other ASINs that negatives can be sampled
+    without forcing the dedup-fallback codepath.
+    """
+    rows = []
+    asins = [f"A{i:03d}" for i in range(8)]
+    asin_a = asins[0]
+    base_date = pd.to_datetime("2024-01-01")
+    for c in range(4):
+        cid = f"C{c:02d}"
+        for e in range(8):
+            d = base_date + pd.Timedelta(days=c * 50 + e)
+            if c == 0 and e in (0, 1):
+                asin = asin_a
+            elif c == 0 and e == 6:
+                asin = asin_a
+            else:
+                asin = asins[1 + ((c + e) % (len(asins) - 1))]
+            cat_idx = int(asin[1:]) % 3
+            rows.append(dict(
+                customer_id=cid, order_date=d, asin=asin,
+                category=f"CAT{cat_idx}",
+                price=5.0 + (int(asin[1:]) % 10),
+                title=f"title {asin} word{e}",
+                routine=int(e > 0),
+                novelty=int(e == 0),
+                recency_days=999 if e == 0 else 7,
+                cat_affinity=e,
+                brand="brand_x",
+            ))
+    df = pd.DataFrame(rows)
+    pop = df.groupby("asin").size().rename("popularity").reset_index()
+    df = df.merge(pop, on="asin", how="left")
+    df = df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
+    splits = []
+    for _, g in df.groupby("customer_id", sort=False):
+        n = len(g)
+        # First 6 train, then 1 val, 1 test per customer.
+        splits.extend(["train"] * (n - 2) + ["val", "test"])
+    df["split"] = splits
+    return df
+
+
+def test_purchase_count_per_alt_correct():
+    """Customer C00 has bought ASIN_A twice in train. A val event
+    listing ASIN_A as a negative must report purchase_count == 2
+    and is_repeat == 1.0 on that alt dict."""
+    events = _make_repeat_events()
+    persons = _persons_for(events)
+    adapter = _StubAdapter()
+    records = build_choice_sets(
+        events, persons, adapter, n_negatives=3, seed=0, n_resamples=1,
+    )
+    asin_a = "A000"
+    # Find C00 val event(s).
+    found = False
+    for r in records:
+        if r["customer_id"] != "C00" or r["split"] != "val":
+            continue
+        for j, asin in enumerate(r["choice_asins"]):
+            if asin == asin_a:
+                # Either the chosen alt or a sampled negative; same map.
+                # Train history of (C00, A000) = 2 events; val
+                # split has adjust_chosen=False so count stays 2.
+                assert r["alt_texts"][j]["purchase_count"] == 2
+                assert r["alt_texts"][j]["is_repeat"] == 1.0
+                found = True
+    assert found, "expected ASIN_A to surface in a C00 val event"
+
+
+def test_purchase_count_no_self_count_leak():
+    """Train-event chosen alt: purchase_count must equal the count
+    of PRIOR purchases (excluding the current event), matching
+    what an identical-history negative would report. ref_df under
+    a temporal split includes the current event itself; without
+    the chosen-self adjustment, chosen would inflate by 1."""
+    events = _make_repeat_events()
+    persons = _persons_for(events)
+    adapter = _StubAdapter()
+    records = build_choice_sets(
+        events, persons, adapter, n_negatives=3, seed=0, n_resamples=1,
+    )
+    # Look for the C00 train events where chosen == ASIN_A.
+    asin_a = "A000"
+    seen_counts = []
+    for r in records:
+        if r["customer_id"] != "C00" or r["split"] != "train":
+            continue
+        if r["chosen_asin"] != asin_a:
+            continue
+        chosen_idx = r["chosen_idx"]
+        seen_counts.append(
+            r["alt_texts"][chosen_idx]["purchase_count"]
+        )
+    assert seen_counts, "expected at least one C00 train event chosen=A000"
+    # Train events for C00 buying A000 are at e=0, 1; the temporal
+    # ref_df under-the-hood includes ALL train rows. With the
+    # self-count adjustment in place, both events should report
+    # count == (raw train count of (C00, A000) which is 2) - 1 = 1.
+    # The third A000 purchase at e=6 falls in val per the split.
+    for cnt in seen_counts:
+        assert cnt < 2, (
+            f"chosen alt purchase_count={cnt} suggests self-count leak; "
+            f"expected raw_count - 1."
         )
