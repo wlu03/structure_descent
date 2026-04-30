@@ -69,6 +69,15 @@ _WEEKDAY_NAMES: tuple[str, ...] = (
     "Monday", "Tuesday", "Wednesday", "Thursday",
     "Friday", "Saturday", "Sunday",
 )
+# Month -> "<early|mid|late> <season>" using meteorological seasons
+# (winter = Dec-Feb, etc.). Dec is the first month of winter so Dec =
+# "early winter", Jan = "mid winter", Feb = "late winter".
+_MONTH_TO_SEASON: dict[int, str] = {
+    12: "early winter", 1: "mid winter", 2: "late winter",
+    3:  "early spring", 4: "mid spring", 5: "late spring",
+    6:  "early summer", 7: "mid summer", 8: "late summer",
+    9:  "early fall",  10: "mid fall",  11: "late fall",
+}
 
 
 def _daypart_for_hour(hour: int) -> str:
@@ -82,10 +91,13 @@ def _daypart_for_hour(hour: int) -> str:
 def format_event_time_phrase(timestamp) -> str:
     """Render an event time as a short natural-English phrase.
 
-    Output looks like ``"Saturday morning"`` or ``"Tuesday evening (a
-    weekday)"``. Used to populate the ``current_time`` parameter of
-    :func:`build_context_string` so the LLM outcome generator sees the
-    when-they-decided context. Pure: no I/O, no globals.
+    Output looks like ``"Saturday morning, early summer"`` or
+    ``"Tuesday evening, late fall (weekend)"``. Used to populate the
+    ``current_time`` parameter of :func:`build_context_string` so the
+    LLM outcome generator sees the when-they-decided context with
+    enough resolution to ground time-conditional outcomes (e.g.
+    "I'll get caught in afternoon rain" in spring vs. winter). Pure:
+    no I/O, no globals.
 
     Returns an empty string when *timestamp* is missing or unparseable
     so the caller can pass the result straight through to
@@ -107,8 +119,11 @@ def format_event_time_phrase(timestamp) -> str:
     weekday_idx = int(ts.weekday())
     weekday = _WEEKDAY_NAMES[weekday_idx]
     daypart = _daypart_for_hour(hour)
+    season = _MONTH_TO_SEASON.get(int(ts.month), "")
     is_weekend = weekday_idx >= 5
     suffix = " (weekend)" if is_weekend else ""
+    if season:
+        return f"{weekday} {daypart}, {season}{suffix}"
     return f"{weekday} {daypart}{suffix}"
 
 
