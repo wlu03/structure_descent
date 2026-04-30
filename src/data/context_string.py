@@ -44,8 +44,80 @@ __all__ = [
     "build_context_string",
     "extract_extra_fields_from_row",
     "compute_customer_aggregates",
+    "format_event_time_phrase",
     "paraphrase_rules_check",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Event-time phrase helper (used by build_choice_sets when the dataset
+# wants the per-event time-of-day + weekday rendered into c_d).
+# ---------------------------------------------------------------------------
+
+# Six daypart buckets — matches what the LLM understands without
+# needing exact hour numerics. Ranges are inclusive on the low end.
+_DAYPART_BANDS: tuple[tuple[int, str], ...] = (
+    (5,  "early morning"),
+    (9,  "morning"),
+    (12, "midday"),
+    (17, "afternoon"),
+    (21, "evening"),
+    (24, "late night"),
+)
+_WEEKDAY_NAMES: tuple[str, ...] = (
+    "Monday", "Tuesday", "Wednesday", "Thursday",
+    "Friday", "Saturday", "Sunday",
+)
+
+
+def _daypart_for_hour(hour: int) -> str:
+    h = int(hour) % 24
+    for cutoff, label in _DAYPART_BANDS:
+        if h < cutoff:
+            return label
+    return "late night"
+
+
+def format_event_time_phrase(timestamp) -> str:
+    """Render an event time as a short natural-English phrase.
+
+    Output looks like ``"Saturday morning"`` or ``"Tuesday evening (a
+    weekday)"``. Used to populate the ``current_time`` parameter of
+    :func:`build_context_string` so the LLM outcome generator sees the
+    when-they-decided context. Pure: no I/O, no globals.
+
+    Returns an empty string when *timestamp* is missing or unparseable
+    so the caller can pass the result straight through to
+    :func:`build_context_string` (which treats empty / falsy
+    ``current_time`` as "skip the line").
+    """
+    if timestamp is None:
+        return ""
+    try:
+        # Lazy-import pandas only when we actually need to coerce.
+        import pandas as _pd  # noqa: PLC0415
+
+        ts = _pd.Timestamp(timestamp)
+    except Exception:  # noqa: BLE001 — return empty rather than raising
+        return ""
+    if _pd_is_nat(ts):
+        return ""
+    hour = int(ts.hour)
+    weekday_idx = int(ts.weekday())
+    weekday = _WEEKDAY_NAMES[weekday_idx]
+    daypart = _daypart_for_hour(hour)
+    is_weekend = weekday_idx >= 5
+    suffix = " (weekend)" if is_weekend else ""
+    return f"{weekday} {daypart}{suffix}"
+
+
+def _pd_is_nat(ts) -> bool:
+    """True for pandas NaT / NumPy NaT timestamps; lazy import."""
+    try:
+        import pandas as _pd  # noqa: PLC0415
+        return bool(_pd.isna(ts))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -443,18 +515,29 @@ def build_context_string(
     # else: both suppressed; skip.
 
     # Line 6: purchase frequency + novelty share (not suppressible).
+    # Domain-overridable verb / noun / object phrasing — defaults are
+    # Amazon-tuned and reproduce the prior literal output byte-for-byte.
+    # A non-Amazon dataset can override via extra_fields:
+    #   domain_verb       e.g. "Travels around Boston"   (default "Buys on Amazon")
+    #   activity_noun     e.g. "trips"                   (default "orders")
+    #   novelty_object    e.g. "places"                  (default "products")
+    #   self_report_verb  e.g. "Visits places"           (default "Shops on Amazon")
     _ = novelty_phrase  # surfaced only for DEFAULT_PHRASINGS-coverage tests
     share_phrase = _novelty_share_phrase(float(row["novelty_rate"]))
+    domain_verb = extras.get("domain_verb") or "Buys on Amazon"
+    activity_noun = extras.get("activity_noun") or "orders"
+    novelty_object = extras.get("novelty_object") or "products"
     lines.append(
-        f"- Buys on Amazon {freq_phrase}; "
-        f"{share_phrase} of orders are first-time products."
+        f"- {domain_verb} {freq_phrase}; "
+        f"{share_phrase} of {activity_noun} are first-time {novelty_object}."
     )
 
-    # Wave-11 extra: self-reported Amazon shopping cadence (complements the
+    # Wave-11 extra: self-reported domain cadence (complements the
     # event-derived purchase_frequency line above; they measure different
     # signals and agreement / disagreement is itself informative).
     if extras.get("amazon_frequency"):
-        lines.append(f"- Shops on Amazon {extras['amazon_frequency']}.")
+        self_report_verb = extras.get("self_report_verb") or "Shops on Amazon"
+        lines.append(f"- {self_report_verb} {extras['amazon_frequency']}.")
 
     # Customer-aggregate enrichment (opt-in via YAML
     # ``data.enrich_customer_context``; ignored when fields are absent).
@@ -631,6 +714,18 @@ def _normalize_extra_fields(
         if not _is_missing(val):
             out[key] = val
 
+    # Domain-override knobs — strings substituted directly into the
+    # purchase_frequency/novelty line. Pass through unchanged when present.
+    for key in (
+        "domain_verb",
+        "activity_noun",
+        "novelty_object",
+        "self_report_verb",
+    ):
+        val = extra_fields.get(key)
+        if not _is_missing(val):
+            out[key] = str(val)
+
     return out
 
 
@@ -682,8 +777,16 @@ def extract_extra_fields_from_row(
     for canonical, spec in yaml_block.items():
         if not isinstance(spec, Mapping):
             continue
-        source = spec.get("source")
         kind = spec.get("kind", "passthrough")
+        # ``kind: constant`` carries no source — it's a YAML-supplied
+        # broadcast value (e.g. dataset-level domain_verb / activity_noun
+        # for non-Amazon adapters). Surface it before we look at the row.
+        if kind == "constant":
+            val = spec.get("value")
+            if val is not None and not _is_missing(val):
+                out[canonical] = val
+            continue
+        source = spec.get("source")
         if source is None or source not in row:
             continue
         raw_value = row[source]
