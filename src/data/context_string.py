@@ -44,6 +44,7 @@ __all__ = [
     "build_context_string",
     "extract_extra_fields_from_row",
     "compute_customer_aggregates",
+    "compute_mobility_aggregates",
     "format_event_time_phrase",
     "paraphrase_rules_check",
 ]
@@ -573,6 +574,34 @@ def build_context_string(
         except (TypeError, ValueError):
             pass
 
+    # Mobility profile aggregates (computed by
+    # :func:`compute_mobility_aggregates`). Adapter-agnostic — Amazon
+    # callers don't populate these so the lines silently drop.
+    if extras.get("typical_distance_km") is not None:
+        try:
+            d_km = float(extras["typical_distance_km"])
+            if d_km > 0.0:
+                lines.append(
+                    f"- Typical trip length: about {d_km:.1f} km."
+                )
+        except (TypeError, ValueError):
+            pass
+    if extras.get("weekend_share") is not None:
+        try:
+            ws = float(extras["weekend_share"])
+            if 0.0 <= ws <= 1.0:
+                if ws >= 0.6:
+                    lines.append("- Mostly travels on weekends.")
+                elif ws <= 0.2:
+                    lines.append("- Mostly travels on weekdays.")
+                # else: roughly even split — skip the clause.
+        except (TypeError, ValueError):
+            pass
+    if extras.get("daypart_preference"):
+        lines.append(
+            f"- Most active during the {extras['daypart_preference']}."
+        )
+
     # --- optional lines --------------------------------------------------
     if event_origin:
         # Per-event origin context — for mobility this renders where the
@@ -718,7 +747,10 @@ def _normalize_extra_fields(
     # present and non-missing. The renderer guards against bad numerics
     # itself (e.g. negative avg_price → skipped clause), so we don't
     # need to re-validate here.
-    for key in ("top_brand", "top_categories", "avg_price", "repeat_rate"):
+    for key in (
+        "top_brand", "top_categories", "avg_price", "repeat_rate",
+        "typical_distance_km", "weekend_share", "daypart_preference",
+    ):
         val = extra_fields.get(key)
         if not _is_missing(val):
             out[key] = val
@@ -882,6 +914,80 @@ def compute_customer_aggregates(events_df, *, train_only: bool = True) -> dict:
                 agg["avg_price"] = float(prices.mean())
         if has_routine:
             agg["repeat_rate"] = float((group["routine"] > 0).mean())
+        out[cid] = agg
+    return out
+
+
+def compute_mobility_aggregates(
+    events_df, *, train_only: bool = True
+) -> dict:
+    """Per-customer mobility summary stats for c_d enrichment.
+
+    Returns ``dict[customer_id, agg]`` with keys:
+
+    * ``typical_distance_km`` (float) — median trip distance over the
+      customer's events. Uses the ``price`` column (= haversine
+      geodistance under the mobility adapter).
+    * ``weekend_share`` (float in [0, 1]) — fraction of events on
+      Saturday/Sunday.
+    * ``daypart_preference`` (str) — the most-frequent daypart label
+      across the customer's events ("late night", "early morning",
+      "morning", "midday", "afternoon", "evening").
+
+    ``train_only=True`` filters by ``events_df["split"] == "train"`` when
+    present, preventing val/test leakage when these aggregates are
+    rendered into c_d for held-out customer-events. Both renderings
+    apply the SAME train-fit per customer, so the c_d the model sees at
+    val/test time is consistent with what it saw at train time.
+
+    Customers absent from ``events_df`` (after the optional split
+    filter) do not appear in the output. Callers should fall back
+    gracefully on missing keys.
+    """
+    import pandas as _pd  # noqa: PLC0415 — keep module light-weight
+
+    df = events_df
+    if train_only and "split" in df.columns:
+        df = df[df["split"] == "train"]
+    if df.empty:
+        return {}
+
+    out: dict[object, dict] = {}
+    has_price = "price" in df.columns
+    has_date = "order_date" in df.columns
+
+    daypart_bins = [-1, 4, 8, 11, 16, 20, 23]
+    daypart_labels = [
+        "late night",
+        "early morning",
+        "morning",
+        "midday",
+        "afternoon",
+        "evening",
+    ]
+
+    for cid, group in df.groupby("customer_id", sort=False):
+        agg: dict = {}
+        if has_price:
+            prices = _pd.to_numeric(group["price"], errors="coerce")
+            valid = prices[prices > 0]
+            if not valid.empty:
+                agg["typical_distance_km"] = float(valid.median())
+        if has_date:
+            dates = _pd.to_datetime(group["order_date"], errors="coerce")
+            dates = dates.dropna()
+            if not dates.empty:
+                agg["weekend_share"] = float((dates.dt.weekday >= 5).mean())
+                hours = dates.dt.hour
+                dayparts = _pd.cut(
+                    hours,
+                    bins=daypart_bins,
+                    labels=daypart_labels,
+                    include_lowest=True,
+                )
+                counts = dayparts.value_counts()
+                if not counts.empty:
+                    agg["daypart_preference"] = str(counts.index[0])
         out[cid] = agg
     return out
 

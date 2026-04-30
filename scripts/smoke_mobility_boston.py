@@ -149,6 +149,18 @@ def main(args: argparse.Namespace) -> int:
                 raw_row.to_dict(), extras_block,
             )
 
+    # Mobility-specific c_d aggregates: typical trip length, weekend
+    # share, daypart preference. Train-only fit; merged into extras
+    # alongside the YAML-supplied constants (domain_verb etc.).
+    from src.data.context_string import compute_mobility_aggregates
+    m_aggs = compute_mobility_aggregates(events, train_only=True)
+    for cid, agg in m_aggs.items():
+        if not agg:
+            continue
+        existing = customer_to_extras.get(str(cid), {}) or {}
+        existing.update(agg)
+        customer_to_extras[str(cid)] = existing
+
     # Leak fix (audit Finding 1): symmetric per-(event, alt) price
     # computed as haversine(event.from_cbg, alt.typical_to_cbg). Same
     # formula for chosen and negatives, fit on train rows only.

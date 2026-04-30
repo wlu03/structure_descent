@@ -783,6 +783,27 @@ def main(args: argparse.Namespace) -> int:
             n_enriched, len(aggs),
         )
 
+    # Mobility-specific c_d enrichment: typical trip length, weekend
+    # share, daypart preference. Computed train-only so val/test
+    # transform under the same per-customer summary the model trained on.
+    if str(args.adapter) == "mobility_boston":
+        from src.data.context_string import compute_mobility_aggregates
+        m_aggs = compute_mobility_aggregates(events_subset, train_only=True)
+        n_m_enriched = 0
+        for cid, agg in m_aggs.items():
+            if not agg:
+                continue
+            existing = customer_to_extras.get(str(cid), {}) or {}
+            existing.update(agg)
+            customer_to_extras[str(cid)] = existing
+            n_m_enriched += 1
+        logger.info(
+            "c_d enrichment (mobility aggregates): populated extras for "
+            "%d / %d customers (typical_distance_km / weekend_share / "
+            "daypart_preference)",
+            n_m_enriched, len(m_aggs),
+        )
+
     # Hard-negative sampling rate: opt-in via YAML ``data.hard_negative_rate``
     # (default 0.0 — preserves the legacy half-cat / half-random sampler).
     # When > 0, that fraction of n_negatives is drawn from same-category +
