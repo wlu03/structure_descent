@@ -78,7 +78,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--adapter",
         required=True,
-        choices=["amazon", "synthetic"],
+        choices=["amazon", "synthetic", "mobility_boston"],
         help="Dataset adapter name. 'synthetic' requires an explicit "
              "--dataset-config (no built-in synthetic YAML ships).",
     )
@@ -164,6 +164,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Sifringer feature-partition residual on / off. Used by "
             "run_full_evaluation.sh to drive the PO-LEU vs PO-LEU-RESIDUAL "
             "leaderboard pair from a single YAML."
+        ),
+    )
+    parser.add_argument(
+        "--add-event-time-to-c-d",
+        action="store_true",
+        help=(
+            "Render a per-event time-of-day phrase (weekday + daypart + "
+            "weekend flag) into c_d via build_context_string's current_time "
+            "kwarg. Off by default (preserves Amazon snapshots bit-"
+            "identical); flip on for mobility-style datasets where 'when' "
+            "is a strong choice predictor."
         ),
     )
     parser.add_argument(
@@ -775,6 +786,17 @@ def main(args: argparse.Namespace) -> int:
             "hard-negative sampling: rate=%.2f, price_band=%.2f",
             hard_neg_rate, hard_neg_band,
         )
+    # Per-event time-of-day phrase in c_d. Off by default (preserves
+    # Amazon snapshot tests bit-identical); flip on either via the YAML
+    # (``data.add_event_time_to_c_d: true``) or the CLI flag
+    # ``--add-event-time-to-c-d``. CLI wins.
+    add_event_time = bool(
+        getattr(args, "add_event_time_to_c_d", False)
+        or data_cfg.get("add_event_time_to_c_d", False)
+    )
+    if add_event_time:
+        logger.info("c_d enrichment: per-event time-of-day phrase enabled")
+
     records_all = build_choice_sets(
         events_subset,
         persons_canonical,
@@ -786,6 +808,7 @@ def main(args: argparse.Namespace) -> int:
         drop_pool_starved=bool(getattr(args, "drop_pool_starved_events", False)),
         hard_negative_rate=hard_neg_rate,
         hard_negative_price_band=hard_neg_band,
+        add_event_time_to_c_d=add_event_time,
     )
 
     # Split records by the split label embedded in each record. Needed
@@ -1281,7 +1304,22 @@ def main(args: argparse.Namespace) -> int:
     # ---- 13. §12 reports (interpretability) ---------------------------
     from src.eval.interpret import run_all_reports
 
-    logger.info("stage: run_all_reports")
+    # Pick attribute-head labels matching the prompt version actually used
+    # for outcome generation. Default = §5.2 purchase-anchored axes.
+    head_names_override: list[str] | None = None
+    if prompt_version_cascade:
+        last_pv = str(prompt_version_cascade[-1])
+        if last_pv.startswith("v4_mobility_anchored"):
+            from src.outcomes.prompts import MOBILITY_ANCHORED_AXES
+            head_names_override = list(MOBILITY_ANCHORED_AXES)
+        elif last_pv.startswith("v3_anchored"):
+            from src.outcomes.prompts import ANCHORED_AXES
+            head_names_override = list(ANCHORED_AXES)
+
+    logger.info(
+        "stage: run_all_reports (head_names=%s)",
+        head_names_override or "default",
+    )
     run_all_reports(
         model,
         batch_val.z_d,
@@ -1290,6 +1328,7 @@ def main(args: argparse.Namespace) -> int:
         batch_val.outcomes_nested,
         out_dir=out_dir,
         event_idx=0,
+        head_names=head_names_override,
     )
 
     # ---- 14. smoke_summary.json ---------------------------------------
