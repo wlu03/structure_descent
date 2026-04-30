@@ -797,6 +797,28 @@ def main(args: argparse.Namespace) -> int:
     if add_event_time:
         logger.info("c_d enrichment: per-event time-of-day phrase enabled")
 
+    # Leak fix (audit Finding 1, mobility-only): symmetric per-(event,
+    # alt) price = haversine(event.from_cbg, alt.typical_to_cbg). Train-
+    # fit; same formula for chosen and negatives. For Amazon and any
+    # adapter without from_cbg / to_cbg / a centroid CSV, the override
+    # closure is None and price stays exactly as before.
+    overrides_fn = None
+    if str(args.adapter) == "mobility_boston":
+        from src.data.mobility_geodistance import (
+            make_per_event_alt_overrides_fn,
+        )
+        centroid_path = (
+            REPO_ROOT / "mobility_trajectory_boston"
+            / "Basic_Geographic_Statistics_CBG_Boston.csv"
+        )
+        overrides_fn = make_per_event_alt_overrides_fn(
+            events_subset, centroid_path,
+        )
+        logger.info(
+            "leak fix: symmetric per-(event, alt) price closure wired "
+            "(centroid_path=%s)", centroid_path,
+        )
+
     records_all = build_choice_sets(
         events_subset,
         persons_canonical,
@@ -809,6 +831,7 @@ def main(args: argparse.Namespace) -> int:
         hard_negative_rate=hard_neg_rate,
         hard_negative_price_band=hard_neg_band,
         add_event_time_to_c_d=add_event_time,
+        per_event_alt_overrides_fn=overrides_fn,
     )
 
     # Split records by the split label embedded in each record. Needed

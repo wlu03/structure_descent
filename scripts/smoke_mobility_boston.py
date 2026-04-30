@@ -146,6 +146,15 @@ def main(args: argparse.Namespace) -> int:
                 raw_row.to_dict(), extras_block,
             )
 
+    # Leak fix (audit Finding 1): symmetric per-(event, alt) price
+    # computed as haversine(event.from_cbg, alt.typical_to_cbg). Same
+    # formula for chosen and negatives, fit on train rows only.
+    from src.data.mobility_geodistance import make_per_event_alt_overrides_fn
+    centroid_path = REPO_ROOT / "mobility_trajectory_boston" / (
+        "Basic_Geographic_Statistics_CBG_Boston.csv"
+    )
+    overrides_fn = make_per_event_alt_overrides_fn(events, centroid_path)
+
     records = build_choice_sets(
         events, persons_canonical, adapter,
         seed=int(args.seed),
@@ -153,11 +162,26 @@ def main(args: argparse.Namespace) -> int:
         n_negatives=int(adapter.schema.choice_set_size) - 1,
         customer_to_extras=customer_to_extras or None,
         add_event_time_to_c_d=bool(args.add_event_time),
+        per_event_alt_overrides_fn=overrides_fn,
     )
     rec_train = [r for r in records if r.get("split") == "train"]
     rec_val   = [r for r in records if r.get("split") == "val"]
     rec_test  = [r for r in records if r.get("split") == "test"]
     logger.info("records: train=%d val=%d test=%d", len(rec_train), len(rec_val), len(rec_test))
+
+    # Persist the (leak-corrected) records so scripts/run_baselines.py
+    # --records-from <path> can score on the same per-(event, alt)
+    # geodistance prices PO-LEU sees. This is the leak-corrected analog
+    # of run_dataset.py's records.pkl sidecar.
+    import pickle
+    records_pkl_path = args.output_dir / "records.pkl"
+    with records_pkl_path.open("wb") as _fh:
+        pickle.dump(
+            {"train": rec_train, "val": rec_val, "test": rec_test},
+            _fh,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    logger.info("wrote %s", records_pkl_path)
 
     # Show a sample c_d so we can eyeball the rendered narrative.
     sample_cd = rec_train[0]["c_d"] if rec_train else "(no train records)"

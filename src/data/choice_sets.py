@@ -140,6 +140,7 @@ def build_choice_sets(
     hard_negative_rate: float = 0.0,
     hard_negative_price_band: float = 0.5,
     add_event_time_to_c_d: bool = False,
+    per_event_alt_overrides_fn=None,
 ) -> list[dict]:
     """Return per-event choice-set records with ``z_d`` and ``c_d`` attached.
 
@@ -780,6 +781,7 @@ def build_choice_sets(
         event_row_alt: dict,
         cid,
         adjust_chosen_self_count: bool,
+        event_idx: int,
     ) -> list[dict]:
         """Render adapter alt_text dicts and inject per-alt train-history.
 
@@ -795,6 +797,13 @@ def build_choice_sets(
         train event). Pass True for train events to subtract 1 from
         the chosen's count (clipped at 0); chosen and negatives then
         report the same purely-prior count.
+
+        ``event_idx`` is the integer position of this event in
+        ``events_df``. Forwarded to ``per_event_alt_overrides_fn`` (when
+        non-None) so adapter-supplied overrides can compute per-(event,
+        alt) features symmetrically across chosen and negatives — fixes
+        the leak where chosen's ``price`` came from the events-row and
+        negatives' came from a per-asin first-seen lookup.
         """
         out: list[dict] = []
         for a in asins:
@@ -807,6 +816,14 @@ def build_choice_sets(
                 cnt -= 1
             d["is_repeat"] = 1.0 if cnt > 0 else 0.0
             d["purchase_count"] = cnt
+            if per_event_alt_overrides_fn is not None:
+                # Adapter-supplied per-(event, alt) overrides. For mobility
+                # this overrides ``price`` with haversine(event.from_cbg,
+                # alt.typical_to_cbg) — same computation for chosen and
+                # negatives, closing the previously-leaky asymmetry.
+                overrides = per_event_alt_overrides_fn(event_idx, a)
+                if overrides:
+                    d.update(overrides)
             out.append(d)
         return out
 
@@ -1004,7 +1021,7 @@ def build_choice_sets(
             chosen_idx = chosen_idx_per_k[0]
             alt_texts = _render_alt_texts(
                 choice_asins, chosen_asin, event_row_alt,
-                ev_cid, adjust_chosen,
+                ev_cid, adjust_chosen, event_idx=i,
             )
         else:
             choice_asins = samples_per_k
@@ -1012,7 +1029,7 @@ def build_choice_sets(
             alt_texts = [
                 _render_alt_texts(
                     sample, chosen_asin, event_row_alt,
-                    ev_cid, adjust_chosen,
+                    ev_cid, adjust_chosen, event_idx=i,
                 )
                 for sample in samples_per_k
             ]
