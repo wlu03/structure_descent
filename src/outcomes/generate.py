@@ -47,7 +47,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
-from src.outcomes.prompts import build_messages, build_messages_anchored
+from src.outcomes.prompts import (
+    build_messages,
+    build_messages_anchored,
+    build_messages_mobility_anchored,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -729,10 +733,15 @@ def generate_outcomes(
                 )
 
     # ---- 2. build messages ---------------------------------------------
-    # Anchored K=5 path (Group-3 fix): when prompt_version starts with
-    # "v3_anchored", use the axis-anchored system prompt that forces one
+    # Anchored K=5 paths: prompt_version selects between the canonical
+    # purchase-anchored axes (financial/health/convenience/emotional/
+    # social) and the mobility-anchored axes (convenience/routine/
+    # purpose/social/leisure). Both force K=5; the model gets one
     # outcome per M=5 head axis in canonical order.
-    if str(prompt_version).startswith("v3_anchored"):
+    pv = str(prompt_version)
+    if pv.startswith("v4_mobility_anchored"):
+        messages = build_messages_mobility_anchored(c_d=c_d, alt=alt, K=K)
+    elif pv.startswith("v3_anchored"):
         messages = build_messages_anchored(c_d=c_d, alt=alt, K=K)
     else:
         messages = build_messages(c_d=c_d, alt=alt, K=K)

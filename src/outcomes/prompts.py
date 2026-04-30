@@ -84,6 +84,44 @@ SYSTEM_PROMPT_ANCHORED: str = (
 )
 
 # ---------------------------------------------------------------------------
+# Mobility-anchored prompt (Boston / urban movement). M=5 axes tuned to
+# trip-choice rather than purchase-choice. Bumps the cache key separately
+# so existing v3_anchored entries are not silently reused.
+# ---------------------------------------------------------------------------
+
+PROMPT_VERSION_MOBILITY_ANCHORED: str = "v4_mobility_anchored"
+
+# Maps 1:1 onto the M=5 attribute heads when used with anchored generation.
+# Order is canonical and must match the head-naming list passed to
+# :func:`src.eval.interpret.head_naming_report`.
+MOBILITY_ANCHORED_AXES: tuple[str, ...] = (
+    "convenience",
+    "routine",
+    "purpose",
+    "social",
+    "leisure",
+)
+
+SYSTEM_PROMPT_MOBILITY_ANCHORED: str = (
+    "You generate short first-person outcome narratives for a person "
+    "deciding whether to visit a particular place. Produce exactly K=5 "
+    "sentences, one per axis, in this canonical order: convenience, "
+    "routine, purpose, social, leisure. Each outcome describes a plausible "
+    "consequence FOR THIS PERSON if they go to THIS place, scored along "
+    "ITS axis:\n"
+    "  - convenience: travel time, distance, effort, friction.\n"
+    "  - routine: how this fits the person's habits — familiar vs. novel.\n"
+    "  - purpose: what need this trip serves (errand, work, food, etc.).\n"
+    "  - social: who they are likely to be with or encounter.\n"
+    "  - leisure: enjoyment, identity, comfort.\n"
+    "Each sentence is 10-25 words, first-person, present or near-future "
+    "tense. Do not describe the place itself. Do not number sentences; "
+    "separate them with newlines. If an axis is genuinely irrelevant for "
+    "this trip, write a brief honest acknowledgement; the salience layer "
+    "will down-weight it."
+)
+
+# ---------------------------------------------------------------------------
 # Curriculum refinement prompts (commit: critique-and-revise loop). Used by
 # :mod:`src.outcomes.refine` to fix outcomes for events the model fails on.
 # Bump :data:`REFINED_PROMPT_VERSION` when either template changes — it is
@@ -332,6 +370,37 @@ def build_messages_anchored(
     ]
 
 
+def build_messages_mobility_anchored(
+    c_d: str,
+    alt: Mapping[str, Any],
+    K: int,
+    optional_fields: Mapping[str, Any] | None = None,
+) -> list[dict]:
+    """Mobility-anchored variant of :func:`build_messages`.
+
+    Forces ``K == len(MOBILITY_ANCHORED_AXES) == 5`` and uses
+    :data:`SYSTEM_PROMPT_MOBILITY_ANCHORED` so the LLM emits one outcome
+    per mobility-tuned axis (convenience, routine, purpose, social,
+    leisure) in canonical order. Each outcome aligns 1:1 with one of the
+    M=5 attribute heads under the head_names override
+    :data:`MOBILITY_ANCHORED_AXES`.
+    """
+    if K != len(MOBILITY_ANCHORED_AXES):
+        raise ValueError(
+            f"expected K=5 to match MOBILITY_ANCHORED_AXES; got K={K}"
+        )
+    user_content = build_user_block(
+        c_d=c_d,
+        alt=alt,
+        K=K,
+        optional_fields=optional_fields,
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT_MOBILITY_ANCHORED},
+        {"role": "user", "content": user_content},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Curriculum-refinement prompt builders (parallel to build_messages)
 # ---------------------------------------------------------------------------
@@ -436,6 +505,10 @@ __all__ = [
     "PROMPT_VERSION_ANCHORED",
     "ANCHORED_AXES",
     "SYSTEM_PROMPT_ANCHORED",
+    "PROMPT_VERSION_MOBILITY_ANCHORED",
+    "MOBILITY_ANCHORED_AXES",
+    "SYSTEM_PROMPT_MOBILITY_ANCHORED",
+    "build_messages_mobility_anchored",
     "build_system_prompt",
     "build_user_block",
     "build_messages",
