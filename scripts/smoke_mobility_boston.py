@@ -59,6 +59,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "v4_mobility_anchored = mobility-tuned heads.")
     p.add_argument("--add-event-time", action="store_true", default=True,
                    help="Render per-event time-of-day phrase into c_d.")
+    p.add_argument("--add-event-origin", action="store_true", default=True,
+                   help="Render per-event origin context into c_d ("
+                        "'home' / 'their workplace' / 'a <category> place').")
     return p
 
 
@@ -162,6 +165,7 @@ def main(args: argparse.Namespace) -> int:
         n_negatives=int(adapter.schema.choice_set_size) - 1,
         customer_to_extras=customer_to_extras or None,
         add_event_time_to_c_d=bool(args.add_event_time),
+        add_event_origin_to_c_d=bool(args.add_event_origin),
         per_event_alt_overrides_fn=overrides_fn,
     )
     rec_train = [r for r in records if r.get("split") == "train"]

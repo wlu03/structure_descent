@@ -379,6 +379,7 @@ def build_context_string(
     current_time: str | None = None,
     suppress_fields: Iterable[str] = (),
     extra_fields: Mapping[str, Any] | None = None,
+    event_origin: str | None = None,
 ) -> str:
     """Render the person-context paragraph ``c_d``.
 
@@ -573,6 +574,14 @@ def build_context_string(
             pass
 
     # --- optional lines --------------------------------------------------
+    if event_origin:
+        # Per-event origin context — for mobility this renders where the
+        # agent is coming from ("home" / "their workplace" / "a Food and
+        # Accommodation place"). Pure narrative; no leak (computed from
+        # from_place_id of the current event, which is the previous
+        # event's destination — strict prefix info).
+        lines.append(f"- Just came from {event_origin}.")
+
     if recent_purchases:
         joined = ", ".join(str(p) for p in recent_purchases)
         lines.append(f"Recent purchases (last 30 days): {joined}.")

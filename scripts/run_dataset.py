@@ -178,6 +178,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--add-event-origin-to-c-d",
+        action="store_true",
+        help=(
+            "Render a per-event origin context line into c_d ('Just came "
+            "from home' / 'their workplace' / 'a <category> place'). Off "
+            "by default; flip on for mobility-style datasets where 'where "
+            "from' is a strong predictor of 'where to'."
+        ),
+    )
+    parser.add_argument(
         "--prompt-version-cascade",
         nargs="+",
         default=None,
@@ -796,6 +806,12 @@ def main(args: argparse.Namespace) -> int:
     )
     if add_event_time:
         logger.info("c_d enrichment: per-event time-of-day phrase enabled")
+    add_event_origin = bool(
+        getattr(args, "add_event_origin_to_c_d", False)
+        or data_cfg.get("add_event_origin_to_c_d", False)
+    )
+    if add_event_origin:
+        logger.info("c_d enrichment: per-event origin context enabled")
 
     # Leak fix (audit Finding 1, mobility-only): symmetric per-(event,
     # alt) price = haversine(event.from_cbg, alt.typical_to_cbg). Train-
@@ -831,6 +847,7 @@ def main(args: argparse.Namespace) -> int:
         hard_negative_rate=hard_neg_rate,
         hard_negative_price_band=hard_neg_band,
         add_event_time_to_c_d=add_event_time,
+        add_event_origin_to_c_d=add_event_origin,
         per_event_alt_overrides_fn=overrides_fn,
     )
 

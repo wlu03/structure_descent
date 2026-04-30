@@ -140,6 +140,7 @@ def build_choice_sets(
     hard_negative_rate: float = 0.0,
     hard_negative_price_band: float = 0.5,
     add_event_time_to_c_d: bool = False,
+    add_event_origin_to_c_d: bool = False,
     per_event_alt_overrides_fn=None,
 ) -> list[dict]:
     """Return per-event choice-set records with ``z_d`` and ``c_d`` attached.
@@ -528,6 +529,43 @@ def build_choice_sets(
         .astype(np.int64)
     )
     sorted_cat_of_asin = sorted_cat_of_asin_full[sort_by_first]
+
+    # ---- Per-event origin context (Wave-13 c_d enrichment) ------------ #
+    # When ``add_event_origin_to_c_d`` is on we render an "- Just came
+    # from <phrase>." line into c_d using the event's from_place_id and
+    # an asin → typical_category lookup fit on the train slice. The
+    # category mode comes from ``ref_df`` so under cold-start the fit
+    # is leakage-safe.
+    asin_to_category_label: dict[object, str] = {}
+    from_place_id_arr = (
+        df["from_place_id"].astype(str).fillna("").to_numpy(dtype=object)
+        if "from_place_id" in df.columns
+        else np.array([""] * n_events, dtype=object)
+    )
+    if add_event_origin_to_c_d:
+        if "category" in ref_df.columns:
+            asin_to_category_label = (
+                ref_df.groupby("asin")["category"]
+                .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else "")
+                .astype(str)
+                .to_dict()
+            )
+
+    def _render_origin_phrase(from_pid: str) -> str | None:
+        if not from_pid:
+            return None
+        s = str(from_pid).strip()
+        if not s:
+            return None
+        if s.lower() == "home":
+            return "home"
+        if s.lower() == "work":
+            return "their workplace"
+        cat = asin_to_category_label.get(from_pid, "")
+        if not cat or cat == "Unknown":
+            return None
+        article = "an" if cat[:1].lower() in "aeiou" else "a"
+        return f"{article} {cat} place"
 
     # For each event: prefix length of ASINs with first_seen < order_date.
     avail_prefix = np.searchsorted(sorted_first_seen, order_dates_ns, side="left")
@@ -1088,12 +1126,20 @@ def build_choice_sets(
         else:
             event_time_phrase = None
 
+        if add_event_origin_to_c_d:
+            event_origin_phrase = _render_origin_phrase(
+                from_place_id_arr[i] if i < len(from_place_id_arr) else ""
+            )
+        else:
+            event_origin_phrase = None
+
         event_c_d = build_context_string(
             customer_to_row[cid],
             suppress_fields=suppress,
             extra_fields=extras_by_cid.get(cid),
             recent_purchases=event_recent,
             current_time=event_time_phrase,
+            event_origin=event_origin_phrase,
         )
 
         # Defensive z_d lookup. The coverage assertion at the top of
