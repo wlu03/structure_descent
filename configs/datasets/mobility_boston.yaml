@@ -1,0 +1,163 @@
+# Veraset Boston aligned-agents 2019+2020 mobility dataset.
+# Each event row is a "move" (origin -> destination at a timestamp); the
+# destination place is the chosen alternative. Persons rows are one per
+# agent (caid) with home-CBG demographics summarized from the Boston CBG
+# table. Preprocessed by scripts/prepare_mobility_dataset.py.
+#
+# Schema notes:
+#   * "asin" maps to safegraph_place_id (destination); "category" maps to
+#     a NAICS-2-digit industry label; "title" is a synthesized place name
+#     (industry + CBG); "price" is a constant 0.0 (mobility has no price,
+#     but the framework requires the column).
+#   * z_d width: nominal canonical p=26 shrinks because city_size and
+#     household_size collapse to single sentinels (Boston-only, no
+#     household data). Other constants follow Amazon precedent.
+#   * c_d_extra_fields supplies the domain-overridable phrasing knobs
+#     introduced for non-Amazon datasets (domain_verb / activity_noun /
+#     novelty_object / self_report_verb).
+
+dataset:
+  name: mobility_boston
+  description: >
+    Veraset Boston aligned agents (2019+2020). 500 agents, ~73K moves
+    across Boston CBGs. Demographics from home CBG: race, age group,
+    industry, education tier, income tier (3-bin).
+
+  events:
+    path: mobility_trajectory_boston/events.csv
+    parse_dates:
+      - to_local_timestamp
+    column_map:
+      caid:                   customer_id
+      to_local_timestamp:     order_date
+      to_place_id:            asin
+      naics_industry:         category
+      price:                  price
+      place_label:            title
+    dropna_subset:
+      - customer_id
+      - order_date
+      - asin
+    category_null_fill: "Unknown"
+    dtype_coerce:
+      price: float
+      customer_id: str
+      asin: str
+
+  persons:
+    path: mobility_trajectory_boston/persons.csv
+    id_column: caid
+
+    z_d_mapping:
+
+      # Boston CBG age groups are coarser than the Amazon survey (3 bins
+      # vs 6). Map to the closest existing canonical labels so the
+      # context_string DEFAULT_PHRASINGS dictionary doesn't need new
+      # entries; standardization absorbs the discretization loss.
+      age_bucket:
+        source: dominant_age_group
+        kind: categorical_map
+        values:
+          "Under 18 years":  "18-24"
+          "18 to 60 years":  "35-44"
+          "Over 60 years":   "65+"
+
+      # 3-bin Boston income tier -> 3 of the 5 canonical income labels.
+      income_bucket:
+        source: income_level_3bin_2019
+        kind: categorical_map
+        values:
+          "Low":    "25-50k"
+          "Medium": "50-100k"
+          "High":   "100-150k"
+
+      # Boston-only dataset; one large-city sentinel for everyone.
+      city_size:
+        source: null
+        kind: constant
+        value: "large"
+
+      # No household-size signal on the Boston CBG block; use a 2-person
+      # sentinel (matches the most common US household).
+      household_size:
+        source: null
+        kind: constant
+        value: 2
+
+      has_kids:
+        source: null
+        kind: constant
+        value: 0
+
+      # 5-tier Boston education_level_2019 maps onto the canonical 1..5
+      # ordinal scale.
+      education:
+        source: education_level_2019
+        kind: ordinal_map
+        values:
+          "Lowest":  1
+          "Low":     2
+          "Medium":  3
+          "High":    4
+          "Highest": 5
+
+      health_rating:
+        source: null
+        kind: constant
+        value: 3
+
+      risk_tolerance:
+        source: null
+        kind: constant
+        value: 0
+
+      # Total event (move) count per customer; orchestrator normalizes
+      # to events-per-week before feeding context_string.
+      purchase_frequency:
+        source: derived_from_events
+        aggregator: count
+        group_by: customer_id
+
+      # Mean of the per-event novelty flag (1 if first time agent visited
+      # this place, else 0). state_features.compute_state_features adds
+      # the novelty column upstream.
+      novelty_rate:
+        source: derived_from_events
+        aggregator: mean
+        aggregator_column: novelty
+        group_by: customer_id
+
+    # c_d_extra_fields - extra narrative signals injected into the LLM
+    # context string. The constant-kind entries override the
+    # Amazon-tuned default phrasing in context_string.build_context_string
+    # so the rendered c_d reads as a mobility narrative ("Travels around
+    # Boston roughly twice per week; about a third of trips are first-
+    # time places.") instead of the Amazon default.
+    c_d_extra_fields:
+      domain_verb:
+        kind: constant
+        value: "Travels around Boston"
+      activity_noun:
+        kind: constant
+        value: "trips"
+      novelty_object:
+        kind: constant
+        value: "places"
+      self_report_verb:
+        kind: constant
+        value: "Visits places"
+      # life_event slot reused to surface the home-CBG dominant industry
+      # (clear narrative anchor: where the agent likely works/lives).
+      life_event:
+        source: dominant_industry
+        kind: passthrough
+
+  training:
+    choice_set_size: 10
+    n_resamples: 1
+    val_frac: 0.1
+    test_frac: 0.1
+    subsample:
+      enabled: false
+      n_customers: 100
+      seed: 42
