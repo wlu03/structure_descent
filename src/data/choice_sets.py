@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, List
 import numpy as np
 import pandas as pd
 
-from src.data.context_string import build_context_string
+from src.data.context_string import build_context_string, format_event_time_phrase
 from src.data.person_features import (
     fit_person_features,
     transform_person_features,
@@ -139,6 +139,7 @@ def build_choice_sets(
     drop_pool_starved: bool = False,
     hard_negative_rate: float = 0.0,
     hard_negative_price_band: float = 0.5,
+    add_event_time_to_c_d: bool = False,
 ) -> list[dict]:
     """Return per-event choice-set records with ``z_d`` and ``c_d`` attached.
 
@@ -1061,11 +1062,21 @@ def build_choice_sets(
                 if slice_titles:
                     event_recent = list(slice_titles)
 
+        # Optional per-event time-of-day phrase. Default off keeps
+        # existing Amazon snapshots bit-identical; mobility runs flip it
+        # on so the LLM sees "Saturday morning" / "Tuesday evening
+        # (weekend)" alongside c_d.
+        if add_event_time_to_c_d:
+            event_time_phrase = format_event_time_phrase(order_dates_ns[i])
+        else:
+            event_time_phrase = None
+
         event_c_d = build_context_string(
             customer_to_row[cid],
             suppress_fields=suppress,
             extra_fields=extras_by_cid.get(cid),
             recent_purchases=event_recent,
+            current_time=event_time_phrase,
         )
 
         # Defensive z_d lookup. The coverage assertion at the top of
