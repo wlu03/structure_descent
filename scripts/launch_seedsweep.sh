@@ -68,6 +68,24 @@ MAX_CONCURRENCY=16
 # any visible output. 4000 covers o4-mini and gemini-3 comfortably.
 MAX_TOKENS=4000
 
+# Refine pipeline knobs (run_dataset.py --refine). When ENABLE_REFINE is
+# 'on', every window does round1 (initial train) → identify worst val
+# events → critic+reviser refine → round2 (retrain with v3_refined
+# cascade prepended). Round-1 artifacts land in <output-dir>/round1/;
+# final artifacts overwrite <output-dir>/ as if a normal run.
+#
+# Refine adds REFINE_TOP_K × J=10 critic calls + a smaller number of
+# reviser calls per window. Cost overhead is small compared to round
+# 1's outcome generation.
+ENABLE_REFINE=on
+REFINE_TOP_K=30
+REFINE_ACCEPT_THRESHOLD=4
+REFINE_PER_OUTCOME=on
+# REFINE_CRITIC: writer (default, reuses the LLM_PROVIDER client — cheap
+# but family-correlated) | anthropic | gemini | openai. Cross-family
+# critic costs more API calls but gives independent scoring.
+REFINE_CRITIC=writer
+
 # Pre-create the session detached, with a no-op control window we'll
 # leave alone (tmux requires at least one window to exist).
 tmux kill-session -t "$SESSION" 2>/dev/null || true
@@ -102,6 +120,17 @@ for entry in "${SWEEP[@]}"; do
     DATASET_FLAGS=""
   fi
 
+  # Refine flags — applied uniformly across all windows when enabled.
+  if [ "$ENABLE_REFINE" = "on" ]; then
+    REFINE_FLAGS="--refine \
+  --refine-top-k ${REFINE_TOP_K} \
+  --refine-accept-threshold ${REFINE_ACCEPT_THRESHOLD} \
+  --refine-per-outcome ${REFINE_PER_OUTCOME} \
+  --refine-critic ${REFINE_CRITIC}"
+  else
+    REFINE_FLAGS=""
+  fi
+
   read -r -d '' CMD <<EOF || true
 set -o allexport; source .env; set +o allexport
 export LLM_PROVIDER=${PROVIDER}
@@ -122,12 +151,14 @@ unset GOOGLE_CLOUD_LOCATION
 echo "[\$(date '+%H:%M:%S')] starting ${TAG}"
 echo "  provider=${PROVIDER} model=${MODEL} seed=${SEED} dataset=${DATASET}"
 echo "  prompt_cascade=${PROMPT_CASCADE}"
+echo "  refine=${ENABLE_REFINE}"
 venv/bin/python scripts/run_dataset.py \\
   --adapter ${DATASET} \\
   --n-customers ${N_CUSTOMERS} --seed ${SEED} \\
   --K ${K} --prompt-version-cascade ${PROMPT_CASCADE} \\
   ${DATASET_FLAGS} \\
   --tabular-residual false \\
+  ${REFINE_FLAGS} \\
   --n-epochs ${N_EPOCHS} --batch-size ${BATCH_SIZE} \\
   --config configs/default.yaml \\
   --output-dir ${OUT_DIR} \\
@@ -153,16 +184,26 @@ cat <<EOF
 Launched ${n_launched}-window tmux session: $SESSION
   6× mobility_boston runs (3 Gemini seeds + 3 o4-mini seeds)
   6× amazon runs           (3 Gemini seeds + 3 o4-mini seeds)
+  refine pipeline: ${ENABLE_REFINE}  (top-K=${REFINE_TOP_K},
+                                      per_outcome=${REFINE_PER_OUTCOME},
+                                      critic=${REFINE_CRITIC})
 
-Per-window outputs:
+Per-window outputs (with --refine on):
   reports/seed_<seed>_<model>_<dataset>/
-    ├─ run.log         live stdout from run_dataset.py
-    ├─ run.cmd         exact command (for re-launching if window dies)
-    ├─ records.pkl     leak-corrected per-(event, alt) records
-    ├─ test_logits.npz logits for leaderboard merging
-    ├─ metrics.json    val metrics
-    ├─ metrics_test.json
-    └─ smoke_summary.json
+    ├─ run.log               live stdout from run_dataset.py
+    ├─ run.cmd               exact command (for re-launch if window dies)
+    ├─ round1/               round-1 (initial-train) artifacts
+    │   ├─ records.pkl
+    │   ├─ metrics.json
+    │   ├─ metrics_test.json
+    │   ├─ val_per_event.json
+    │   └─ test_logits.npz
+    ├─ failure_events.json   round-1's worst val events
+    ├─ refined_outcomes.json critic + reviser bookkeeping
+    ├─ records.pkl           round-2 records (cache-warm rebuild)
+    ├─ test_logits.npz       FINAL leaderboard-ready logits (round 2)
+    ├─ metrics.json          FINAL val metrics
+    └─ metrics_test.json     FINAL test metrics
 
 Attach:
   tmux attach -t $SESSION
@@ -172,15 +213,33 @@ Inside tmux:
   Ctrl-b n/p   next / prev window
   Ctrl-b d     detach (runs keep going in background)
 
-Cost ballpark for the full 12-window sweep (n_customers=${N_CUSTOMERS}):
-  Gemini-3-Flash × 6 runs       ≈ \$30-60   (cheap; flash model)
-  o4-mini × 6 runs              ≈ \$400-800 (reasoning model, 4-8x tokens)
+Cost ballpark (n_customers=${N_CUSTOMERS}, refine=${ENABLE_REFINE}):
+  Gemini-3-Flash × 6 runs       ≈ \$30-60     (cheap; flash model)
+  o4-mini × 6 runs              ≈ \$400-800   (reasoning model)
+EOF
+if [ "$ENABLE_REFINE" = "on" ]; then
+  cat <<EOF
+  refine overhead per run:      ≈ +5-15%      (top-K=${REFINE_TOP_K} events
+                                                × J=10 alts × 2 critic+
+                                                reviser calls; round 2 is
+                                                cache-warm, no new outcomes)
+EOF
+fi
+cat <<EOF
 
-Wall time per run with concurrency=${MAX_CONCURRENCY}: ~60-180 min
-(Amazon may be slower than mobility; ~4-5x the events per customer)
+Wall time per window with concurrency=${MAX_CONCURRENCY}:
+  round 1 (LLM-bound):  60-180 min  (Amazon ~4-5x mobility events)
+EOF
+if [ "$ENABLE_REFINE" = "on" ]; then
+  cat <<EOF
+  refine + round 2:     5-15 min    (cache-warm, ~1k LLM calls)
+EOF
+fi
+cat <<EOF
 
-If \$400-800 for o4-mini is too much, edit the SWEEP list at the top
-of this script to drop the o4-mini rows, or reduce N_CUSTOMERS.
+To switch off refine for a single sweep, edit ENABLE_REFINE=off at the
+top of this script. To trim cost: reduce N_CUSTOMERS, or drop o4-mini
+rows from the SWEEP array.
 
 Kill the whole sweep:
   tmux kill-session -t $SESSION
