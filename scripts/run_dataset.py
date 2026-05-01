@@ -302,38 +302,28 @@ def _p_reduction_reason(adapter: Any) -> str:
 def _build_llm_and_encoder(args: argparse.Namespace, config: dict) -> tuple[Any, Any]:
     """Instantiate the real LLM client + sentence encoder.
 
+    Provider selection is env-var driven so the same orchestrator can fan
+    out across providers without CLI surgery:
+
+    * ``LLM_PROVIDER=anthropic`` (default). Reads ``ANTHROPIC_API_KEY``;
+      ``ANTHROPIC_MODEL`` (default ``claude-sonnet-4-6``) controls the
+      model id.
+    * ``LLM_PROVIDER=gemini``. Reads ``GEMINI_API_KEY`` (or
+      ``GOOGLE_API_KEY``); ``GEMINI_MODEL`` (default
+      ``gemini-2.5-flash``) controls the model id.
+    * ``LLM_PROVIDER=openai``. Reads ``OPENAI_API_KEY``;
+      ``OPENAI_MODEL`` (default ``gpt-5``) controls the model id.
+
     The driver is real-only: stubs used to live behind a ``--stub-llm``
     flag but shared the outcomes-cache key schema with real calls, which
-    silently fed stale stub entries into real training runs. We now fail
-    loudly and early if any precondition for real clients is unmet:
-
-    * ``ANTHROPIC_API_KEY`` must be set in the environment.
-    * ``anthropic`` and ``sentence_transformers`` must be installed.
-
-    Defense in depth: after instantiation we ``isinstance``-check against
-    the stub classes and raise if either slipped through. This cannot
-    fire under current code, but any future refactor that accidentally
-    routes a stub into production gets caught at driver startup.
+    silently fed stale stub entries into real training runs. Each
+    provider's model_id is folded into the cache key
+    (``build_cache_prompt_version``), so different providers / models
+    never collide in the cache.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        sys.stderr.write(
-            "run_dataset.py: ANTHROPIC_API_KEY is not set in the environment; "
-            "refusing to start (driver is real-LLM-only).\n"
-        )
-        sys.exit(2)
+    provider = os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()
 
-    # Lazy import of the real backends so missing deps yield a helpful
-    # message rather than an ImportError at module load.
-    try:
-        import anthropic  # noqa: F401  # type: ignore[import-not-found]
-    except ImportError:
-        sys.stderr.write(
-            "run_dataset.py: the `anthropic` package is required but not "
-            "installed. Install it with `pip install anthropic` (or "
-            "`pip install -e .[llm]`).\n"
-        )
-        sys.exit(2)
+    # Encoder is always sentence-transformers regardless of LLM provider.
     try:
         import sentence_transformers  # noqa: F401  # type: ignore[import-not-found]
     except ImportError:
@@ -345,12 +335,9 @@ def _build_llm_and_encoder(args: argparse.Namespace, config: dict) -> tuple[Any,
         sys.exit(2)
 
     from src.outcomes.encode import SentenceTransformersEncoder, StubEncoder
-    from src.outcomes.generate import AnthropicLLMClient, StubLLMClient
+    from src.outcomes.generate import StubLLMClient
 
     enc_cfg = (config.get("outcomes") or {}).get("encoder") or {}
-    model_id = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-
-    llm_client: Any = AnthropicLLMClient(model_id=model_id, api_key=api_key)
     encoder: Any = SentenceTransformersEncoder(
         model_id=enc_cfg.get("model_id",
                              "sentence-transformers/all-mpnet-base-v2"),
@@ -358,7 +345,64 @@ def _build_llm_and_encoder(args: argparse.Namespace, config: dict) -> tuple[Any,
         pooling=enc_cfg.get("pooling", "mean"),
     )
 
-    # Defense in depth: refuse stubs even if a future refactor routes one in.
+    if provider == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            sys.stderr.write("run_dataset.py: ANTHROPIC_API_KEY missing.\n")
+            sys.exit(2)
+        try:
+            import anthropic  # noqa: F401  # type: ignore[import-not-found]
+        except ImportError:
+            sys.stderr.write("run_dataset.py: install `anthropic`.\n")
+            sys.exit(2)
+        from src.outcomes.generate import AnthropicLLMClient
+        model_id = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        llm_client: Any = AnthropicLLMClient(model_id=model_id, api_key=api_key)
+
+    elif provider == "gemini":
+        api_key = (
+            os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+        )
+        if not api_key:
+            sys.stderr.write(
+                "run_dataset.py: GEMINI_API_KEY (or GOOGLE_API_KEY) missing.\n"
+            )
+            sys.exit(2)
+        try:
+            import google.genai  # noqa: F401  # type: ignore[import-not-found]
+        except ImportError:
+            sys.stderr.write("run_dataset.py: install `google-genai`.\n")
+            sys.exit(2)
+        from src.outcomes._gemini_client import GeminiLLMClient
+        model_id = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        llm_client = GeminiLLMClient(model_id=model_id, api_key=api_key)
+
+    elif provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            sys.stderr.write("run_dataset.py: OPENAI_API_KEY missing.\n")
+            sys.exit(2)
+        try:
+            import openai  # noqa: F401  # type: ignore[import-not-found]
+        except ImportError:
+            sys.stderr.write("run_dataset.py: install `openai`.\n")
+            sys.exit(2)
+        from src.outcomes._openai_client import OpenAILLMClient
+        model_id = os.environ.get("OPENAI_MODEL", "gpt-5")
+        llm_client = OpenAILLMClient(model_id=model_id, api_key=api_key)
+
+    else:
+        sys.stderr.write(
+            f"run_dataset.py: LLM_PROVIDER={provider!r} unrecognised "
+            f"(expected one of: anthropic, gemini, openai).\n"
+        )
+        sys.exit(2)
+
+    logger.info(
+        "LLM provider=%s model_id=%s", provider, llm_client.model_id,
+    )
+
     if isinstance(llm_client, StubLLMClient):
         raise RuntimeError(
             "Production driver refuses StubLLMClient; run_dataset.py is "
@@ -1032,6 +1076,9 @@ def main(args: argparse.Namespace) -> int:
         diversity_filter=_default_div_filter,
         omega=train_event_weights_aligned,
         tabular_feature_names=tab_names,
+        max_concurrent_llm_calls=int(
+            os.environ.get("MAX_CONCURRENT_LLM_CALLS", "8")
+        ),
     )
 
     # Val batch: reuse train batch when val is empty so downstream forward
@@ -1054,6 +1101,9 @@ def main(args: argparse.Namespace) -> int:
             diversity_filter=_default_div_filter,
             omega=None,
             tabular_feature_names=tab_names,
+            max_concurrent_llm_calls=int(
+                os.environ.get("MAX_CONCURRENT_LLM_CALLS", "8")
+            ),
         )
 
     # Test batch: §9.1 held-out split, un-weighted. Reuse val batch when
@@ -1081,6 +1131,9 @@ def main(args: argparse.Namespace) -> int:
             diversity_filter=_default_div_filter,
             omega=None,
             tabular_feature_names=tab_names,
+            max_concurrent_llm_calls=int(
+                os.environ.get("MAX_CONCURRENT_LLM_CALLS", "8")
+            ),
         )
         if len(batch_test) < 10:
             logger.warning(
