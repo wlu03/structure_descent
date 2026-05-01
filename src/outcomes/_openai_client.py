@@ -78,6 +78,7 @@ logger = logging.getLogger(__name__)
 _REASONING_MODEL_PREFIXES: tuple[str, ...] = (
     "o1",
     "o3",
+    "o4",
     "gpt-5",
 )
 

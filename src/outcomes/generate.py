@@ -546,10 +546,14 @@ class OutcomesPayload:
 
 
 # Decoding defaults straight from configs/default.yaml § outcomes.generator.
+# ``OUTCOMES_MAX_TOKENS`` env var bumps the cap at module load — needed for
+# reasoning-capable models (Gemini 3, o-series, GPT-5) that burn tokens on
+# internal thinking before any visible output. Default 180 matches the
+# YAML; reasoning runs typically set 2000.
 _DEFAULT_GEN_KWARGS: dict[str, Any] = {
     "temperature": 0.8,
     "top_p": 0.95,
-    "max_tokens": 180,
+    "max_tokens": int(os.environ.get("OUTCOMES_MAX_TOKENS", "180")),
 }
 
 

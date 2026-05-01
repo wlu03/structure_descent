@@ -196,6 +196,7 @@ class GeminiLLMClient:
         *,
         project: str | None = None,
         location: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         try:
             from google import genai  # type: ignore[import-not-found]
@@ -206,6 +207,9 @@ class GeminiLLMClient:
                 "Install with `pip install google-genai>=1.51.0`."
             ) from exc
 
+        resolved_api_key = api_key if api_key is not None else os.environ.get(
+            "GEMINI_API_KEY"
+        )
         resolved_project = project if project is not None else os.environ.get(
             "GOOGLE_CLOUD_PROJECT"
         )
@@ -216,14 +220,27 @@ class GeminiLLMClient:
         self.model_id = model_id
         self._project = resolved_project
         self._location = resolved_location
+        self._api_key = resolved_api_key
 
-        client_kwargs: dict[str, Any] = {
-            "http_options": HttpOptions(api_version="v1"),
-        }
-        if resolved_project is not None:
-            client_kwargs["project"] = resolved_project
-        if resolved_location is not None:
-            client_kwargs["location"] = resolved_location
+        # Vertex ADC and Generative Language API expose different sets of
+        # fields. Vertex's v1 endpoint accepts ``systemInstruction`` (used
+        # by ``_convert_messages``); the public Generative Language API
+        # only honors it under ``v1beta``. Pin per-path so callers don't
+        # have to know.
+        if resolved_api_key is not None:
+            client_kwargs: dict[str, Any] = {
+                "api_key": resolved_api_key,
+                "vertexai": False,
+                "http_options": HttpOptions(api_version="v1beta"),
+            }
+        else:
+            client_kwargs = {
+                "http_options": HttpOptions(api_version="v1"),
+            }
+            if resolved_project is not None:
+                client_kwargs["project"] = resolved_project
+            if resolved_location is not None:
+                client_kwargs["location"] = resolved_location
 
         self._client = genai.Client(**client_kwargs)
 
