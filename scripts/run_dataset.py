@@ -188,6 +188,58 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--refine",
+        action="store_true",
+        help=(
+            "Run a 2-round identify→refine→retrain pipeline in one shot. "
+            "Round 1 = initial PO-LEU training (artifacts land in "
+            "``<output-dir>/round1/``). Round 2 = identify the worst val "
+            "events, run the critic+reviser loop, then retrain with the "
+            "refined cascade prepended (``v3_refined → <original cascade>``); "
+            "artifacts land in ``<output-dir>/`` matching a normal run. "
+            "Refined-outcome bookkeeping (``failure_events.json`` + "
+            "``refined_outcomes.json``) lives in ``<output-dir>/`` for "
+            "inspection."
+        ),
+    )
+    parser.add_argument(
+        "--refine-top-k",
+        type=int,
+        default=30,
+        help="Number of worst val events to refine (default 30).",
+    )
+    parser.add_argument(
+        "--refine-accept-threshold",
+        type=int,
+        default=4,
+        help=(
+            "Critic accept threshold (1–5). Pairs with both critic scores "
+            "≥ threshold AND no flagged weak positions are skipped. "
+            "Default 4."
+        ),
+    )
+    parser.add_argument(
+        "--refine-per-outcome",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "When 'on' (default), reviser only rewrites positions the "
+            "critic flagged via weak_outcome_indices; strong outcomes "
+            "are preserved byte-identical via splice. 'off' falls back "
+            "to monolithic K-sentence rewrite (legacy v2_refined)."
+        ),
+    )
+    parser.add_argument(
+        "--refine-critic",
+        choices=["writer", "anthropic", "gemini", "openai"],
+        default="writer",
+        help=(
+            "Critic LLM family. 'writer' (default) reuses the writer's "
+            "client (cheapest, but family-correlated); cross-family "
+            "options give independent scoring at extra API spend."
+        ),
+    )
+    parser.add_argument(
         "--prompt-version-cascade",
         nargs="+",
         default=None,
@@ -421,7 +473,7 @@ def _build_llm_and_encoder(args: argparse.Namespace, config: dict) -> tuple[Any,
 # --------------------------------------------------------------------------- #
 
 
-def main(args: argparse.Namespace) -> int:
+def _run_pipeline_once(args: argparse.Namespace) -> int:
     """Orchestrate the Wave 10 pipeline. Returns a POSIX-style exit code."""
     logging.basicConfig(
         level=logging.INFO,
@@ -1508,6 +1560,137 @@ def main(args: argparse.Namespace) -> int:
         pass
 
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Refine orchestration
+# --------------------------------------------------------------------------- #
+
+
+def _run_with_refine(args: argparse.Namespace) -> int:
+    """Run round-1 → identify failures → refine → round-2 in one shot.
+
+    Layout:
+      ``<output_dir>/round1/``     — round-1 artifacts (records.pkl,
+                                     val_per_event.json, test_logits.npz,
+                                     metrics.json, …)
+      ``<output_dir>/failure_events.json``  — round-1 worst val events
+      ``<output_dir>/refined_outcomes.json`` — refine bookkeeping
+      ``<output_dir>/<round-2 artifacts>``    — final retrain output
+
+    Cache reuse: round-1 outcome generations populate the configured
+    outcomes_cache; refine writes refined entries under
+    REFINED_PROMPT_VERSION; round-2 assemble_batch hits the cache for
+    every (cust, alt) so no new outcome generations are needed beyond
+    the critic+reviser calls.
+    """
+    final_output_dir = _resolve_output_dir(args)
+    final_output_dir.mkdir(parents=True, exist_ok=True)
+    round1_dir = final_output_dir / "round1"
+    round1_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("=== --refine: round 1 (initial PO-LEU train) ===")
+    round1_args = argparse.Namespace(**vars(args))
+    round1_args.refine = False  # avoid recursion
+    round1_args.output_dir = round1_dir
+    rc1 = _run_pipeline_once(round1_args)
+    if rc1 != 0:
+        logger.error("--refine: round 1 exit %d; aborting", rc1)
+        return rc1
+
+    failure_events_path = final_output_dir / "failure_events.json"
+    refined_outcomes_path = final_output_dir / "refined_outcomes.json"
+
+    # Resolve the outcomes-cache path the round-1 run used. Mirrors the
+    # env-var-first / config-fallback rule inside _run_pipeline_once.
+    config = _load_yaml(args.config)
+    paths_cfg = config.get("paths") or {}
+    cache_cfg = (config.get("outcomes") or {}).get("cache") or {}
+    env_outcomes = os.environ.get("OUTCOMES_CACHE_PATH", "").strip()
+    outcomes_cache_path = Path(
+        env_outcomes
+        or cache_cfg.get(
+            "outcomes_path",
+            paths_cfg.get("outcomes_cache", "outcomes_cache/")
+            + "outcomes.sqlite",
+        )
+    )
+    if not outcomes_cache_path.is_absolute():
+        outcomes_cache_path = REPO_ROOT / outcomes_cache_path
+
+    K = int(args.K) if args.K is not None else int(
+        (config.get("outcomes") or {}).get("K", 3)
+    )
+
+    # Last entry of the cascade is the prompt-version that wrote the v1
+    # cache entries we want refine_outcomes to read from (it folds the
+    # v1 prompt_version into its lookup key).
+    cascade_arg = list(getattr(args, "prompt_version_cascade", None) or [])
+    v1_pv = cascade_arg[-1] if cascade_arg else "v1"
+
+    logger.info(
+        "=== --refine: identify_failure_events (top-K=%d) ===",
+        int(args.refine_top_k),
+    )
+    import subprocess
+    rc_id = subprocess.call(
+        [
+            sys.executable, str(REPO_ROOT / "scripts" / "identify_failure_events.py"),
+            "--run-dir", str(round1_dir),
+            "--top-k", str(int(args.refine_top_k)),
+            "--output", str(failure_events_path),
+        ],
+        cwd=str(REPO_ROOT),
+    )
+    if rc_id != 0:
+        logger.error("--refine: identify_failure_events exit %d; aborting", rc_id)
+        return rc_id
+
+    logger.info("=== --refine: refine_outcomes (per_outcome=%s) ===",
+                args.refine_per_outcome)
+    refine_writer = os.environ.get("LLM_PROVIDER", "anthropic")
+    if refine_writer not in {"anthropic", "gemini", "openai"}:
+        refine_writer = "anthropic"
+    rc_rf = subprocess.call(
+        [
+            sys.executable, str(REPO_ROOT / "scripts" / "refine_outcomes.py"),
+            "--failure-events", str(failure_events_path),
+            "--outcomes-cache", str(outcomes_cache_path),
+            "--K", str(K),
+            "--seed", str(int(args.seed)),
+            "--v1-prompt-version", str(v1_pv),
+            "--writer", refine_writer,
+            "--critic", str(args.refine_critic),
+            "--accept-threshold", str(int(args.refine_accept_threshold)),
+            "--per-outcome", str(args.refine_per_outcome),
+            "--output", str(refined_outcomes_path),
+        ],
+        cwd=str(REPO_ROOT),
+    )
+    if rc_rf != 0:
+        logger.error("--refine: refine_outcomes exit %d; aborting", rc_rf)
+        return rc_rf
+
+    logger.info(
+        "=== --refine: round 2 (retrain with cascade prepended) ==="
+    )
+    from src.outcomes.prompts import REFINED_PROMPT_VERSION
+    round2_args = argparse.Namespace(**vars(args))
+    round2_args.refine = False  # no recursion
+    round2_args.output_dir = final_output_dir
+    # Prepend the refined version to the cascade so refined entries win.
+    round2_args.prompt_version_cascade = (
+        [REFINED_PROMPT_VERSION] + cascade_arg
+    )
+    return _run_pipeline_once(round2_args)
+
+
+def main(args: argparse.Namespace) -> int:
+    """Top-level entry. Dispatches to the refine pipeline when ``--refine``
+    is set, else runs the single-pass pipeline."""
+    if getattr(args, "refine", False):
+        return _run_with_refine(args)
+    return _run_pipeline_once(args)
 
 
 # --------------------------------------------------------------------------- #
