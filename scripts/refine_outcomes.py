@@ -118,6 +118,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-events", type=int, default=None,
         help="Hard cap on events to refine (debug). Default: all.",
     )
+    p.add_argument(
+        "--per-outcome",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "When 'on' (default), the reviser only rewrites positions the "
+            "critic flagged via weak_outcome_indices; strong outcomes are "
+            "preserved byte-identical via splice. When 'off', falls back "
+            "to the monolithic K-sentence rewrite even when per-position "
+            "info is available — useful for ablation."
+        ),
+    )
     p.add_argument("--log-level", default="INFO")
     return p
 
@@ -259,6 +271,7 @@ def main() -> int:
                     critic_client=critic_client,
                     seed=int(args.seed),
                     accept_threshold=int(args.accept_threshold),
+                    per_outcome=(args.per_outcome == "on"),
                 )
             except Exception as exc:  # noqa: BLE001
                 n_revise_failures += 1
@@ -282,6 +295,9 @@ def main() -> int:
                 "critic_plausibility": int(result.critique.plausibility),
                 "critic_diversity": int(result.critique.diversity),
                 "critic_notes": result.critique.notes,
+                "critic_weak_outcome_indices": list(
+                    result.critique.weak_outcome_indices
+                ),
             })
             cache.put_outcomes(
                 customer_id, str(asin), int(args.seed), v2_cache_pv,
@@ -304,11 +320,33 @@ def main() -> int:
                     "plausibility": int(result.critique.plausibility),
                     "diversity": int(result.critique.diversity),
                     "notes": result.critique.notes,
+                    "weak_outcome_indices": list(
+                        result.critique.weak_outcome_indices
+                    ),
                     "model_id": result.critique.model_id,
                 },
+                "revise_path": result.metadata.get("revise_path", "none"),
                 "v1_outcomes": v1_outcomes,
                 "v2_outcomes": result.revised_outcomes,
             })
+
+    # Per-outcome surgical-rewrite stats (only meaningful when
+    # --per-outcome on). Counts how many of the revised pairs went
+    # through the per-outcome path vs. the monolithic fallback, and
+    # the average # of positions rewritten when per-outcome fired.
+    n_per_outcome = 0
+    n_monolithic = 0
+    weak_positions_rewritten = 0
+    for it in bookkeeping:
+        if it.get("skipped"):
+            continue
+        if it.get("revise_path") == "per_outcome":
+            n_per_outcome += 1
+            weak_positions_rewritten += len(
+                it.get("critic", {}).get("weak_outcome_indices", []) or []
+            )
+        elif it.get("revise_path") == "monolithic":
+            n_monolithic += 1
 
     summary = {
         "n_events": len(events),
@@ -322,17 +360,29 @@ def main() -> int:
         "accept_threshold": int(args.accept_threshold),
         "v1_prompt_version": str(args.v1_prompt_version),
         "v2_prompt_version": REFINED_PROMPT_VERSION,
+        "per_outcome_enabled": (args.per_outcome == "on"),
+        "n_per_outcome_path": n_per_outcome,
+        "n_monolithic_path": n_monolithic,
+        "avg_positions_rewritten_per_outcome": (
+            (weak_positions_rewritten / n_per_outcome)
+            if n_per_outcome > 0 else 0.0
+        ),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(
         {"summary": summary, "items": bookkeeping}, indent=2,
     ))
     logger.info(
-        "refinement complete: %d refined, %d skipped (passed threshold), "
+        "refinement complete: %d refined (%d via per-outcome splice, "
+        "%d via monolithic rewrite), %d skipped (passed threshold), "
         "%d v1 cache misses, %d revise failures (out of %d pairs in "
-        "%d events). bookkeeping: %s",
-        n_refined, n_skipped, n_cache_miss, n_revise_failures,
-        n_pairs, len(events), output_path,
+        "%d events). avg_positions_rewritten_per_outcome=%.2f. "
+        "bookkeeping: %s",
+        n_refined, n_per_outcome, n_monolithic,
+        n_skipped, n_cache_miss, n_revise_failures,
+        n_pairs, len(events),
+        summary["avg_positions_rewritten_per_outcome"],
+        output_path,
     )
     return 0
 

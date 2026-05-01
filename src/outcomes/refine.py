@@ -37,6 +37,7 @@ from src.outcomes.prompts import (
     REFINED_PROMPT_VERSION,
     build_critic_messages,
     build_reviser_messages,
+    build_reviser_per_outcome_messages,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,13 +61,22 @@ _DEFAULT_GEN_KWARGS: dict[str, Any] = {
 
 @dataclass
 class CritiqueResult:
-    """Structured critic output. ``raw`` is the unparsed completion text."""
+    """Structured critic output. ``raw`` is the unparsed completion text.
+
+    ``weak_outcome_indices`` is the per-outcome flag list (0-indexed)
+    introduced for the per-outcome reviser path: when non-empty, only
+    those positions are rewritten and the strong outcomes are preserved
+    byte-identical via splice. Empty list means either every outcome is
+    acceptable, or the critic didn't supply position-level info — in
+    the latter case the reviser falls back to the monolithic rewrite.
+    """
 
     plausibility: int
     diversity: int
     notes: str
     raw: str
     model_id: str = ""
+    weak_outcome_indices: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -138,17 +148,37 @@ def critique(
         notes = str(parsed.get("notes", "")).strip()
         p = max(1, min(5, p))
         d = max(1, min(5, d))
+        # Per-outcome flag list. Tolerant: missing field, non-list, or
+        # mixed types all degrade gracefully to an empty list (which
+        # routes the reviser to the monolithic path so behavior matches
+        # the prior contract on critics that don't yet return the field).
+        raw_indices = parsed.get("weak_outcome_indices", []) or []
+        weak: list[int] = []
+        if isinstance(raw_indices, list):
+            seen: set[int] = set()
+            for v in raw_indices:
+                if isinstance(v, bool):
+                    continue
+                try:
+                    iv = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= iv < int(K) and iv not in seen:
+                    weak.append(iv)
+                    seen.add(iv)
+            weak.sort()
     except (ValueError, json.JSONDecodeError, TypeError) as exc:
         logger.warning(
             "critique JSON parse failed (%s); defaulting to 3/3", exc
         )
-        p, d, notes = 3, 3, "<parse error>"
+        p, d, notes, weak = 3, 3, "<parse error>", []
     return CritiqueResult(
         plausibility=p,
         diversity=d,
         notes=notes,
         raw=raw,
         model_id=str(getattr(result, "model_id", "")),
+        weak_outcome_indices=weak,
     )
 
 
@@ -163,41 +193,92 @@ def revise(
     seed: int,
     diversity_filter: Any | None = None,
     generation_kwargs: Mapping[str, Any] | None = None,
+    per_outcome: bool = True,
 ) -> list[str]:
-    """Rewrite K outcomes given the critic's feedback.
+    """Rewrite outcomes given the critic's feedback.
 
-    Reuses :func:`src.outcomes.generate.parse_completion` (same parser the
-    v1 generator uses) so the revised list goes through the same validation
-    contract: K sentences, each within length bounds. Optional
-    ``diversity_filter`` is applied just like v1; failures here log a
-    warning but do NOT block — the refinement loop favors making progress.
+    Two paths, selected by ``per_outcome`` × the critic output:
+
+    * **Per-outcome (preferred)** — when ``per_outcome=True`` AND
+      ``critique_result.weak_outcome_indices`` is non-empty, the writer
+      regenerates ONLY those positions. Strong outcomes are preserved
+      byte-identical via splice in this function. Less variance, less
+      thematic drift on the strong outcomes.
+
+    * **Monolithic (fallback)** — when ``per_outcome=False`` OR the
+      critic returned no per-position info, the writer rewrites all K
+      outcomes (the original v2_refined contract).
+
+    Reuses :func:`src.outcomes.generate.parse_completion` (same parser
+    the v1 generator uses) so the revised list goes through the same
+    validation contract: N sentences (per-outcome) or K sentences
+    (monolithic), each within length bounds. Optional
+    ``diversity_filter`` is applied to the spliced final K-sentence
+    result so diversity coherence holds across the strong + revised
+    mixed set.
     """
     if len(outcomes) != int(K):
         raise ValueError(
             f"revise: got {len(outcomes)} outcomes, expected K={K}"
         )
-    messages = build_reviser_messages(
-        c_d=c_d,
-        alt=alt,
-        outcomes=outcomes,
-        K=int(K),
-        plausibility=int(critique_result.plausibility),
-        diversity=int(critique_result.diversity),
-        notes=critique_result.notes,
-    )
+
+    weak_indices = list(critique_result.weak_outcome_indices or [])
+    use_per_outcome = bool(per_outcome) and len(weak_indices) > 0
+
     gen_kwargs = dict(_DEFAULT_GEN_KWARGS)
     if generation_kwargs:
         gen_kwargs.update(dict(generation_kwargs))
 
-    result = writer_client.generate(
-        messages,
-        temperature=float(gen_kwargs["temperature"]),
-        top_p=float(gen_kwargs["top_p"]),
-        max_tokens=int(gen_kwargs["max_tokens"]),
-        seed=int(seed),
-    )
-    raw = getattr(result, "text", "") or ""
-    parsed = parse_completion(raw, K=int(K))
+    if use_per_outcome:
+        n = len(weak_indices)
+        messages = build_reviser_per_outcome_messages(
+            c_d=c_d,
+            alt=alt,
+            outcomes=outcomes,
+            K=int(K),
+            weak_indices=weak_indices,
+            plausibility=int(critique_result.plausibility),
+            diversity=int(critique_result.diversity),
+            notes=critique_result.notes,
+        )
+        result = writer_client.generate(
+            messages,
+            temperature=float(gen_kwargs["temperature"]),
+            top_p=float(gen_kwargs["top_p"]),
+            max_tokens=int(gen_kwargs["max_tokens"]),
+            seed=int(seed),
+        )
+        raw = getattr(result, "text", "") or ""
+        parsed_n = parse_completion(raw, K=int(n))
+        if len(parsed_n) != n:
+            raise AssertionError(
+                f"revise (per-outcome): parser returned {len(parsed_n)} "
+                f"outcomes, expected N={n}"
+            )
+        # Splice: keep strong outcomes verbatim, replace weak positions.
+        merged = list(outcomes)
+        for slot_idx, new_text in zip(weak_indices, parsed_n):
+            merged[slot_idx] = new_text
+        parsed = merged
+    else:
+        messages = build_reviser_messages(
+            c_d=c_d,
+            alt=alt,
+            outcomes=outcomes,
+            K=int(K),
+            plausibility=int(critique_result.plausibility),
+            diversity=int(critique_result.diversity),
+            notes=critique_result.notes,
+        )
+        result = writer_client.generate(
+            messages,
+            temperature=float(gen_kwargs["temperature"]),
+            top_p=float(gen_kwargs["top_p"]),
+            max_tokens=int(gen_kwargs["max_tokens"]),
+            seed=int(seed),
+        )
+        raw = getattr(result, "text", "") or ""
+        parsed = parse_completion(raw, K=int(K))
 
     if diversity_filter is not None:
         try:
@@ -230,12 +311,20 @@ def refine_outcomes(
     accept_threshold: int = 4,
     diversity_filter: Any | None = None,
     generation_kwargs: Mapping[str, Any] | None = None,
+    per_outcome: bool = True,
 ) -> RefinementResult:
     """End-to-end critique + (optionally) revise for one (customer, alt).
 
-    If both critic scores are >= ``accept_threshold``, returns the originals
-    unchanged with ``skipped=True`` so the driver can avoid spending a
-    revise call. Otherwise runs :func:`revise` and returns the new list.
+    If both critic scores are >= ``accept_threshold`` AND the critic
+    flagged no specific weak positions, returns the originals unchanged
+    with ``skipped=True`` (no revise call).
+
+    Otherwise runs :func:`revise`. With ``per_outcome=True`` (default),
+    the reviser only rewrites positions in
+    ``critique_result.weak_outcome_indices``; strong outcomes are
+    preserved byte-identical via splice. When the critic doesn't supply
+    weak indices, the reviser falls back to the monolithic K-sentence
+    rewrite (matches the prior v2_refined contract).
     """
     crit = critique(
         c_d=c_d,
@@ -246,7 +335,17 @@ def refine_outcomes(
         seed=int(seed),
         generation_kwargs=generation_kwargs,
     )
-    if crit.plausibility >= accept_threshold and crit.diversity >= accept_threshold:
+    has_weak = len(crit.weak_outcome_indices) > 0
+    scores_pass = (
+        crit.plausibility >= accept_threshold
+        and crit.diversity >= accept_threshold
+    )
+    # Skip the revise call when scores pass AND the critic didn't single
+    # out any specific weak positions. If scores pass but the critic
+    # nonetheless flagged a position as weak, trust the per-outcome
+    # signal and rewrite that one slot — this is the cheap, high-
+    # surgical-precision path the new contract is designed for.
+    if scores_pass and not has_weak:
         return RefinementResult(
             revised_outcomes=list(outcomes),
             critique=crit,
@@ -256,6 +355,8 @@ def refine_outcomes(
                 "critic_model_id": crit.model_id,
                 "writer_model_id": "",
                 "prompt_version": REFINED_PROMPT_VERSION,
+                "weak_outcome_indices": list(crit.weak_outcome_indices),
+                "per_outcome": False,
             },
         )
     revised = revise(
@@ -268,6 +369,10 @@ def refine_outcomes(
         seed=int(seed),
         diversity_filter=diversity_filter,
         generation_kwargs=generation_kwargs,
+        per_outcome=per_outcome,
+    )
+    revise_path = (
+        "per_outcome" if (per_outcome and has_weak) else "monolithic"
     )
     return RefinementResult(
         revised_outcomes=revised,
@@ -278,5 +383,7 @@ def refine_outcomes(
             "critic_model_id": crit.model_id,
             "writer_model_id": str(getattr(writer_client, "model_id", "")),
             "prompt_version": REFINED_PROMPT_VERSION,
+            "weak_outcome_indices": list(crit.weak_outcome_indices),
+            "revise_path": revise_path,
         },
     )

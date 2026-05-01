@@ -128,20 +128,28 @@ SYSTEM_PROMPT_MOBILITY_ANCHORED: str = (
 # folded into the cache key so prior refined entries are not silently reused.
 # ---------------------------------------------------------------------------
 
-REFINED_PROMPT_VERSION: str = "v2_refined"
+REFINED_PROMPT_VERSION: str = "v3_refined"
 
 CRITIC_SYSTEM_PROMPT: str = (
     "You are a careful critic of first-person outcome narratives. You receive "
     "K candidate outcomes that another model wrote for a person considering "
-    "an alternative. Score them on two axes:\n"
+    "an alternative. Score them on two axes AND identify which specific "
+    "outcomes are weak so the reviser can rewrite only those — strong "
+    "outcomes get preserved verbatim, reducing churn.\n"
     "  - plausibility (1-5): does each outcome describe something that could "
     "realistically happen to THIS person given THIS alternative? "
     "Penalize generic or off-topic claims.\n"
     "  - diversity (1-5): do the K outcomes cover *different types* of "
     "consequences (financial, health, convenience, emotional, social) — or "
     "are they paraphrases of each other?\n"
+    "  - weak_outcome_indices: 0-indexed positions of outcomes that need "
+    "rewriting (generic, off-topic, redundant with another, factually "
+    "incoherent). EMPTY list when every outcome is acceptable. Aim to "
+    "flag only outcomes that materially degrade the set; leave the others "
+    "alone so their signal carries through.\n"
     "Return STRICT JSON with this schema and nothing else:\n"
     "  {\"plausibility\": <int 1-5>, \"diversity\": <int 1-5>, "
+    "\"weak_outcome_indices\": [<0-indexed ints>], "
     "\"notes\": \"<one short sentence per weak outcome, naming the issue>\"}"
 )
 
@@ -194,6 +202,53 @@ REVISER_USER_TEMPLATE: str = (
     "- notes: {notes}\n"
     "\n"
     "Generate K={K} revised outcome sentences."
+)
+
+
+# Per-outcome reviser. When the critic flags only specific positions as
+# weak, this prompt asks for ONLY those rewrites — strong outcomes stay
+# byte-identical via splice in the orchestrator. Different system prompt
+# from the monolithic reviser because the contract is a partial output
+# count + position-ordered emission, not the K-sentences-total contract.
+REVISER_PER_OUTCOME_SYSTEM_PROMPT: str = (
+    "You rewrite a small subset of weak outcome narratives based on a "
+    "critic's per-position feedback. The strong outcomes are kept verbatim "
+    "by the caller — DO NOT include them in your output. Produce exactly N "
+    "sentences, one for each weak position the critic flagged, in the "
+    "SAME order as the position list (ascending). Each sentence is 10-25 "
+    "words, first-person, present or near-future tense, and grounded in "
+    "the person's specific context. Do not describe the product. Do not "
+    "number sentences; separate them with newlines. Each new sentence "
+    "must complement (not paraphrase) the strong outcomes that will sit "
+    "alongside it in the final K-sentence set."
+)
+
+REVISER_PER_OUTCOME_USER_TEMPLATE: str = (
+    "PERSON CONTEXT:\n"
+    "{c_d}\n"
+    "\n"
+    "ALTERNATIVE:\n"
+    "- Name/title: {title}\n"
+    "- Category: {category}\n"
+    "- Price: ${price}\n"
+    "- Popularity: {popularity_rank}\n"
+    "{optional_fields}"
+    "\n"
+    "ALL CURRENT OUTCOMES (numbered 1..K, weak ones marked):\n"
+    "{outcomes_block}\n"
+    "\n"
+    "WEAK POSITIONS (1-indexed, in ascending order): {weak_positions_1based}\n"
+    "STRONG POSITIONS (kept verbatim, do NOT regenerate these): "
+    "{strong_positions_1based}\n"
+    "\n"
+    "CRITIC FEEDBACK:\n"
+    "- plausibility: {plausibility}/5\n"
+    "- diversity: {diversity}/5\n"
+    "- notes: {notes}\n"
+    "\n"
+    "Output exactly N={N} sentences, one per weak position, in ascending "
+    "order. Each new sentence must cover a *consequence type* that "
+    "complements (does not duplicate) the strong outcomes' types."
 )
 
 # Required keys for the ``alt`` mapping passed to :func:`build_user_block`.
@@ -411,6 +466,24 @@ def _render_outcomes_block(outcomes: list[str]) -> str:
     return "\n".join(f"{i + 1}. {s}" for i, s in enumerate(outcomes))
 
 
+def _render_outcomes_block_marked(
+    outcomes: list[str], weak_indices: list[int]
+) -> str:
+    """Render K outcomes with a ``*** WEAK ***`` tag on flagged positions.
+
+    Used by the per-outcome reviser so the model has both the full set
+    (for diversity coherence) and an explicit flag of which positions to
+    rewrite. ``weak_indices`` is 0-indexed; tags are appended to the same
+    line as the outcome text.
+    """
+    weak_set = set(int(i) for i in weak_indices)
+    lines: list[str] = []
+    for i, s in enumerate(outcomes):
+        marker = "  *** WEAK — REWRITE ***" if i in weak_set else ""
+        lines.append(f"{i + 1}. {s}{marker}")
+    return "\n".join(lines)
+
+
 def build_critic_messages(
     c_d: str,
     alt: Mapping[str, Any],
@@ -498,6 +571,88 @@ def build_reviser_messages(
     ]
 
 
+def build_reviser_per_outcome_messages(
+    c_d: str,
+    alt: Mapping[str, Any],
+    outcomes: list[str],
+    K: int,
+    weak_indices: list[int],
+    plausibility: int,
+    diversity: int,
+    notes: str,
+    optional_fields: Mapping[str, Any] | None = None,
+) -> list[dict]:
+    """Build chat messages for the per-outcome reviser path.
+
+    Asks the LLM to rewrite ONLY the weak positions; strong outcomes
+    are kept verbatim by the orchestrator via splice. Returns a prompt
+    that requests exactly ``N = len(weak_indices)`` sentences in
+    ascending position order.
+
+    The strong outcomes are still rendered in the prompt (with a
+    ``*** WEAK — REWRITE ***`` tag on the weak ones) so the reviser
+    knows what's already covered and avoids generating paraphrases of
+    the strong outcomes' consequence types.
+    """
+    if not isinstance(K, int) or isinstance(K, bool) or K <= 0:
+        raise ValueError(f"K must be a positive int, got {K!r}")
+    if len(outcomes) != K:
+        raise ValueError(
+            f"build_reviser_per_outcome_messages: got {len(outcomes)} "
+            f"outcomes, expected K={K}"
+        )
+    missing = [field for field in _REQUIRED_ALT_FIELDS if field not in alt]
+    if missing:
+        raise ValueError(
+            "alt is missing required field(s): " + ", ".join(missing)
+        )
+
+    weak_idx_sorted = sorted({int(i) for i in (weak_indices or [])})
+    if not weak_idx_sorted:
+        raise ValueError(
+            "build_reviser_per_outcome_messages: weak_indices is empty; "
+            "use build_reviser_messages for monolithic rewrites instead."
+        )
+    if any(i < 0 or i >= K for i in weak_idx_sorted):
+        raise ValueError(
+            f"build_reviser_per_outcome_messages: weak_indices "
+            f"{weak_idx_sorted!r} out of range [0, {K})"
+        )
+    strong_idx_sorted = [i for i in range(K) if i not in set(weak_idx_sorted)]
+
+    extras = {
+        k: alt[k] for k in alt.keys() if k not in _REQUIRED_ALT_FIELDS
+    }
+    if optional_fields:
+        extras.update(dict(optional_fields))
+
+    n = len(weak_idx_sorted)
+    weak_1based = ", ".join(str(i + 1) for i in weak_idx_sorted)
+    strong_1based = (
+        ", ".join(str(i + 1) for i in strong_idx_sorted) or "(none)"
+    )
+
+    user_content = REVISER_PER_OUTCOME_USER_TEMPLATE.format(
+        c_d=c_d,
+        title=alt["title"],
+        category=alt["category"],
+        price=alt["price"],
+        popularity_rank=alt["popularity_rank"],
+        optional_fields=_render_optional_fields(extras),
+        outcomes_block=_render_outcomes_block_marked(outcomes, weak_idx_sorted),
+        weak_positions_1based=weak_1based,
+        strong_positions_1based=strong_1based,
+        plausibility=int(plausibility),
+        diversity=int(diversity),
+        notes=str(notes),
+        N=n,
+    )
+    return [
+        {"role": "system", "content": REVISER_PER_OUTCOME_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+
 __all__ = [
     "SYSTEM_PROMPT",
     "USER_BLOCK_TEMPLATE",
@@ -513,4 +668,10 @@ __all__ = [
     "build_user_block",
     "build_messages",
     "build_messages_anchored",
+    "REFINED_PROMPT_VERSION",
+    "REVISER_PER_OUTCOME_SYSTEM_PROMPT",
+    "REVISER_PER_OUTCOME_USER_TEMPLATE",
+    "build_critic_messages",
+    "build_reviser_messages",
+    "build_reviser_per_outcome_messages",
 ]
